@@ -1,0 +1,45 @@
+# Systemd service for nightly research runner
+# Copy to /etc/systemd/system/trading-research.service
+#
+# Installation:
+#   sudo cp trading-research.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable trading-research.service
+#   sudo systemctl start trading-research.service
+#
+# Logs:
+#   journalctl -u trading-research -f
+
+[Unit]
+Description=Trading System Nightly Research
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+
+# Working directory - adjust for your setup
+WorkingDirectory=/mnt/nvme/trading_system
+
+# Run the research script
+ExecStart=/usr/bin/python3 run_nightly_research.py --loop
+
+# Restart policy
+Restart=always
+RestartSec=300
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+Environment="TRADING_SYSTEM_ROOT=/mnt/nvme/trading_system"
+
+# Resource limits (Pi 5 has 8GB RAM)
+MemoryMax=4G
+CPUQuota=50%
+
+# Logging
+StandardOutput=append:/mnt/nvme/trading_system/logs/nightly_research_service.log
+StandardError=append:/mnt/nvme/trading_system/logs/nightly_research_service.log
+
+[Install]
+WantedBy=multi-user.target

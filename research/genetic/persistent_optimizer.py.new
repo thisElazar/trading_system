@@ -1,0 +1,837 @@
+"""
+Persistent Genetic Algorithm Optimizer
+======================================
+Wraps GeneticOptimizer with database persistence for cross-session evolution.
+
+Key features:
+- Load population from database (resume from yesterday)
+- Save population after each generation
+- Log evolution history for analysis
+- Incremental evolution (1-5 generations per session)
+- Fitness constraints to reject overfit/unrealistic strategies
+- Multi-metric composite fitness to prevent single-metric overfitting:
+  * Sharpe Ratio (40%) - General risk-adjusted performance
+  * Sortino Ratio (30%) - Downside risk-adjusted returns
+  * Calmar Ratio (20%) - Return per unit of max drawdown
+  * Win Rate (10%) - Consistency and psychological tradability
+
+Usage:
+    from research.genetic.persistent_optimizer import PersistentGAOptimizer
+
+    optimizer = PersistentGAOptimizer('vol_managed_momentum', fitness_fn)
+    best = optimizer.evolve_incremental(generations=3)
+"""
+
+import logging
+from typing import Dict, List, Callable, Optional, Tuple
+from dataclasses import asdict
+from pathlib import Path
+import sys
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from research.genetic.optimizer import (
+    GeneticOptimizer, GeneticConfig, Individual, ParameterSpec, STRATEGY_PARAMS
+)
+from research.genetic.fitness_utils import calculate_composite_fitness
+from data.storage.db_manager import get_db
+from research.discovery.shared_data import SharedDataManager
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# FITNESS CONSTRAINTS
+# ============================================================================
+
+# Constraint thresholds (configurable per strategy type)
+CONSTRAINT_THRESHOLDS = {
+    'default': {
+        # Hard constraints (rejection if violated)
+        'min_trades': 30,           # Minimum trades for statistical significance
+        'max_drawdown': -30,        # Maximum acceptable drawdown (%)
+        'min_annual_return': 0,     # Must be positive
+        'min_win_rate': 35,         # Minimum win rate (%)
+        # Soft constraint thresholds
+        'low_trades': 50,           # Below this gets penalized
+        'moderate_drawdown': -20,   # Below this gets penalized
+        'low_win_rate': 45,         # Below this gets penalized
+        'suspicious_sharpe': 2.0,   # Above this gets penalized (likely overfit)
+    },
+    # Strategy-specific overrides (momentum/trend strategies need fewer trades)
+    'momentum': {
+        'min_trades': 20,
+        'low_trades': 35,
+    },
+    'mean_reversion': {
+        'min_trades': 40,           # Mean reversion should trade more frequently
+        'low_trades': 60,
+    },
+}
+
+# Map strategies to constraint profiles
+STRATEGY_CONSTRAINT_PROFILE = {
+    'vol_managed_momentum': 'momentum',
+    'factor_momentum': 'momentum',
+    'sector_rotation': 'momentum',
+    'mean_reversion': 'mean_reversion',
+    'pairs_trading': 'mean_reversion',
+    # Others use 'default'
+}
+
+
+def get_constraint_thresholds(strategy_name: str) -> dict:
+    """Get constraint thresholds for a strategy, with profile overrides."""
+    # Start with defaults
+    thresholds = CONSTRAINT_THRESHOLDS['default'].copy()
+
+    # Apply strategy-specific profile overrides
+    profile = STRATEGY_CONSTRAINT_PROFILE.get(strategy_name, 'default')
+    if profile in CONSTRAINT_THRESHOLDS and profile != 'default':
+        thresholds.update(CONSTRAINT_THRESHOLDS[profile])
+
+    return thresholds
+
+
+def apply_fitness_constraints(result, strategy_name: str = 'default') -> Tuple[float, str]:
+    """
+    Apply hard and soft constraints to fitness evaluation.
+
+    Args:
+        result: Backtest result object with metrics
+        strategy_name: Name of strategy for profile-specific thresholds
+
+    Returns:
+        (multiplier, reason) where multiplier=0 means rejection
+    """
+    thresholds = get_constraint_thresholds(strategy_name)
+
+    # ========================================================================
+    # HARD CONSTRAINTS - Return 0 fitness (reject completely)
+    # ========================================================================
+
+    # Minimum trades for statistical significance
+    if result.total_trades < thresholds['min_trades']:
+        return 0.0, f"Rejected: Only {result.total_trades} trades (min {thresholds['min_trades']})"
+
+    # Maximum drawdown (catastrophic loss prevention)
+    if result.max_drawdown_pct < thresholds['max_drawdown']:
+        return 0.0, f"Rejected: {result.max_drawdown_pct:.1f}% drawdown (max {thresholds['max_drawdown']}%)"
+
+    # Must have positive annual return
+    if hasattr(result, 'annual_return') and result.annual_return < thresholds['min_annual_return']:
+        return 0.0, f"Rejected: {result.annual_return:.1f}% annual return (must be positive)"
+
+    # Minimum win rate (avoid extreme skew strategies)
+    if hasattr(result, 'win_rate') and result.win_rate < thresholds['min_win_rate']:
+        return 0.0, f"Rejected: {result.win_rate:.1f}% win rate (min {thresholds['min_win_rate']}%)"
+
+    # ========================================================================
+    # SOFT CONSTRAINTS - Reduce fitness but don't reject
+    # ========================================================================
+    multiplier = 1.0
+    reasons = []
+
+    # Penalize low trade count
+    if result.total_trades < thresholds['low_trades']:
+        penalty = 0.8
+        multiplier *= penalty
+        reasons.append(f"Low trades ({result.total_trades}): {penalty}x")
+
+    # Penalize moderate drawdown
+    if result.max_drawdown_pct < thresholds['moderate_drawdown']:
+        penalty = 0.85
+        multiplier *= penalty
+        reasons.append(f"Moderate DD ({result.max_drawdown_pct:.1f}%): {penalty}x")
+
+    # Penalize low win rate (if available)
+    if hasattr(result, 'win_rate') and result.win_rate < thresholds['low_win_rate']:
+        penalty = 0.9
+        multiplier *= penalty
+        reasons.append(f"Low win rate ({result.win_rate:.1f}%): {penalty}x")
+
+    # Penalize suspiciously high Sharpe (likely overfit)
+    if hasattr(result, 'sharpe_ratio') and result.sharpe_ratio > thresholds['suspicious_sharpe']:
+        penalty = 0.7
+        multiplier *= penalty
+        reasons.append(f"Suspicious Sharpe ({result.sharpe_ratio:.2f}): {penalty}x")
+
+    reason = "; ".join(reasons) if reasons else "Passed all constraints"
+    return multiplier, reason
+
+
+class PersistentGAOptimizer:
+    """
+    Genetic algorithm optimizer with database persistence.
+    
+    Enables continuous evolution across sessions:
+    - Run a few generations each night
+    - Resume from the last population the next day
+    - Track improvement over weeks/months
+    """
+    
+    def __init__(
+        self,
+        strategy_name: str,
+        fitness_function: Callable[[Dict[str, float]], float],
+        parameter_specs: List[ParameterSpec] = None,
+        config: GeneticConfig = None,
+        strategy_factory: Callable = None
+    ):
+        """
+        Initialize persistent GA optimizer.
+        
+        Args:
+            strategy_name: Name of strategy (used as DB key)
+            fitness_function: Function(genes) -> fitness score
+            parameter_specs: Optional custom parameter specs (defaults to STRATEGY_PARAMS)
+            config: Optional GA configuration
+            strategy_factory: Optional function(genes) -> strategy for parallel evaluation
+        """
+        self.strategy_factory = strategy_factory
+        self.strategy_name = strategy_name
+        self.fitness_fn = fitness_function
+        self.db = get_db()
+        
+        # Get parameter specs
+        if parameter_specs:
+            self.specs = parameter_specs
+        elif strategy_name in STRATEGY_PARAMS:
+            self.specs = STRATEGY_PARAMS[strategy_name]
+        else:
+            raise ValueError(
+                f"No parameter specs for strategy '{strategy_name}'. "
+                f"Provide parameter_specs or use known strategy: {list(STRATEGY_PARAMS.keys())}"
+            )
+        
+        # Default config for incremental evolution
+        self.config = config or GeneticConfig(
+            population_size=30,      # Smaller population for nightly runs
+            generations=5,           # Max generations per session
+            mutation_rate=0.15,      # Slightly higher mutation for exploration
+            crossover_rate=0.7,
+            elitism=2,
+            tournament_size=3,
+            early_stop_generations=3  # Stop early if no improvement
+        )
+        
+        # Create base optimizer
+        self.optimizer = GeneticOptimizer(
+            self.specs,
+            self.fitness_fn,
+            self.config,
+            strategy_factory=self.strategy_factory
+        )
+        
+        # State tracking
+        self.current_generation = 0
+        self.generations_without_improvement = 0
+        self.best_ever_fitness = float('-inf')
+        self.best_ever_genes = None
+
+        # Persistent pool state for multi-core parallelism
+        self._shared_data_manager = None
+        self._pool_initialized = False
+
+    def _evaluate_population_batch(self, individuals: list) -> None:
+        """
+        Evaluate population using parallel pool if available, else sequential.
+        """
+        if self._pool_initialized and self.strategy_factory is not None:
+            # Use parallel pool
+            logger.info(f"Evaluating {len(individuals)} individuals with persistent pool")
+            try:
+                genes_list = [ind.genes for ind in individuals]
+                results = self.optimizer._worker_pool.evaluate_fitness_batch(
+                    strategy_factory=self.strategy_factory,
+                    genes_list=genes_list,
+                    config={}
+                )
+                for ind, result in zip(individuals, results):
+                    if result.get('success', False):
+                        ind.fitness = result.get('fitness', float('-inf'))
+                    else:
+                        logger.warning(f"Worker evaluation failed: {result.get('error', 'unknown')}")
+                        ind.fitness = float('-inf')
+                return
+            except Exception as e:
+                logger.warning(f"Parallel evaluation failed ({e}), falling back to sequential")
+        
+        # Sequential fallback
+        for ind in individuals:
+            ind.fitness = self.optimizer._evaluate_fitness(ind)
+
+
+    def _individual_to_dict(self, ind: Individual) -> dict:
+        """Convert Individual to JSON-serializable dict."""
+        return {
+            'genes': ind.genes,
+            'fitness': ind.fitness,
+            'generation': ind.generation
+        }
+    
+    def _dict_to_individual(self, d: dict) -> Individual:
+        """Convert dict back to Individual."""
+        return Individual(
+            genes=d['genes'],
+            fitness=d['fitness'],
+            generation=d.get('generation', 0)
+        )
+    
+    def load_population(self) -> bool:
+        """
+        Load population from database.
+        
+        Returns:
+            True if population was loaded, False if starting fresh
+        """
+        saved = self.db.load_ga_population(self.strategy_name)
+        
+        if saved and saved['population']:
+            # Restore population
+            self.optimizer.population = [
+                self._dict_to_individual(d) for d in saved['population']
+            ]
+            self.current_generation = saved['generation']
+            
+            # Find best individual
+            if self.optimizer.population:
+                self.optimizer.best_individual = max(
+                    self.optimizer.population, 
+                    key=lambda x: x.fitness
+                )
+                self.best_ever_fitness = saved['best_fitness']
+                self.best_ever_genes = saved['best_genes']
+            
+            logger.info(
+                f"Loaded population for {self.strategy_name}: "
+                f"Gen {self.current_generation}, "
+                f"Best fitness: {self.best_ever_fitness:.4f}, "
+                f"Population size: {len(self.optimizer.population)}"
+            )
+            return True
+        
+        logger.info(f"No saved population for {self.strategy_name}, starting fresh")
+        return False
+    
+    def save_population(self) -> None:
+        """Save current population to database."""
+        if not self.optimizer.population:
+            return
+        
+        # Convert population to JSON-serializable format
+        population_data = [
+            self._individual_to_dict(ind) for ind in self.optimizer.population
+        ]
+        
+        best = self.optimizer.best_individual
+        self.db.save_ga_population(
+            strategy=self.strategy_name,
+            generation=self.current_generation,
+            population=population_data,
+            best_fitness=best.fitness if best else 0,
+            best_genes=best.genes if best else {}
+        )
+        
+        logger.debug(f"Saved population: Gen {self.current_generation}")
+    
+    def log_generation(self, stats: dict) -> None:
+        """Log generation statistics to history."""
+        self.db.log_ga_history(
+            strategy=self.strategy_name,
+            generation=self.current_generation,
+            best_fitness=stats['best_fitness'],
+            mean_fitness=stats['mean_fitness'],
+            std_fitness=stats['std_fitness'],
+            best_genes=stats['best_genes'],
+            generations_without_improvement=self.generations_without_improvement
+        )
+    
+    def evolve_incremental(self, generations: int = None) -> Individual:
+        """
+        Run incremental evolution.
+        
+        Loads existing population (or creates new), evolves for N generations,
+        saves state, and returns best individual.
+        
+        Args:
+            generations: Number of generations to run (default: config.generations)
+            
+        Returns:
+            Best individual found
+        """
+        generations = generations or self.config.generations
+        
+        # Try to load existing population
+        loaded = self.load_population()
+        
+        if not loaded:
+            # Initialize new population
+            self.optimizer.population = [
+                self.optimizer._create_individual(0)
+                for _ in range(self.config.population_size)
+            ]
+            
+            # Evaluate initial population
+            self._evaluate_population_batch(self.optimizer.population)
+            
+            self.optimizer.best_individual = max(
+                self.optimizer.population, 
+                key=lambda x: x.fitness
+            )
+            self.best_ever_fitness = self.optimizer.best_individual.fitness
+            self.best_ever_genes = self.optimizer.best_individual.genes.copy()
+            
+            # Log initial generation
+            fitnesses = [ind.fitness for ind in self.optimizer.population]
+            self.log_generation({
+                'best_fitness': self.best_ever_fitness,
+                'mean_fitness': np.mean(fitnesses),
+                'std_fitness': np.std(fitnesses),
+                'best_genes': self.best_ever_genes
+            })
+            
+            self.save_population()
+            
+            logger.info(
+                f"Generation 0 (init): Best = {self.best_ever_fitness:.4f}"
+            )
+        
+        # Track if we found improvement this session
+        session_improved = False
+        start_fitness = self.best_ever_fitness
+        
+        # Evolve for specified generations
+        for i in range(generations):
+            self.current_generation += 1
+
+            # Evolve one generation
+            self.optimizer.population = self.optimizer._evolve_generation(
+                self.current_generation
+            )
+
+            # Evaluate new individuals (those with fitness == 0)
+            to_evaluate = [ind for ind in self.optimizer.population if ind.fitness == 0]
+            if to_evaluate:
+                self._evaluate_population_batch(to_evaluate)
+
+            # Log constraint rejection summary for this generation
+            fitnesses = [ind.fitness for ind in self.optimizer.population]
+            rejected_count = sum(1 for f in fitnesses if f == 0)
+            if rejected_count > 0:
+                logger.info(
+                    f"  Generation {self.current_generation}: "
+                    f"{rejected_count}/{len(self.optimizer.population)} rejected by constraints"
+                )
+
+            # Find generation best
+            gen_best = max(self.optimizer.population, key=lambda x: x.fitness)
+            
+            # Update global best
+            if gen_best.fitness > self.best_ever_fitness:
+                self.best_ever_fitness = gen_best.fitness
+                self.best_ever_genes = gen_best.genes.copy()
+                self.optimizer.best_individual = gen_best.copy()
+                self.generations_without_improvement = 0
+                session_improved = True
+                
+                logger.info(
+                    f"  Generation {self.current_generation}: "
+                    f"NEW BEST = {self.best_ever_fitness:.4f} 🎯"
+                )
+            else:
+                self.generations_without_improvement += 1
+                logger.info(
+                    f"  Generation {self.current_generation}: "
+                    f"Gen best = {gen_best.fitness:.4f}, "
+                    f"All-time best = {self.best_ever_fitness:.4f}"
+                )
+            
+            # Log and save progress
+            fitnesses = [ind.fitness for ind in self.optimizer.population]
+            self.log_generation({
+                'best_fitness': self.best_ever_fitness,
+                'mean_fitness': np.mean(fitnesses),
+                'std_fitness': np.std(fitnesses),
+                'best_genes': self.best_ever_genes
+            })
+            self.save_population()
+            
+            # Early stopping
+            if self.generations_without_improvement >= self.config.early_stop_generations:
+                logger.info(
+                    f"  Early stopping: No improvement for "
+                    f"{self.generations_without_improvement} generations"
+                )
+                break
+        
+        # Summary
+        improvement = self.best_ever_fitness - start_fitness
+        logger.info(
+            f"\n{self.strategy_name} evolution complete:\n"
+            f"  Generations run: {i + 1}\n"
+            f"  Best fitness: {self.best_ever_fitness:.4f}\n"
+            f"  Session improvement: {improvement:+.4f}\n"
+            f"  Best genes: {self.best_ever_genes}"
+        )
+        
+        return self.optimizer.best_individual
+    
+    def get_improvement_summary(self, days: int = 30) -> dict:
+        """
+        Get summary of improvement over time.
+        
+        Args:
+            days: Number of days to look back
+            
+        Returns:
+            Summary dict with improvement statistics
+        """
+        history = self.db.get_ga_history(self.strategy_name, days)
+        
+        if not history:
+            return {
+                'strategy': self.strategy_name,
+                'days_tracked': 0,
+                'total_generations': 0,
+                'improvement': 0,
+                'current_best': None
+            }
+        
+        first_fitness = history[0]['best_fitness']
+        last_fitness = history[-1]['best_fitness']
+        
+        return {
+            'strategy': self.strategy_name,
+            'days_tracked': days,
+            'total_generations': len(history),
+            'start_fitness': first_fitness,
+            'end_fitness': last_fitness,
+            'improvement': last_fitness - first_fitness,
+            'improvement_pct': ((last_fitness - first_fitness) / abs(first_fitness) * 100) 
+                               if first_fitness != 0 else 0,
+            'best_genes': self.best_ever_genes
+        }
+
+
+
+    # =========================================================================
+    # Persistent Pool Support for Multi-Core Parallelism
+    # =========================================================================
+
+    def init_parallel_pool(self, data: dict, vix_data=None, n_workers: int = None):
+        """
+        Initialize shared memory and configure optimizer for parallel evaluation.
+
+        Call this once before evolve_incremental() for much faster evaluation.
+        Workers stay alive across all generations.
+
+        Args:
+            data: Market data dict (symbol -> DataFrame)
+            vix_data: Optional VIX DataFrame
+            n_workers: Number of workers (default: config.n_workers)
+        """
+        if self._pool_initialized:
+            return
+
+        # Forward to the inner GeneticOptimizer
+        n = n_workers or self.config.n_workers
+        self.optimizer.init_persistent_pool(data, vix_data, n)
+        self._pool_initialized = True
+
+        logger.info(f"PersistentGAOptimizer parallel pool initialized with {n} workers")
+
+    def cleanup_parallel_pool(self):
+        """Clean up shared memory and worker pool."""
+        if self._pool_initialized:
+            self.optimizer.cleanup()
+            self._pool_initialized = False
+            logger.info("PersistentGAOptimizer parallel pool cleaned up")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.cleanup_parallel_pool()
+
+def create_backtest_fitness_fn(
+    strategy_name: str,
+    backtester,
+    data: Dict,
+    vix_data=None,
+    use_composite: bool = True,
+    walk_forward: bool = True,
+    train_ratio: float = 0.7,
+    degradation_threshold: float = 0.2
+) -> Callable[[Dict], float]:
+    """
+    Create a fitness function that runs walk-forward backtests.
+
+    Uses walk-forward validation to prevent overfitting:
+    - Splits data into 70% train / 30% test (configurable)
+    - Runs backtest on both sets
+    - Uses OUT-OF-SAMPLE (test) fitness as primary metric
+    - Penalizes strategies with high train-to-test degradation
+
+    Uses multi-metric composite fitness to prevent single-metric overfitting:
+    - Sharpe Ratio (40%): General risk-adjusted performance
+    - Sortino Ratio (30%): Downside risk-adjusted returns
+    - Calmar Ratio (20%): Return per unit of max drawdown
+    - Win Rate (10%): Consistency and psychological tradability
+
+    Args:
+        strategy_name: Name of strategy
+        backtester: Backtester instance
+        data: Historical data dict
+        vix_data: Optional VIX data
+        use_composite: If True, use multi-metric fitness (default: True)
+        walk_forward: Enable walk-forward validation (default: True)
+        train_ratio: Ratio of data for training (default: 0.7 = 70%)
+        degradation_threshold: Max allowed degradation before penalty (default: 0.2 = 20%)
+
+    Returns:
+        Fitness function: genes -> float
+    """
+    # Lazy import to avoid cascade failures
+    strategy_class = None
+
+    if strategy_name == 'vol_managed_momentum':
+        from strategies.vol_managed_momentum import VolManagedMomentumStrategy
+        strategy_class = VolManagedMomentumStrategy
+    elif strategy_name == 'mean_reversion':
+        from strategies.mean_reversion import MeanReversionStrategy
+        strategy_class = MeanReversionStrategy
+    elif strategy_name == 'pairs_trading':
+        from strategies.pairs_trading import PairsTradingStrategy
+        strategy_class = PairsTradingStrategy
+    elif strategy_name == 'relative_volume_breakout':
+        from strategies.relative_volume_breakout import RelativeVolumeBreakout
+        strategy_class = RelativeVolumeBreakout
+    if not strategy_class:
+        raise ValueError(f"Unknown strategy: {strategy_name}")
+
+    # Pre-compute train/test split if walk-forward is enabled
+    train_data = None
+    test_data = None
+    train_vix = None
+    test_vix = None
+    wf_enabled = False
+
+    if walk_forward and data:
+        # Get all unique dates across all symbols
+        all_dates = set()
+        for sym, df in data.items():
+            if df is not None and len(df) > 0:
+                all_dates.update(df.index.tolist())
+
+        if len(all_dates) >= 100:  # Need enough data points for meaningful split
+            sorted_dates = sorted(all_dates)
+            split_idx = int(len(sorted_dates) * train_ratio)
+            split_date = sorted_dates[split_idx]
+
+            # Split data
+            train_data = {}
+            test_data = {}
+            for sym, df in data.items():
+                if df is not None and len(df) > 0:
+                    train_data[sym] = df[df.index <= split_date].copy()
+                    test_data[sym] = df[df.index > split_date].copy()
+
+            # Filter out symbols with insufficient data in either split
+            train_data = {sym: df for sym, df in train_data.items() if len(df) >= 20}
+            test_data = {sym: df for sym, df in test_data.items() if len(df) >= 20}
+
+            # Split VIX data if provided
+            if vix_data is not None and len(vix_data) > 0:
+                train_vix = vix_data[vix_data.index <= split_date].copy()
+                test_vix = vix_data[vix_data.index > split_date].copy()
+
+            # Verify we have enough data in both splits
+            if len(train_data) >= 5 and len(test_data) >= 5:
+                wf_enabled = True
+                logger.debug(f"Walk-forward enabled: {len(sorted_dates)} dates, split at {split_date}")
+                logger.debug(f"  Train: {len(train_data)} symbols ({int(train_ratio*100)}%), "
+                           f"Test: {len(test_data)} symbols ({int((1-train_ratio)*100)}%)")
+            else:
+                logger.warning(f"Insufficient symbols after split (train={len(train_data)}, "
+                              f"test={len(test_data)}), using full dataset")
+        else:
+            logger.warning(f"Insufficient data for walk-forward ({len(all_dates)} dates), "
+                          "using full dataset")
+
+    def fitness_fn(genes: Dict) -> float:
+        """Evaluate genes by running backtest with walk-forward validation and composite fitness."""
+        try:
+            # Create strategy with evolved parameters
+            strategy = strategy_class(**genes)
+
+            if wf_enabled:
+                # === WALK-FORWARD VALIDATION ===
+
+                # Run backtest on TRAINING data (in-sample)
+                train_result = backtester.run(
+                    strategy=strategy,
+                    data=train_data,
+                    vix_data=train_vix
+                )
+
+                # Recreate strategy to reset any internal state
+                strategy = strategy_class(**genes)
+
+                # Run backtest on TEST data (out-of-sample)
+                test_result = backtester.run(
+                    strategy=strategy,
+                    data=test_data,
+                    vix_data=test_vix
+                )
+
+                # Apply constraint checks to TEST (out-of-sample) result
+                constraint_mult, constraint_reason = apply_fitness_constraints(
+                    test_result, strategy_name
+                )
+
+                if constraint_mult == 0:
+                    logger.debug(f"OOS Constraint rejection: {constraint_reason}")
+                    return 0.0
+
+                # Calculate fitness using composite multi-metric approach
+                if use_composite:
+                    train_fitness = calculate_composite_fitness(train_result, verbose=False)
+                    test_fitness = calculate_composite_fitness(test_result, verbose=False)
+                else:
+                    train_fitness = getattr(train_result, 'sharpe_ratio', 0)
+                    test_fitness = getattr(test_result, 'sharpe_ratio', 0)
+
+                # Handle edge cases
+                if test_fitness == float('inf') or test_fitness == float('-inf'):
+                    test_fitness = 0.0
+                if train_fitness == float('inf') or train_fitness == float('-inf'):
+                    train_fitness = 0.0
+
+                # Use OUT-OF-SAMPLE as primary fitness
+                fitness = test_fitness
+
+                # Calculate degradation and apply penalty
+                degradation = 0.0
+                if train_fitness > 0 and test_fitness < train_fitness:
+                    degradation = (train_fitness - test_fitness) / train_fitness
+                    if degradation > degradation_threshold:
+                        # Penalize fitness proportionally to degradation
+                        penalty = max(0.5, 1.0 - degradation)
+                        fitness *= penalty
+
+                # Apply constraint penalties
+                fitness *= constraint_mult
+
+                # Log walk-forward metrics for debugging
+                logger.debug(
+                    f"WF Fitness: Train={train_fitness:.3f}, Test={test_fitness:.3f}, "
+                    f"Deg={degradation:.0%}, Final={fitness:.3f}"
+                )
+
+                return float(fitness)
+
+            else:
+                # === FALLBACK: Full dataset (no walk-forward) ===
+                result = backtester.run(
+                    strategy=strategy,
+                    data=data,
+                    vix_data=vix_data
+                )
+
+                # Apply constraint checks first
+                constraint_mult, constraint_reason = apply_fitness_constraints(
+                    result, strategy_name
+                )
+
+                if constraint_mult == 0:
+                    logger.debug(f"Constraint rejection: {constraint_reason}")
+                    return 0.0
+
+                # Calculate fitness using composite multi-metric approach
+                if use_composite:
+                    base_fitness = calculate_composite_fitness(result, verbose=False)
+                else:
+                    base_fitness = getattr(result, 'sharpe_ratio', 0)
+
+                # Apply constraint penalties
+                fitness = base_fitness * constraint_mult
+
+                # Handle edge cases
+                if fitness == float('inf') or fitness == float('-inf'):
+                    return 0.0
+
+                # Log component metrics for debugging
+                logger.debug(
+                    f"Fitness: {fitness:.3f} (Sh={result.sharpe_ratio:.2f}, "
+                    f"So={result.sortino_ratio:.2f}, DD={result.max_drawdown_pct:.1f}%, "
+                    f"WR={result.win_rate:.1f}%, trades={result.total_trades})"
+                )
+
+                return float(fitness)
+
+        except Exception as e:
+            logger.warning(f"Fitness evaluation failed: {e}")
+            return 0.0
+
+    # Expose walk-forward status for debugging
+    fitness_fn.walk_forward_enabled = wf_enabled
+    return fitness_fn
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)s | %(message)s'
+    )
+    
+    print("=" * 60)
+    print("Persistent GA Optimizer Test")
+    print("=" * 60)
+    
+    # Simple test fitness function
+    def test_fitness(genes: dict) -> float:
+        """Simple test function: maximize sum of normalized parameters."""
+        return sum(genes.values()) / len(genes)
+    
+    # Test with vol_managed_momentum params
+    optimizer = PersistentGAOptimizer(
+        'vol_managed_momentum',
+        test_fitness,
+        config=GeneticConfig(
+            population_size=10,
+            generations=3,
+            early_stop_generations=2
+        )
+    )
+    
+    print("\nRunning incremental evolution...")
+    best = optimizer.evolve_incremental(generations=3)
+    
+    print(f"\nBest individual:")
+    print(f"  Genes: {best.genes}")
+    print(f"  Fitness: {best.fitness:.4f}")
+    
+    # Check if we can load and continue
+    print("\nSimulating restart...")
+    optimizer2 = PersistentGAOptimizer(
+        'vol_managed_momentum',
+        test_fitness,
+        config=GeneticConfig(
+            population_size=10,
+            generations=2
+        )
+    )
+    
+    best2 = optimizer2.evolve_incremental(generations=2)
+    
+    print(f"\nAfter restart, best:")
+    print(f"  Generation: {optimizer2.current_generation}")
+    print(f"  Fitness: {best2.fitness:.4f}")
+    
+    # Show improvement summary
+    summary = optimizer2.get_improvement_summary(days=1)
+    print(f"\nImprovement summary:")
+    for k, v in summary.items():
+        print(f"  {k}: {v}")

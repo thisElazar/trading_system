@@ -1,0 +1,13 @@
+{
+  "timestamp": "2025-12-31T01:53:41.171534-05:00",
+  "positions": [
+    "BrokerPosition(symbol='DHR', qty=29.0, side='long', avg_entry_price=230.322955, market_value=6689.43, unrealized_pnl=10.064305, unrealized_pnl_pct=0.15067755621666, current_price=230.67)",
+    "BrokerPosition(symbol='IWM', qty=38.0, side='long', avg_entry_price=249.563333, market_value=9425.14, unrealized_pnl=-58.266654, unrealized_pnl_pct=-0.61440636393488, current_price=248.03)",
+    "BrokerPosition(symbol='MS', qty=40.0, side='long', avg_entry_price=180.253167, market_value=7163.2, unrealized_pnl=-46.92668, unrealized_pnl_pct=-0.65084404314516, current_price=179.08)",
+    "BrokerPosition(symbol='QQQ', qty=15.0, side='long', avg_entry_price=619.223333, market_value=9291.45, unrealized_pnl=3.100005, unrealized_pnl_pct=0.03337519582777, current_price=619.43)",
+    "BrokerPosition(symbol='XEL', qty=80.0, side='long', avg_entry_price=74.336695, market_value=5935.2, unrealized_pnl=-11.7356, unrealized_pnl_pct=-0.19733860914854998, current_price=74.19)",
+    "BrokerPosition(symbol='XLF', qty=175.0, side='long', avg_entry_price=55.286667, market_value=9656.5, unrealized_pnl=-18.666725, unrealized_pnl_pct=-0.1929344013449, current_price=55.18)",
+    "BrokerPosition(symbol='XLK', qty=66.0, side='long', avg_entry_price=145.356667, market_value=9597.06, unrealized_pnl=3.519978, unrealized_pnl_pct=0.03669112748712, current_price=145.41)",
+    "BrokerPosition(symbol='XLY', qty=80.0, side='long', avg_entry_price=120.9, market_value=9628.8, unrealized_pnl=-43.2, unrealized_pnl_pct=-0.44665012406948, current_price=120.36)"
+  ]
+}

@@ -1,0 +1,558 @@
+"""
+Genetic Algorithm Parameter Optimizer
+=====================================
+Evolves strategy parameters using genetic algorithms.
+
+Features:
+- Tournament selection
+- Crossover and mutation
+- Elitism
+- Parallel fitness evaluation with persistent worker pool
+- Shared memory for data (no copying between processes)
+- Early stopping on convergence
+"""
+
+import random
+import logging
+import os
+from typing import Dict, List, Tuple, Callable, Any, Optional
+from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import Pool
+import numpy as np
+
+from research.discovery.shared_data import SharedDataManager
+from .ga_parallel import GAWorkerPool
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Individual:
+    """A single solution (set of parameters)."""
+    genes: Dict[str, float]
+    fitness: float = 0.0
+    generation: int = 0
+
+    def copy(self) -> 'Individual':
+        return Individual(
+            genes=self.genes.copy(),
+            fitness=self.fitness,
+            generation=self.generation
+        )
+
+
+@dataclass
+class ParameterSpec:
+    """Specification for a single parameter."""
+    name: str
+    min_val: float
+    max_val: float
+    step: float = None  # If set, parameter is discrete
+    dtype: type = float
+
+    def random_value(self) -> float:
+        if self.step:
+            n_steps = int((self.max_val - self.min_val) / self.step) + 1
+            return self.min_val + random.randint(0, n_steps - 1) * self.step
+        return random.uniform(self.min_val, self.max_val)
+
+    def mutate(self, value: float, strength: float = 0.2) -> float:
+        """Mutate value within bounds."""
+        range_size = self.max_val - self.min_val
+        delta = random.gauss(0, range_size * strength)
+        new_val = value + delta
+        new_val = max(self.min_val, min(self.max_val, new_val))
+
+        if self.step:
+            new_val = round((new_val - self.min_val) / self.step) * self.step + self.min_val
+
+        return self.dtype(new_val)
+
+
+@dataclass
+class GeneticConfig:
+    """Configuration for genetic algorithm."""
+    population_size: int = 50
+    generations: int = 20
+    mutation_rate: float = 0.1
+    crossover_rate: float = 0.7
+    elitism: int = 2  # Keep top N individuals
+    tournament_size: int = 3
+    early_stop_generations: int = 5  # Stop if no improvement
+    parallel: bool = True  # Enable parallel by default for faster optimization
+    n_workers: int = 1  # Adjust based on CPU cores (os.cpu_count() // 2 is safe)
+    use_persistent_pool: bool = True  # Use persistent worker pool with shared memory
+
+
+class GeneticOptimizer:
+    """
+    Genetic algorithm optimizer for trading strategy parameters.
+
+    Usage:
+        params = [
+            ParameterSpec('stop_loss', 0.01, 0.10, step=0.01),
+            ParameterSpec('take_profit', 0.02, 0.20, step=0.01),
+            ParameterSpec('lookback', 5, 30, step=1, dtype=int),
+        ]
+
+        def fitness_fn(genes: dict) -> float:
+            # Run backtest with these parameters
+            result = backtest(strategy, **genes)
+            return result.sharpe_ratio
+
+        optimizer = GeneticOptimizer(params, fitness_fn)
+        best = optimizer.evolve()
+        print(f"Best params: {best.genes}, fitness: {best.fitness}")
+
+    For persistent pool usage (faster for multiple generations):
+        optimizer = GeneticOptimizer(params, fitness_fn)
+        optimizer.init_persistent_pool(data, vix_data)
+        best = optimizer.evolve()
+        optimizer.cleanup()
+    """
+
+    def __init__(
+        self,
+        parameter_specs: List[ParameterSpec],
+        fitness_function: Callable[[Dict[str, float]], float],
+        config: GeneticConfig = None,
+        strategy_factory: Callable = None
+    ):
+        self.specs = {p.name: p for p in parameter_specs}
+        self.fitness_fn = fitness_function
+        self.config = config or GeneticConfig()
+        self.strategy_factory = strategy_factory
+
+        self.population: List[Individual] = []
+        self.best_individual: Optional[Individual] = None
+        self.history: List[Dict] = []
+
+        # Persistent pool state
+        self._shared_data_manager: Optional[SharedDataManager] = None
+        self._worker_pool: Optional[GAWorkerPool] = None
+        self._pool_initialized = False
+
+    # =========================================================================
+    # Persistent Pool Support
+    # =========================================================================
+
+    def init_persistent_pool(
+        self,
+        data: Dict,
+        vix_data = None,
+        n_workers: int = None
+    ):
+        """
+        Initialize shared memory and persistent worker pool.
+
+        Call this once before evolve() for best performance.
+        Workers stay alive across all generations.
+
+        Args:
+            data: Market data dict (symbol -> DataFrame)
+            vix_data: Optional VIX DataFrame
+            n_workers: Number of workers (default: config.n_workers)
+        """
+        # Create shared memory manager
+        self._shared_data_manager = SharedDataManager()
+        self._shared_data_manager.load_data(data, vix_data)
+
+        # Create persistent worker pool
+        n = n_workers or self.config.n_workers
+        self._worker_pool = GAWorkerPool(
+            n_workers=n,
+            shared_metadata=self._shared_data_manager.get_metadata()
+        )
+        self._worker_pool.start()
+        self._pool_initialized = True
+
+        logger.info(f"Persistent pool initialized with {n} workers")
+
+    def cleanup(self):
+        """Clean up shared memory and worker pool."""
+        if self._worker_pool is not None:
+            self._worker_pool.shutdown()
+            self._worker_pool = None
+
+        if self._shared_data_manager is not None:
+            self._shared_data_manager.cleanup()
+            self._shared_data_manager = None
+
+        self._pool_initialized = False
+        logger.info("Persistent pool cleaned up")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.cleanup()
+
+    # =========================================================================
+    # Core GA Methods
+    # =========================================================================
+
+    def _create_individual(self, generation: int = 0) -> Individual:
+        """Create random individual."""
+        genes = {name: spec.random_value() for name, spec in self.specs.items()}
+        return Individual(genes=genes, generation=generation)
+
+    def _evaluate_fitness(self, individual: Individual) -> float:
+        """Evaluate fitness of an individual."""
+        try:
+            return self.fitness_fn(individual.genes)
+        except Exception as e:
+            logger.warning(f"Fitness evaluation failed: {e}")
+            return float('-inf')
+
+    def _tournament_select(self) -> Individual:
+        """Select individual via tournament selection."""
+        contestants = random.sample(self.population, self.config.tournament_size)
+        return max(contestants, key=lambda x: x.fitness)
+
+    def _crossover(self, parent1: Individual, parent2: Individual, generation: int) -> Tuple[Individual, Individual]:
+        """Single-point crossover."""
+        if random.random() > self.config.crossover_rate:
+            return parent1.copy(), parent2.copy()
+
+        child1_genes = {}
+        child2_genes = {}
+
+        param_names = list(self.specs.keys())
+        crossover_point = random.randint(1, len(param_names) - 1)
+
+        for i, name in enumerate(param_names):
+            if i < crossover_point:
+                child1_genes[name] = parent1.genes[name]
+                child2_genes[name] = parent2.genes[name]
+            else:
+                child1_genes[name] = parent2.genes[name]
+                child2_genes[name] = parent1.genes[name]
+
+        return (
+            Individual(genes=child1_genes, generation=generation),
+            Individual(genes=child2_genes, generation=generation)
+        )
+
+    def _mutate(self, individual: Individual) -> Individual:
+        """Mutate individual's genes."""
+        mutated = individual.copy()
+
+        for name, spec in self.specs.items():
+            if random.random() < self.config.mutation_rate:
+                mutated.genes[name] = spec.mutate(mutated.genes[name])
+
+        return mutated
+
+    def _evolve_generation(self, generation: int) -> List[Individual]:
+        """Create next generation."""
+        # Sort by fitness
+        self.population.sort(key=lambda x: x.fitness, reverse=True)
+
+        # Elitism - keep best individuals
+        new_population = [ind.copy() for ind in self.population[:self.config.elitism]]
+
+        # Fill rest with offspring
+        while len(new_population) < self.config.population_size:
+            parent1 = self._tournament_select()
+            parent2 = self._tournament_select()
+
+            child1, child2 = self._crossover(parent1, parent2, generation)
+            child1 = self._mutate(child1)
+            child2 = self._mutate(child2)
+
+            new_population.extend([child1, child2])
+
+        return new_population[:self.config.population_size]
+
+    def _evaluate_population_persistent(self, individuals: List[Individual]) -> None:
+        """Evaluate fitness using persistent worker pool with shared memory."""
+        if not self._pool_initialized:
+            raise RuntimeError("Pool not initialized - call init_persistent_pool first")
+
+        # Check if strategy_factory is available for parallel evaluation
+        if self.strategy_factory is None:
+            logger.info("No strategy_factory provided, using fitness_fn (sequential in main process)")
+            self._evaluate_population_sequential(individuals)
+            return
+
+        # Filter to only evaluate individuals that need evaluation
+        to_evaluate = [(i, ind) for i, ind in enumerate(individuals) if ind.fitness == 0]
+
+        if not to_evaluate:
+            return
+
+        logger.info(f"Evaluating {len(to_evaluate)} individuals with persistent pool ({self.config.n_workers} workers)")
+
+        # Get genes list for batch evaluation
+        genes_list = [ind.genes for _, ind in to_evaluate]
+        config_dict = {}  # Can pass additional config if needed
+
+        try:
+            # Use persistent pool for evaluation
+            results = self._worker_pool.evaluate_fitness_batch(
+                strategy_factory=self.strategy_factory,
+                genes_list=genes_list,
+                config=config_dict
+            )
+
+            # Process results
+            for (idx, _), result in zip(to_evaluate, results):
+                if result.get('success', False):
+                    individuals[idx].fitness = result.get('fitness', float('-inf'))
+                else:
+                    logger.warning(f"Evaluation failed: {result.get('error', 'unknown')}")
+                    individuals[idx].fitness = float('-inf')
+
+        except Exception as e:
+            logger.warning(f"Persistent pool evaluation failed ({e}), falling back to sequential")
+            self._evaluate_population_sequential(individuals)
+
+    def _evaluate_population_parallel(self, individuals: List[Individual]) -> None:
+        """Evaluate fitness for multiple individuals in parallel (legacy method)."""
+        # Filter to only evaluate individuals that need evaluation
+        to_evaluate = [(i, ind) for i, ind in enumerate(individuals) if ind.fitness == 0]
+
+        if not to_evaluate:
+            return
+
+        logger.info(f"Evaluating {len(to_evaluate)} individuals in parallel with {self.config.n_workers} workers")
+
+        try:
+            with ProcessPoolExecutor(max_workers=self.config.n_workers) as executor:
+                # Submit all fitness evaluations
+                future_to_idx = {
+                    executor.submit(self.fitness_fn, ind.genes): idx
+                    for idx, ind in to_evaluate
+                }
+
+                # Collect results as they complete
+                completed = 0
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        fitness = future.result()
+                        individuals[idx].fitness = fitness
+                        completed += 1
+                    except Exception as e:
+                        logger.warning(f"Parallel fitness evaluation failed for individual {idx}: {e}")
+                        individuals[idx].fitness = float('-inf')
+
+                # If all failed, fall back to sequential
+                if completed == 0:
+                    raise RuntimeError("All parallel evaluations failed")
+
+        except Exception as e:
+            # Fall back to sequential if parallel fails (e.g., pickling issues)
+            logger.warning(f"Parallel execution failed ({e}), falling back to sequential")
+            self._evaluate_population_sequential(individuals)
+
+    def _evaluate_population_sequential(self, individuals: List[Individual]) -> None:
+        """Evaluate fitness for multiple individuals sequentially."""
+        for ind in individuals:
+            if ind.fitness == 0:
+                ind.fitness = self._evaluate_fitness(ind)
+
+    def evolve(self) -> Individual:
+        """
+        Run genetic algorithm evolution.
+
+        Returns:
+            Best individual found
+        """
+        # Initialize population
+        self.population = [
+            self._create_individual(0)
+            for _ in range(self.config.population_size)
+        ]
+
+        # Choose evaluation method based on configuration and pool state
+        if self._pool_initialized and self.config.use_persistent_pool:
+            evaluate_fn = self._evaluate_population_persistent
+        elif self.config.parallel:
+            evaluate_fn = self._evaluate_population_parallel
+        else:
+            evaluate_fn = self._evaluate_population_sequential
+
+        # Evaluate initial population
+        evaluate_fn(self.population)
+
+        self.best_individual = max(self.population, key=lambda x: x.fitness)
+        generations_without_improvement = 0
+
+        logger.info(f"Generation 0: Best fitness = {self.best_individual.fitness:.4f}")
+
+        for gen in range(1, self.config.generations + 1):
+            # Evolve
+            self.population = self._evolve_generation(gen)
+
+            # Evaluate fitness
+            evaluate_fn(self.population)
+
+            # Update best
+            gen_best = max(self.population, key=lambda x: x.fitness)
+
+            if gen_best.fitness > self.best_individual.fitness:
+                self.best_individual = gen_best.copy()
+                generations_without_improvement = 0
+            else:
+                generations_without_improvement += 1
+
+            # Record history
+            fitnesses = [ind.fitness for ind in self.population]
+            self.history.append({
+                'generation': gen,
+                'best_fitness': self.best_individual.fitness,
+                'gen_best': gen_best.fitness,
+                'mean_fitness': np.mean(fitnesses),
+                'std_fitness': np.std(fitnesses)
+            })
+
+            logger.info(
+                f"Generation {gen}: Best = {self.best_individual.fitness:.4f}, "
+                f"Gen best = {gen_best.fitness:.4f}, Mean = {np.mean(fitnesses):.4f}"
+            )
+
+            # Early stopping
+            if generations_without_improvement >= self.config.early_stop_generations:
+                logger.info(f"Early stopping: No improvement for {generations_without_improvement} generations")
+                break
+
+        return self.best_individual
+
+    def get_top_n(self, n: int = 5) -> List[Individual]:
+        """Get top N individuals from final population."""
+        return sorted(self.population, key=lambda x: x.fitness, reverse=True)[:n]
+
+
+# Predefined parameter specs for common strategies
+# These define the search space for genetic optimization
+# Ranges are tightened based on academic research to prevent overfitting
+STRATEGY_PARAMS = {
+    'gap_fill': [
+        # Gap thresholds based on Plastun et al. (2020) - momentum strongest for 0.5-2% gaps
+        ParameterSpec('min_gap_pct', 0.005, 0.015, step=0.005),  # 0.5-1.5%
+        ParameterSpec('max_gap_pct', 0.02, 0.04, step=0.005),    # 2-4% (tightened from 10%)
+        # Stop loss: research suggests 0.5-1.5% for intraday momentum
+        ParameterSpec('stop_loss_pct', 0.005, 0.015, step=0.005),  # Was 0.25-1.00!
+    ],
+
+    'pairs_trading': [
+        # Entry z-score: Gatev et al. (2006) suggest 2.0 standard
+        ParameterSpec('entry_z', 1.5, 2.5, step=0.25),           # Tightened from 3.0 max
+        ParameterSpec('exit_z', 0.25, 0.75, step=0.25),          # Tightened from 1.0 max
+        # Stop must be > entry (add buffer minimum) - Caldeira & Moura (2013)
+        ParameterSpec('stop_z', 3.5, 5.0, step=0.5),             # Min is entry_max + 1.0
+        # Cointegration requirements - Vidyamurthy (2004)
+        ParameterSpec('min_correlation', 0.7, 0.9, step=0.1),    # Tightened from 0.5
+        ParameterSpec('max_half_life', 20, 40, step=5, dtype=int),  # Tightened
+        # Position management
+        ParameterSpec('max_hold_days', 10, 30, step=5, dtype=int),
+    ],
+
+    'relative_volume_breakout': [
+        # Lee et al. (2016): Effect strongest with high abnormal volume
+        ParameterSpec('min_rv', 1.5, 2.5, step=0.25),            # Relative volume threshold
+        # Gap filter - tightened for meaningful breakouts
+        ParameterSpec('min_gap_pct', 0.01, 0.025, step=0.005),   # Tightened
+        # ATR-based stops - research: 1.0-1.5x ATR for intraday
+        ParameterSpec('atr_stop_mult', 1.0, 1.5, step=0.25),     # Tightened from 0.75
+        # ATR-based targets - 2:1 R:R minimum per professional standards
+        ParameterSpec('atr_target_mult', 2.0, 3.0, step=0.25),   # Reasonable R:R
+        # Hold period - 1 day optimal for intraday momentum capture
+        ParameterSpec('max_hold_days', 1, 2, step=1, dtype=int),
+    ],
+
+    'vol_managed_momentum': [
+        # Barroso & Santa-Clara (2015): 12-month formation optimal
+        ParameterSpec('formation_period', 189, 273, step=21, dtype=int),  # 9-13 months
+        ParameterSpec('skip_period', 14, 28, step=7, dtype=int),          # 2-4 weeks (skip short-term reversal)
+        # Volatility management - Moreira & Muir (2017) + empirical best
+        ParameterSpec('vol_lookback', 14, 126, step=7, dtype=int),        # 2 weeks - 6 months (widened)
+        ParameterSpec('target_vol', 0.10, 0.25, step=0.025),              # 10-25% target (widened to include best=0.20)
+        # Portfolio construction - allow wider range around empirical best
+        ParameterSpec('top_pct', 0.10, 0.30, step=0.025),                 # Top 10-30% (widened to include best=0.25)
+    ],
+}
+
+
+# =============================================================================
+# CLI Demo
+# =============================================================================
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    print("\n" + "=" * 60)
+    print("GENETIC OPTIMIZER DEMO")
+    print("=" * 60)
+
+    # Example: optimize simple parameters
+    params = [
+        ParameterSpec('x', -10, 10, step=0.1),
+        ParameterSpec('y', -10, 10, step=0.1),
+    ]
+
+    # Fitness function: minimize distance from (3, 4)
+    def fitness_fn(genes):
+        x, y = genes['x'], genes['y']
+        return -((x - 3)**2 + (y - 4)**2)  # Negative because we maximize
+
+    config = GeneticConfig(
+        population_size=20,
+        generations=10,
+        parallel=False  # Demo runs sequentially
+    )
+
+    optimizer = GeneticOptimizer(params, fitness_fn, config)
+    best = optimizer.evolve()
+
+    print(f"\nBest solution: x={best.genes['x']:.2f}, y={best.genes['y']:.2f}")
+    print(f"Fitness: {best.fitness:.4f}")
+    print(f"Expected: x=3.00, y=4.00, fitness=0.0000")
+
+
+# =============================================================================
+# Convenience function for quick optimization
+# =============================================================================
+
+def optimize_strategy(
+    parameter_specs: List[ParameterSpec],
+    fitness_function: Callable[[Dict[str, float]], float],
+    config: GeneticConfig = None,
+    data: Dict = None,
+    vix_data = None,
+    use_persistent_pool: bool = True
+) -> Individual:
+    """
+    Convenience function to run a GA optimization.
+
+    Args:
+        parameter_specs: List of ParameterSpec defining the search space
+        fitness_function: Function that takes genes dict and returns fitness
+        config: Optional GeneticConfig
+        data: Optional market data for persistent pool
+        vix_data: Optional VIX data for persistent pool
+        use_persistent_pool: If True and data provided, use shared memory pool
+
+    Returns:
+        Best Individual found
+    """
+    config = config or GeneticConfig()
+
+    optimizer = GeneticOptimizer(
+        parameter_specs=parameter_specs,
+        fitness_function=fitness_function,
+        config=config
+    )
+
+    try:
+        if use_persistent_pool and data is not None:
+            optimizer.init_persistent_pool(data, vix_data)
+
+        best = optimizer.evolve()
+        return best
+
+    finally:
+        if use_persistent_pool:
+            optimizer.cleanup()

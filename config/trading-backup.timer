@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Trading System Database Backup
+
+[Timer]
+# Run at 5:00 AM ET (before market prep)
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

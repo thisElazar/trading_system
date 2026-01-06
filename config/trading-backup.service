@@ -1,0 +1,14 @@
+[Unit]
+Description=Trading System Database Backup
+After=network.target
+
+[Service]
+Type=oneshot
+User=thiselazar
+WorkingDirectory=/home/thiselazar/trading_system
+ExecStart=/home/thiselazar/trading_system/venv/bin/python /home/thiselazar/trading_system/scripts/backup_databases.py --full
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

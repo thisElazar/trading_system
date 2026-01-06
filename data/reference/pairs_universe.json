@@ -1,0 +1,68 @@
+{
+  "technology": [
+    [
+      "AAPL",
+      "MSFT"
+    ],
+    [
+      "GOOGL",
+      "META"
+    ],
+    [
+      "NVDA",
+      "AMD"
+    ]
+  ],
+  "financials": [
+    [
+      "JPM",
+      "BAC"
+    ],
+    [
+      "GS",
+      "MS"
+    ],
+    [
+      "V",
+      "MA"
+    ]
+  ],
+  "healthcare": [
+    [
+      "JNJ",
+      "PFE"
+    ],
+    [
+      "UNH",
+      "CVS"
+    ],
+    [
+      "ABBV",
+      "MRK"
+    ]
+  ],
+  "energy": [
+    [
+      "XOM",
+      "CVX"
+    ],
+    [
+      "COP",
+      "EOG"
+    ]
+  ],
+  "consumer": [
+    [
+      "HD",
+      "LOW"
+    ],
+    [
+      "MCD",
+      "SBUX"
+    ],
+    [
+      "NKE",
+      "LULU"
+    ]
+  ]
+}

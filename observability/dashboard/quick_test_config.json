@@ -1,0 +1,6 @@
+{
+    "mode": "auto",
+    "manual_strategy": "mean_reversion",
+    "generations": 1,
+    "notes": "mode options: 'auto' (picks best strategy) or 'manual' (uses manual_strategy)"
+}

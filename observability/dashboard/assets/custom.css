@@ -1,0 +1,179 @@
+/* Custom CSS for Trading Dashboard */
+
+/* Blinking effect for halted trading */
+@keyframes blink-danger {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+.blink-danger {
+    animation: blink-danger 1s infinite;
+}
+
+/* Circuit breaker card styling */
+.border-danger {
+    border-color: #dc3545 !important;
+}
+
+.border-warning {
+    border-color: #ffc107 !important;
+}
+
+.border-success {
+    border-color: #28a745 !important;
+}
+
+/* =============================================
+   HEADER STATUS BAR PANELS
+   ============================================= */
+
+/* Base panel styling for header elements */
+.status-panel {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    padding: 8px 12px;
+    height: 100%;
+    display: flex;
+    align-items: center;
+}
+
+/* Panel with label on top */
+.status-panel-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: rgba(255, 255, 255, 0.5);
+    margin-bottom: 2px;
+}
+
+/* P&L panel - subtle green tint when positive */
+.status-panel-pnl {
+    border-left: 3px solid #6c757d;
+}
+
+.status-panel-pnl.positive {
+    border-left-color: #28a745;
+}
+
+.status-panel-pnl.negative {
+    border-left-color: #dc3545;
+}
+
+/* Market status panel */
+.status-panel-market {
+    border-left: 3px solid #17a2b8;
+}
+
+/* Circuit breaker panel */
+.status-panel-cb {
+    border-left: 3px solid #28a745;
+}
+
+.status-panel-cb.halted {
+    border-left-color: #dc3545;
+    background: rgba(220, 53, 69, 0.1);
+}
+
+.status-panel-cb.warning {
+    border-left-color: #ffc107;
+    background: rgba(255, 193, 7, 0.1);
+}
+
+/* System performance panel */
+.status-panel-perf {
+    border-left: 3px solid #6f42c1;
+}
+
+/* Orchestrator panel */
+.status-panel-orch {
+    border-left: 3px solid #fd7e14;
+}
+
+.status-panel-orch.running {
+    border-left-color: #28a745;
+}
+
+.status-panel-orch.stopped {
+    border-left-color: #dc3545;
+    background: rgba(220, 53, 69, 0.1);
+}
+
+/* =============================================
+   MOBILE RESPONSIVE STYLES
+   ============================================= */
+
+/* Stack all columns on mobile (< 768px) */
+@media (max-width: 767px) {
+    /* Force all columns to full width on mobile */
+    .col, .col-1, .col-2, .col-3, .col-4, .col-5, .col-6,
+    .col-7, .col-8, .col-9, .col-10, .col-11, .col-12,
+    [class*="col-"] {
+        flex: 0 0 100% !important;
+        max-width: 100% !important;
+        padding-left: 10px;
+        padding-right: 10px;
+    }
+
+    /* Add spacing between stacked sections */
+    .row {
+        margin-left: 0;
+        margin-right: 0;
+    }
+
+    .row > [class*="col-"] {
+        margin-bottom: 15px;
+    }
+
+    /* Smaller padding on cards */
+    .card-body {
+        padding: 0.75rem;
+    }
+
+    /* Smaller text for mobile */
+    .display-4 {
+        font-size: 1.5rem;
+    }
+
+    h1, .h1 { font-size: 1.5rem; }
+    h2, .h2 { font-size: 1.25rem; }
+    h3, .h3 { font-size: 1.1rem; }
+    h4, .h4 { font-size: 1rem; }
+
+    /* Button groups - stack vertically on mobile */
+    .btn-group {
+        flex-direction: column;
+        width: 100%;
+    }
+
+    .btn-group > .btn {
+        margin-bottom: 5px;
+        border-radius: 0.25rem !important;
+    }
+
+    /* Tables - allow horizontal scroll */
+    .table-responsive {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* Make data tables scrollable */
+    .dash-spreadsheet-container {
+        overflow-x: auto !important;
+    }
+
+    /* Charts - reduce height on mobile */
+    .js-plotly-plot {
+        max-height: 250px;
+    }
+
+    /* Header row adjustments */
+    .navbar, .container-fluid > .row:first-child {
+        padding: 0.5rem;
+    }
+
+    /* Hide less important elements on mobile */
+    .d-none-mobile {
+        display: none !important;
+    }
+}

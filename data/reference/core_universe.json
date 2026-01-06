@@ -1,0 +1,48 @@
+{
+  "indices": [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "DIA"
+  ],
+  "mega_cap": [
+    "AAPL",
+    "MSFT",
+    "GOOGL",
+    "AMZN",
+    "NVDA",
+    "META",
+    "TSLA"
+  ],
+  "sector_etfs": [
+    "XLB",
+    "XLC",
+    "XLE",
+    "XLF",
+    "XLI",
+    "XLK",
+    "XLP",
+    "XLRE",
+    "XLU",
+    "XLV",
+    "XLY"
+  ],
+  "bond_etfs": [
+    "TLT",
+    "IEF",
+    "SHY",
+    "BND",
+    "AGG"
+  ],
+  "volatility": [
+    "VXX",
+    "VIXY",
+    "UVXY"
+  ],
+  "commodities": [
+    "GLD",
+    "SLV",
+    "USO",
+    "UNG"
+  ]
+}

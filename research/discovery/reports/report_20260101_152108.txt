@@ -1,0 +1,28 @@
+
+================================================================================
+AUTONOMOUS STRATEGY DISCOVERY REPORT
+================================================================================
+
+Run Information:
+  Run ID: c917b225
+  Start Time: 2026-01-01T15:10:57.754285
+  End Time: 2026-01-01T15:21:08.106597
+  Duration: 0.17 hours
+
+Evolution Statistics:
+  Generations Completed: 5
+  Total Strategies Evaluated: 729
+  Strategies Saved to DB: 85
+  Pareto Front Size: 35
+  Final Diversity: 0.4834
+  Best Sortino: 1.476
+
+Island Performance:
+    Island 0: best=1.398, diversity=0.554
+    Island 1: best=1.467, diversity=0.602
+    Island 2: best=1.467, diversity=0.282
+    Island 3: best=1.432, diversity=0.463
+    Island 4: best=1.384, diversity=0.384
+    Island 5: best=1.476, diversity=0.616
+
+================================================================================

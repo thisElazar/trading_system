@@ -1,0 +1,64 @@
+# Coverage.py Configuration for Trading System
+# =============================================
+# Run: pytest --cov=. --cov-config=.coveragerc --cov-report=html
+
+[run]
+# Source directories to measure
+source =
+    execution
+    strategies
+    data
+    research
+
+# Branch coverage
+branch = True
+
+# Parallel execution support
+parallel = True
+data_file = .coverage
+
+# Omit patterns
+omit =
+    */tests/*
+    */__pycache__/*
+    */venv/*
+    scripts/*
+    config.py
+    setup.py
+
+[report]
+# Minimum threshold
+fail_under = 60
+
+# Precision
+precision = 2
+
+# Show missing lines
+show_missing = True
+
+# Skip empty files
+skip_empty = True
+
+# Exclude patterns
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
+    @abstractmethod
+    if TYPE_CHECKING:
+    if __name__ == .__main__.:
+
+# Sort by coverage
+sort = Cover
+
+[html]
+directory = htmlcov
+title = Trading System Coverage Report
+show_contexts = True
+
+[xml]
+output = coverage.xml
+
+[json]
+output = coverage.json
+pretty_print = True

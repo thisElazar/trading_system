@@ -1,0 +1,46 @@
+{
+  "XLB": {
+    "name": "Materials",
+    "type": "cyclical"
+  },
+  "XLC": {
+    "name": "Communication Services",
+    "type": "growth"
+  },
+  "XLE": {
+    "name": "Energy",
+    "type": "cyclical"
+  },
+  "XLF": {
+    "name": "Financials",
+    "type": "cyclical"
+  },
+  "XLI": {
+    "name": "Industrials",
+    "type": "cyclical"
+  },
+  "XLK": {
+    "name": "Technology",
+    "type": "growth"
+  },
+  "XLP": {
+    "name": "Consumer Staples",
+    "type": "defensive"
+  },
+  "XLRE": {
+    "name": "Real Estate",
+    "type": "rate_sensitive"
+  },
+  "XLU": {
+    "name": "Utilities",
+    "type": "defensive"
+  },
+  "XLV": {
+    "name": "Healthcare",
+    "type": "defensive"
+  },
+  "XLY": {
+    "name": "Consumer Discretionary",
+    "type": "cyclical"
+  }
+}
