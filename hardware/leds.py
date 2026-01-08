@@ -279,13 +279,21 @@ class LEDController:
             self.blink(led, color, interval=period/2)
 
     def flash_all(self, color: str = 'white', times: int = 3, interval: float = 0.1) -> None:
-        """Flash all LEDs synchronously (blocking)."""
+        """Flash all LEDs synchronously (blocking). Restores previous state after."""
+        # Save current state
+        saved_colors = self._current_colors.copy()
+
         self._stop_all_blinks()
         for _ in range(times):
             self.set_all(color)
             time.sleep(interval)
             self.all_off()
             time.sleep(interval)
+
+        # Restore previous LED state
+        for led, led_color in saved_colors.items():
+            if led_color != 'off':
+                self.set_color(led, led_color)
 
     def startup_sequence(self) -> None:
         """Run a startup LED sequence to confirm hardware is working."""

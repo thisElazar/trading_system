@@ -20,6 +20,14 @@ from enum import Enum, auto
 from .display import LCDDisplay, get_display_manager
 from .gpio_config import LCD_TRADING_ADDR, GPIO_CHIP, ENCODER_PINS
 
+# Import LED controller for feedback
+try:
+    from .leds import get_led_controller
+    HAS_LEDS = True
+except ImportError:
+    get_led_controller = None
+    HAS_LEDS = False
+
 
 class DisplayPage(Enum):
     """Available display pages."""
@@ -78,6 +86,16 @@ class ScreenController:
         self._debounce_ms: float = 150  # Minimum ms between page changes
         self._button_press_time: float = 0  # For long-press detection
         self._backlight_on: bool = True
+        self._reset_feedback_given: bool = False  # LED blink given at 5s threshold
+        self._reset_hold_threshold: float = 5.0  # Seconds to hold for reset
+
+        # LED controller for feedback
+        self._leds = None
+        if HAS_LEDS:
+            try:
+                self._leds = get_led_controller()
+            except Exception:
+                pass
 
         # Screensaver animation
         self._screensaver_frame: int = 0
@@ -184,13 +202,32 @@ class ScreenController:
                 # Button press detection (falling edge - button down)
                 if self._last_sw == 1 and sw == 0:
                     self._button_press_time = now
+                    self._reset_feedback_given = False
+
+                # While button is held, check for 5-second threshold
+                if sw == 0 and self._button_press_time > 0:
+                    hold_duration = now - self._button_press_time
+                    # Give LED feedback at 5-second threshold (once)
+                    if hold_duration >= self._reset_hold_threshold and not self._reset_feedback_given:
+                        self._reset_feedback_given = True
+                        # Blink LEDs to confirm reset threshold reached
+                        if self._leds:
+                            try:
+                                self._leds.flash_all('cyan', times=3, interval=0.1)
+                            except Exception:
+                                pass
 
                 # Button release detection
                 if self._last_sw == 0 and sw == 1:
                     press_duration = now - self._button_press_time
-                    if press_duration >= 1.0:  # Long press (>= 1 second)
+                    if press_duration >= self._reset_hold_threshold:
+                        # 5+ second hold: Reset screen
+                        self._reset_screen()
+                    elif press_duration >= 1.0:
+                        # 1-5 second hold: Toggle backlight
                         self._toggle_backlight()
-                    else:  # Short click
+                    else:
+                        # Short click
                         self._on_click()
 
                 self._last_clk = clk
@@ -212,6 +249,36 @@ class ScreenController:
                     self._screen._lcd.backlight_enabled = False
             except Exception:
                 pass
+
+    def _reset_screen(self) -> None:
+        """Reset the LCD screen by reinitializing it."""
+        print("[ScreenController] Screen reset requested via button hold")
+
+        # Flash LEDs green to confirm reset is happening
+        if self._leds:
+            try:
+                self._leds.flash_all('green', times=2, interval=0.15)
+            except Exception:
+                pass
+
+        # Reinitialize the LCD
+        success = self._screen.reinit()
+
+        if success:
+            # Reinitialize custom chars for screensaver
+            self._gol_chars_initialized = False
+            self._backlight_on = True
+            # Render current page
+            self._render_current_page()
+            print("[ScreenController] Screen reset successful")
+        else:
+            # Flash red to indicate failure
+            if self._leds:
+                try:
+                    self._leds.flash_all('red', times=3, interval=0.2)
+                except Exception:
+                    pass
+            print("[ScreenController] Screen reset failed")
 
     def _on_click(self) -> None:
         """Handle encoder click - scroll positions or reset screensaver."""

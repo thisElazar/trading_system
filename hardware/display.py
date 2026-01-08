@@ -8,10 +8,13 @@ Controls 20x4 I2C character LCD displays:
 Uses RPLCD library for LCD control.
 """
 
+import logging
 import threading
 import time
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 try:
     from RPLCD.i2c import CharLCD
@@ -96,6 +99,26 @@ class LCDDisplay:
         """Check if LCD is available."""
         return self._available
 
+    def reinit(self) -> bool:
+        """
+        Reinitialize the LCD. Use this to recover from I2C errors.
+
+        Returns True if successful.
+        """
+        print(f"[{self.name}] Attempting LCD reinit at 0x{self.address:02X}")
+        self._available = False
+        self._lcd = None
+
+        # Small delay to let I2C bus settle
+        time.sleep(0.5)
+
+        success = self._init_lcd()
+        if success:
+            print(f"[{self.name}] LCD reinit successful")
+        else:
+            print(f"[{self.name}] LCD reinit failed")
+        return success
+
     def clear(self) -> None:
         """Clear the display."""
         if not self._available:
@@ -103,8 +126,9 @@ class LCDDisplay:
         with self._lock:
             try:
                 self._lcd.clear()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[{self.name}] LCD clear failed: {e}")
+                self._available = False  # Mark as unavailable for reinit
 
     def write_line(self, line: int, text: str, center: bool = False) -> None:
         """
@@ -129,8 +153,9 @@ class LCDDisplay:
             try:
                 self._lcd.cursor_pos = (line, 0)
                 self._lcd.write_string(text)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[{self.name}] LCD write failed (line {line}): {e}")
+                self._available = False  # Mark as unavailable for reinit
 
     def write_all(self, lines: List[str], center: bool = False) -> None:
         """
