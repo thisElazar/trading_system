@@ -390,22 +390,24 @@ Created `requirements.lock` with 84 pinned dependencies:
 ### P0 - Critical
 
 #### GA-001: GA Stagnation Detection
-**Status:** Observed but not handled
-**Impact:** Wasted compute on converged populations
+**Status:** IMPLEMENTED (2026-01-08)
+**Impact:** Reduced wasted compute on converged populations
 
 **Evidence:**
 ```
 mean_reversion: generations 26-31 all at fitness 0.53
 ```
 
-**Current State:**
-- Adaptive mutation increases when stagnant
-- But population may have converged to local optimum
+**Solution Applied:**
+The `PersistentGAOptimizer` now has comprehensive anti-stagnation:
 
-**Next Steps:**
-1. Implement diversity injection when stagnant >5 generations
-2. Add restart mechanism (fresh random population)
-3. Track and log stagnation events
+1. **Fitness-based diversity injection** - Replace low-fitness individuals when >50% failing
+2. **Similarity-based diversity injection** - Detect and break converged populations (>85% identical genes)
+3. **Adaptive mutation** - Increase from 15% → 40% when stagnating
+4. **Hard reset** (NEW) - After 10 generations without improvement, reset entire population except top 2 elites
+
+**Files Modified:**
+- `research/genetic/persistent_optimizer.py` - Added `_hard_reset_population()` method
 
 ---
 
@@ -519,9 +521,9 @@ vol_managed_momentum gen 6: 8.88
 
 ---
 
-## PRE-LAUNCH AUDIT (January 4, 2026)
+## PRE-LAUNCH AUDIT (Updated January 7, 2026)
 
-### System Status: READY WITH CAVEATS
+### System Status: LIVE TRADING ACTIVE
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -530,31 +532,33 @@ vol_managed_momentum gen 6: 8.88
 | Memory | Healthy | 1.3GB used, 2.7GB available |
 | Disk | Healthy | 9% used (203GB free) |
 | Kill Switch | Clear | No halt files present |
-| Data | Stale (weekend) | VIX: Jan 2, SPY: Dec 30 - will refresh Monday |
+| Data | Live | Data refreshing during market hours |
+| Hardware | Active | LED breathing working, LCD display operational |
+| RapidGainScaler | Disabled | Removed to let strategy performance shine through |
 
-### Critical Items for Monday Morning
+### Recent Session Fixes (Jan 7)
 
-1. **Position Sync Will Run at PRE_MARKET (8:00 AM ET)**
-   - 8 broker positions currently not in local DB
-   - Sync task now works (tested - was fixed between Jan 2-4)
-   - Watch for "Position sync complete: 8 new" in logs
+1. **LED Breathing Fix**
+   - `flash_all()` now preserves and restores breathing state
+   - Research LED properly shows blue breathing during overnight evolution
+   - Added `_breathing_params` dict to track breathing configuration
 
-2. **Data Refresh Required**
-   - SPY data is 5 days old (Dec 30)
-   - VIX data is 2 days old (Jan 2)
-   - refresh_data task runs at PRE_MARKET
-   - Verify: `tail -f logs/orchestrator.log | grep -i refresh`
+2. **RapidGainScaler Disabled**
+   - Removed `check_rapid_gains` from MARKET_OPEN phase tasks
+   - Allows strategy performance to flow through without early trimming
+   - Can re-enable later if desired with modified thresholds
 
-3. **ML Regime Detector**
-   - Timezone bug FIXED in this session
-   - Should train successfully Monday
-   - Watch for: "Training regime detection model..."
+3. **Documentation Created**
+   - `docs/DAY_CYCLE.md` - Complete operational cycle reference
+   - Updated all related docs with cross-references
 
-### Items That Can Wait
+### Items Already Resolved (from Jan 4)
 
-- Pairs trading debugging (5% allocation, keep conservative)
-- GP discovery validation (R&D, not blocking)
-- Dashboard real-time P&L (nice to have)
+- ✅ Position sync working
+- ✅ Timezone bug fixed
+- ✅ ML regime detector training
+- ✅ Pairs trading disabled (cash account constraint)
+- ✅ GP discovery validated (100+ strategies)
 
 ### Emergency Procedures
 
@@ -592,6 +596,13 @@ python3 -c "from execution.alpaca_connector import AlpacaConnector; c = AlpacaCo
 | 2026-01-04 | BUG-005 (empty signals) FIXED - Added strategy runners and registration for all 7 strategies |
 | 2026-01-04 | BUG-006 (ML samples warning) DOCUMENTED - Expected behavior for rare crisis regimes |
 | 2026-01-04 | ARCH-004 (position sync) VERIFIED WORKING - sync_positions() method complete and functional |
+| 2026-01-07 | LED breathing fix - flash_all() now preserves and restores breathing state after flashing |
+| 2026-01-07 | RapidGainScaler DISABLED - Removed check_rapid_gains from MARKET_OPEN tasks to let strategy performance shine through |
+| 2026-01-07 | DAY_CYCLE.md CREATED - Complete documentation of trading system day cycle phases and tasks |
+| 2026-01-07 | Documentation refresh - Updated AUTONOMOUS_RESEARCH_ENGINE.md, STRATEGY_PORTFOLIO_OVERVIEW.md, TRADEBOT_RD_OVERVIEW.md |
+| 2026-01-08 | GA-001 IMPLEMENTED - Added hard reset mechanism for deeply stuck populations (10+ gens without improvement) |
+| 2026-01-08 | LED fix - Removed blanket pkill that caused cross-process GPIO conflicts |
+| 2026-01-08 | LCD fix - Research display now queries ga_history table, cleaner format |
 
 ---
 

@@ -237,6 +237,14 @@ except ImportError as e:
     InterventionManager = None
     InterventionMode = None
 
+# Hardware LED integration (optional)
+LED_AVAILABLE = True
+try:
+    from hardware.leds import get_led_controller
+except ImportError:
+    LED_AVAILABLE = False
+    get_led_controller = None
+
 # Setup logging
 LOG_DIR = DIRS.get('logs', Path('./logs'))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1484,6 +1492,14 @@ class NightlyResearchEngine:
             logger.info(f"  Adaptive: pop={self.adaptive_config['total_population']}, "
                        f"islands={self.adaptive_config['n_islands']}, rapid_first={rapid_first}")
 
+        # LED controller for hardware feedback
+        self._leds = None
+        if LED_AVAILABLE:
+            try:
+                self._leds = get_led_controller()
+            except Exception as e:
+                logger.debug(f"LED controller not available: {e}")
+
         # State
         self.data = None
         self.vix_data = None
@@ -1792,6 +1808,13 @@ class NightlyResearchEngine:
             logger.info(f"Adaptive GA: ENABLED")
         logger.info("=" * 70)
 
+        # Start research LED breathing (blue = evolving)
+        if self._leds:
+            try:
+                self._leds.breathe('research', 'blue', period=3.0, min_brightness=0.2)
+            except Exception as e:
+                logger.debug(f"Failed to start research LED: {e}")
+
         # Log run start with strategies and planned generations (skip if resuming)
         if not is_resume:
             self.db.start_ga_run(self.run_id, strategies=self.strategies,
@@ -1800,6 +1823,11 @@ class NightlyResearchEngine:
         # Load data
         if not self.load_data():
             self.db.fail_ga_run(self.run_id, "Failed to load market data")
+            if self._leds:
+                try:
+                    self._leds.set_color('research', 'red')
+                except Exception:
+                    pass
             return {'success': False, 'error': 'Data load failed'}
 
         # Track results
@@ -2084,6 +2112,16 @@ class NightlyResearchEngine:
             logger.warning(f"\nErrors: {len(errors)}")
             for err in errors:
                 logger.warning(f"  - {err}")
+
+        # Set research LED to final state (green=success, yellow=partial, red=error)
+        if self._leds:
+            try:
+                if errors:
+                    self._leds.set_color('research', 'yellow')  # Completed with warnings
+                else:
+                    self._leds.set_color('research', 'green')  # Full success
+            except Exception as e:
+                logger.debug(f"Failed to set research LED: {e}")
 
         return summary
 

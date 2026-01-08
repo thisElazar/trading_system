@@ -250,6 +250,7 @@ class ExecutionManager:
         self.execution_tracker = None  # ExecutionTracker
         self.order_executor = None  # OrderExecutor
         self.signal_database = None  # SignalDatabase
+        self.promotion_pipeline = None  # PromotionPipeline (graduation authority)
 
         # State tracking
         self._strategy_graduation_cache: Dict[str, bool] = {}
@@ -270,7 +271,8 @@ class ExecutionManager:
         adaptive_sizer=None,
         execution_tracker=None,
         order_executor=None,
-        signal_database=None
+        signal_database=None,
+        promotion_pipeline=None
     ):
         """Inject dependencies after construction."""
         if signal_scorer:
@@ -287,6 +289,8 @@ class ExecutionManager:
             self.order_executor = order_executor
         if signal_database:
             self.signal_database = signal_database
+        if promotion_pipeline:
+            self.promotion_pipeline = promotion_pipeline
 
         logger.info("ExecutionManager dependencies injected")
 
@@ -749,22 +753,30 @@ class ExecutionManager:
         return ExecutionRoute.LIVE.value
 
     def _is_strategy_graduated(self, strategy_name: str) -> bool:
-        """Check if strategy has graduated from shadow trading."""
+        """Check if strategy has graduated to live trading.
+
+        Uses PromotionPipeline as the single source of truth for strategy lifecycle.
+        A strategy is considered 'graduated' if it has LIVE status in the pipeline.
+        """
         # Check cache first
         if strategy_name in self._strategy_graduation_cache:
             return self._strategy_graduation_cache[strategy_name]
 
-        # Query shadow trader
-        if self.shadow_trader:
+        # Query promotion pipeline (authoritative source)
+        if self.promotion_pipeline:
             try:
-                report = self.shadow_trader.check_graduation(strategy_name)
-                is_graduated = report.ready if report else False
-                self._strategy_graduation_cache[strategy_name] = is_graduated
-                return is_graduated
+                record = self.promotion_pipeline.get_strategy_record(strategy_name)
+                if record:
+                    # Import here to avoid circular imports
+                    from research.discovery.promotion_pipeline import StrategyStatus
+                    is_graduated = record.status == StrategyStatus.LIVE
+                    self._strategy_graduation_cache[strategy_name] = is_graduated
+                    return is_graduated
             except Exception as e:
-                logger.warning(f"Failed to check graduation for {strategy_name}: {e}")
+                logger.warning(f"Failed to check promotion status for {strategy_name}: {e}")
 
-        # Default to live if no shadow trader
+        # If no promotion pipeline record, check if it's a hardcoded strategy
+        # Hardcoded strategies (not from GP discovery) default to live
         return True
 
     def invalidate_graduation_cache(self, strategy_name: str = None):

@@ -1,8 +1,43 @@
 # Autonomous Research Engine
 
-The autonomous research engine continuously evolves trading strategy parameters using genetic algorithms, accumulating improvements over weeks and months of unattended operation.
+**Last Updated:** 2026-01-07
+
+The autonomous research engine continuously evolves trading strategies using genetic algorithms and genetic programming, accumulating improvements over weeks and months of unattended operation. It operates during the OVERNIGHT phase (21:30 - 08:00 ET) as defined in [DAY_CYCLE.md](DAY_CYCLE.md).
+
+---
+
+## Three Research Phases
+
+The research engine runs three distinct phases each night:
+
+```
+OVERNIGHT (21:30 - 08:00 ET)
+    │
+    ├─► Phase 1: PARAMETER OPTIMIZATION
+    │   └─► Evolve parameters of existing hand-coded strategies
+    │       (vol_managed_momentum, mean_reversion, etc.)
+    │
+    ├─► Phase 2: STRATEGY DISCOVERY (GP)
+    │   └─► Discover novel strategy genomes using genetic programming
+    │       (entry/exit/position trees evolved from primitives)
+    │
+    └─► Phase 3: ADAPTIVE GA (Island Model)
+        └─► Regime-matched multi-scale testing across islands
+            (LOW_VOL, NORMAL, HIGH_VOL, CRISIS populations)
+```
+
+**Configuration in `config.py`:**
+```python
+ENABLE_PARAM_OPTIMIZATION = True    # Phase 1
+ENABLE_STRATEGY_DISCOVERY = True    # Phase 2
+ENABLE_ADAPTIVE_GA = True           # Phase 3
+```
+
+---
 
 ## Architecture
+
+### Phase 1: Parameter Optimization
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -36,6 +71,74 @@ The autonomous research engine continuously evolves trading strategy parameters 
 │  - Fitness evaluation via walk-forward backtest              │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Phase 2: Strategy Discovery (GP)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      EvolutionEngine                             │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  StrategyGenome (5-tree representation)                   │  │
+│  │  ├─ entry_tree    → Boolean GP tree (when to BUY)        │  │
+│  │  ├─ exit_tree     → Boolean GP tree (when to SELL)       │  │
+│  │  ├─ position_tree → Float GP tree (position size 0-1)    │  │
+│  │  ├─ stop_loss_tree→ Float GP tree (stop distance %)      │  │
+│  │  └─ target_tree   → Float GP tree (profit target %)      │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│                              ▼                                   │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  NSGA-II Multi-Objective Optimization                     │  │
+│  │  Objectives: Sortino, MaxDD, WinRate, ProfitFactor, Size │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│                              ▼                                   │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  PromotionPipeline                                        │  │
+│  │  CANDIDATE → VALIDATED → PAPER → LIVE                    │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase 3: Adaptive GA (Island Model)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       IslandModel                                │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐   │
+│  │  LOW_VOL   │ │  NORMAL    │ │  HIGH_VOL  │ │  CRISIS    │   │
+│  │  Island    │ │  Island    │ │  Island    │ │  Island    │   │
+│  │  (VIX<15)  │ │ (VIX 15-25)│ │ (VIX 25-35)│ │ (VIX>35)   │   │
+│  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘ └─────┬──────┘   │
+│        │              │              │              │           │
+│        └──────────────┴──────┬───────┴──────────────┘           │
+│                              │                                   │
+│                    Migration (every 10 gens)                     │
+│                              │                                   │
+│                              ▼                                   │
+│               Best individuals swap between islands              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hardware Integration
+
+During research, LED status indicates progress:
+
+| LED | State | Meaning |
+|-----|-------|---------|
+| Research (LED 3) | Blue breathing | Evolution in progress |
+| Research (LED 3) | Green solid | Research completed successfully |
+| Research (LED 3) | Yellow solid | Research completed with errors |
+| Research (LED 3) | Off | Research idle |
+
+The LCD display shows research metrics during OVERNIGHT phase:
+- Current generation / max generation
+- Best Sharpe ratio discovered
+- Estimated time remaining
+
+---
 
 ## Database Schema
 
@@ -223,6 +326,38 @@ for run in runs:
 4. **Observable progress** - Must be able to query "show me how strategy X has improved over the last 30 days."
 
 5. **Graceful degradation** - If backtester fails for one strategy, continue with others. Log errors, don't crash.
+
+---
+
+## Promotion Pipeline
+
+Discovered strategies progress through a lifecycle before going live:
+
+```
+CANDIDATE → VALIDATED → PAPER → LIVE
+    │           │          │        │
+    │           │          │        └─ Real money trading (3% allocation)
+    │           │          └─ Shadow trading for 30+ days
+    │           └─ Walk-forward validation passed
+    └─ Discovered by GP evolution
+```
+
+**Key Files:**
+- `research/discovery/promotion_pipeline.py` - Lifecycle management
+- `execution/strategy_loader.py` - Loads LIVE strategies into scheduler
+- `execution/shadow_trading.py` - Paper trading infrastructure
+
+**Promotion Criteria (from `config.py`):**
+```python
+PAPER_PROMOTION_THRESHOLDS = {
+    'min_trades': 30,
+    'min_sharpe': 0.5,
+    'max_drawdown': 0.25,
+    'min_win_rate': 0.40,
+}
+```
+
+---
 
 ## Verification
 

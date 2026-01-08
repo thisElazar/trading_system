@@ -110,6 +110,12 @@ class HardwareStatus:
                     logger.warning("Screen not available - skipping screen startup")
                     return
 
+                # Reset/reinitialize screen on startup to ensure clean state
+                # This fixes LED issues that occur without a manual reset
+                logger.info("Reinitializing screen for clean startup...")
+                self._screen_controller._screen.reinit()
+                time.sleep(0.3)
+
                 # Show startup message briefly
                 self._screen_controller._screen.clear()
                 self._screen_controller._screen.write_all([

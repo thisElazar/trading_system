@@ -148,6 +148,12 @@ class GenomeFactory:
         self.float_toolbox = create_toolbox(self.float_pset, self.config)
         self.bool_toolbox = create_toolbox(self.bool_pset, self.config)
 
+        # Failure tracking for monitoring genetic operation health
+        self.crossover_failures = 0
+        self.crossover_attempts = 0
+        self.mutation_failures = 0
+        self.mutation_attempts = 0
+
     def create_random_genome(self, generation: int = 0) -> StrategyGenome:
         """
         Create a random genome with all trees.
@@ -251,11 +257,35 @@ class GenomeFactory:
 
     def _crossover_trees(self, tree1: gp.PrimitiveTree, tree2: gp.PrimitiveTree,
                          pset: gp.PrimitiveSetTyped) -> Tuple[gp.PrimitiveTree, gp.PrimitiveTree]:
-        """Perform one-point crossover on two trees."""
+        """
+        Perform one-point crossover on two trees.
+
+        STGP crossover only swaps subtrees with matching return types.
+        Failures are logged and tracked for monitoring.
+        """
+        self.crossover_attempts += 1
+
         try:
             return gp.cxOnePoint(tree1, tree2)
-        except Exception:
-            return tree1, tree2  # Return unchanged if crossover fails
+        except IndexError:
+            # Expected: no compatible crossover points (trees too small or no common types)
+            # This is normal for small trees - don't count as failure
+            logger.debug(f"Crossover skipped: no compatible crossover points "
+                        f"(tree sizes: {len(tree1)}, {len(tree2)})")
+            return tree1, tree2
+        except TypeError as e:
+            # STGP type mismatch - this should NOT happen if types are enforced
+            self.crossover_failures += 1
+            logger.warning(f"STGP crossover type error (possible type violation): {e} | "
+                          f"tree1_root={tree1[0].ret if tree1 else 'empty'}, "
+                          f"tree2_root={tree2[0].ret if tree2 else 'empty'}")
+            return tree1, tree2
+        except Exception as e:
+            # Unexpected error - log with full context for debugging
+            self.crossover_failures += 1
+            logger.error(f"Unexpected crossover failure: {type(e).__name__}: {e} | "
+                        f"tree1={str(tree1)[:100]}, tree2={str(tree2)[:100]}")
+            return tree1, tree2
 
     def mutate(self, genome: StrategyGenome, generation: int) -> StrategyGenome:
         """
@@ -304,41 +334,124 @@ class GenomeFactory:
 
     def _mutate_tree(self, tree: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped,
                      toolbox) -> gp.PrimitiveTree:
-        """Apply weighted mutation to a single tree."""
+        """
+        Apply weighted mutation to a single tree.
+
+        STGP mutations preserve type constraints:
+        - Subtree: replaces subtree with same-typed new subtree
+        - Point: replaces node with same-type/arity alternative
+        - Hoist: promotes subtree (may change root type - use carefully)
+        - Shrink: reduces tree size
+
+        Failures are logged and tracked for monitoring.
+        """
         import random
 
+        self.mutation_attempts += 1
         r = random.random()
+        mutation_type = None
 
         try:
             if r < self.config.subtree_mutation_prob:
-                # Subtree mutation
-                expr = gp.genFull(pset, min_=0, max_=2)
-                result = gp.mutUniform(tree, expr=lambda: expr, pset=pset)
+                mutation_type = "subtree"
+                # DEAP's mutUniform calls expr(pset=pset, type_=type_) to generate replacement subtree
+                # Must accept these kwargs and use type_ to maintain STGP constraints
+                def gen_typed_subtree(pset, type_):
+                    return gp.genFull(pset, min_=0, max_=2, type_=type_)
+                result = gp.mutUniform(tree, expr=gen_typed_subtree, pset=pset)
                 return result[0] if isinstance(result, tuple) else result
 
             elif r < self.config.subtree_mutation_prob + self.config.point_mutation_prob:
-                # Point mutation
+                mutation_type = "point"
                 result = gp.mutNodeReplacement(tree, pset=pset)
                 return result[0] if isinstance(result, tuple) else result
 
             elif r < (self.config.subtree_mutation_prob + self.config.point_mutation_prob +
                       self.config.hoist_mutation_prob):
-                # Hoist mutation
-                if len(tree) > 2:
-                    index = random.randrange(1, len(tree))
-                    slice_ = tree.searchSubtree(index)
-                    subtree = tree[slice_]
+                mutation_type = "hoist"
+                try:
+                    tree_len = len(tree)
+                except (TypeError, AttributeError):
+                    return tree
+                if tree_len is None or tree_len <= 2:
+                    return tree
+                index = random.randrange(1, tree_len)
+                slice_ = tree.searchSubtree(index)
+                subtree = tree[slice_]
+                # Verify hoist preserves root type (critical for STGP)
+                try:
+                    subtree_len = len(subtree) if subtree is not None else 0
+                except (TypeError, AttributeError):
+                    subtree_len = 0
+                if subtree_len > 0:
+                    subtree_root = subtree[0] if isinstance(subtree, list) else subtree
+                    tree_root = tree[0]
+                    subtree_ret = getattr(subtree_root, 'ret', None)
+                    tree_ret = getattr(tree_root, 'ret', None)
+                    if subtree_ret is not None and tree_ret is not None:
+                        if subtree_ret != tree_ret:
+                            logger.debug(f"Hoist skipped: would change root type from "
+                                        f"{tree_ret} to {subtree_ret}")
+                            return tree
                     tree[:] = subtree
                 return tree
 
             else:
-                # Shrink mutation
+                mutation_type = "shrink"
                 result = gp.mutShrink(tree)
                 return result[0] if isinstance(result, tuple) else result
 
+        except IndexError:
+            # Expected: tree too small for this mutation type
+            logger.debug(f"{mutation_type} mutation skipped: tree too small (size={len(tree)})")
+            return tree
+        except TypeError as e:
+            # STGP type mismatch - should NOT happen if types are enforced
+            self.mutation_failures += 1
+            logger.warning(f"STGP {mutation_type} mutation type error (possible type violation): {e} | "
+                          f"tree_root={tree[0].ret if tree else 'empty'}, tree={str(tree)[:80]}")
+            return tree
         except Exception as e:
-            logger.debug(f"Mutation failed: {e}")
-            return tree  # Return unchanged on failure
+            # Unexpected error - log with full context
+            self.mutation_failures += 1
+            logger.error(f"Unexpected {mutation_type} mutation failure: {type(e).__name__}: {e} | "
+                        f"tree={str(tree)[:100]}")
+            return tree
+
+    def get_operation_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics on genetic operation success/failure rates.
+
+        Returns dict with crossover and mutation attempt/failure counts
+        and failure rates. Use this to monitor STGP health.
+        """
+        cx_rate = (self.crossover_failures / self.crossover_attempts * 100
+                   if self.crossover_attempts > 0 else 0.0)
+        mut_rate = (self.mutation_failures / self.mutation_attempts * 100
+                    if self.mutation_attempts > 0 else 0.0)
+
+        return {
+            'crossover_attempts': self.crossover_attempts,
+            'crossover_failures': self.crossover_failures,
+            'crossover_failure_rate_pct': cx_rate,
+            'mutation_attempts': self.mutation_attempts,
+            'mutation_failures': self.mutation_failures,
+            'mutation_failure_rate_pct': mut_rate
+        }
+
+    def log_operation_stats(self):
+        """Log current genetic operation statistics."""
+        stats = self.get_operation_stats()
+        if stats['crossover_failures'] > 0 or stats['mutation_failures'] > 0:
+            logger.warning(f"Genetic operation stats: "
+                          f"crossover={stats['crossover_failures']}/{stats['crossover_attempts']} "
+                          f"({stats['crossover_failure_rate_pct']:.1f}% failures), "
+                          f"mutation={stats['mutation_failures']}/{stats['mutation_attempts']} "
+                          f"({stats['mutation_failure_rate_pct']:.1f}% failures)")
+        else:
+            logger.info(f"Genetic operation stats: "
+                       f"{stats['crossover_attempts']} crossovers, "
+                       f"{stats['mutation_attempts']} mutations, 0 failures")
 
     def evaluate_genome(self, genome: StrategyGenome, data: pd.DataFrame) -> Dict[str, Any]:
         """

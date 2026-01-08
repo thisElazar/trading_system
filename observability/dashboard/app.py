@@ -745,16 +745,19 @@ def get_ga_runs(limit: int = 10) -> List[Dict[str, Any]]:
                 # Show live progress: Gen X/Y (Z/5 Testing)
                 first_strat = run_strategies[0] if run_strategies else None
                 live_prog = get_live_research_progress(run_id=row['run_id'], strategy=first_strat)
-                # current_gen is what we're working on (1-indexed for display)
-                # If completed_gens >= planned_gens, we're done
-                if completed_gens >= planned_gens:
-                    display_status = f"Gen {planned_gens}/{planned_gens} (Finalizing)"
+                # Display completed gens (use actual count, not capped)
+                display_gens = min(completed_gens, planned_gens) if completed_gens <= planned_gens else completed_gens
+                # Don't show "Finalizing" if research is actively running
+                # planned_gens is per-strategy, but research may run discovery/adaptive phases too
+                if live_prog:
+                    display_status = f"Gen {display_gens}/{planned_gens} ({live_prog})"
+                elif completed_gens >= planned_gens:
+                    # Check if research process is still actively running
+                    # Show actual progress instead of misleading "Finalizing"
+                    display_status = f"Gen {completed_gens}/{planned_gens} (Running)"
                 else:
                     current_gen = completed_gens + 1
-                    if live_prog:
-                        display_status = f"Gen {current_gen}/{planned_gens} ({live_prog})"
-                    else:
-                        display_status = f"Gen {current_gen}/{planned_gens}"
+                    display_status = f"Gen {current_gen}/{planned_gens}"
             elif status == 'interrupted':
                 display_status = "interrupted (resumable)" if has_progress else "interrupted"
             elif status == 'paused':

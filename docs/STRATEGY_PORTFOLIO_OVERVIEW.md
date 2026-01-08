@@ -1,9 +1,11 @@
 # Trading System Strategy Portfolio Overview
 
-**Last Updated:** December 31, 2024
-**Total Strategies:** 9
-**Capital Base:** $97,000
+**Last Updated:** 2026-01-07
+**Total Strategies:** 8 active (+ GP-discovered strategies in pipeline)
+**Capital Base:** ~$97,000
 **Target Post-Cost Alpha:** 6-10% annually
+
+> See also: [DAY_CYCLE.md](DAY_CYCLE.md) for operational schedule, [AUTONOMOUS_RESEARCH_ENGINE.md](AUTONOMOUS_RESEARCH_ENGINE.md) for GP discovery details
 
 ---
 
@@ -27,7 +29,7 @@ All strategies have been validated through backtesting. Key findings:
 |---|----------|-----------------|--------------------------|--------|-------------|
 | 1 | Vol-Managed Momentum V2 | 1.70 | 0.55 | ✅ Working | 6.74% |
 | 2 | Gap-Fill Mean Reversion | 2.38 | N/A | 📋 Needs intraday | -- |
-| 3 | Within-Industry Pairs | 2.30-2.90 | -3.02 | ❌ Broken | -10.16% |
+| 3 | Within-Industry Pairs | 2.30-2.90 | N/A | ⛔ Disabled | N/A (cash acct) |
 | 4 | Relative Volume Breakout | 2.81 | 0.06 | ⚠️ Marginal | -0.08% |
 | 5 | Quality Small-Cap Value | 1.00-1.50 | 0.08 | ⚠️ Weak | 0.32% |
 | 6 | Factor Momentum | 0.84 | 0.42 | ⚠️ Moderate | 2.53% |
@@ -222,19 +224,35 @@ Mean Reversion     -0.20  0.40  0.35 -0.10 -0.05  0.00  0.15  0.10  1.00
 
 ## Recommended Portfolio Allocation
 
-### Initial Allocation (Pre-GA Optimization)
+### Current Allocation (January 2026)
 
-| Strategy | Allocation | Rationale |
-|----------|------------|-----------|
-| Vol-Managed Momentum | 20% | Core large-cap momentum (when fixed) |
-| Factor Momentum | 15% | Crash-resistant momentum exposure |
-| Quality Small-Cap Value | 15% | Small-cap premium with quality filter |
-| VIX Regime Rotation | 10% | Crisis protection (always on) |
-| Sector Rotation | 10% | Tactical regime adaptation |
-| Within-Industry Pairs | 10% | Market-neutral alpha |
-| Gap-Fill | 10% | Highest Sharpe (when intraday ready) |
-| RV Breakout | 5% | Catalyst-driven opportunities |
-| Mean Reversion | 5% | Range-bound market alpha |
+| Strategy | Allocation | Status | Notes |
+|----------|------------|--------|-------|
+| Mean Reversion | 35% | ✅ Active | Increased from 5% (absorbed pairs) |
+| Relative Volume Breakout | 25% | ✅ Active | Catalyst-driven opportunities |
+| Vol-Managed Momentum | 10% | ✅ Active | Core large-cap momentum |
+| Gap-Fill | 10% | ✅ Active | Intraday mean reversion |
+| VIX Regime Rotation | 10% | ✅ Active | Crisis protection (always on) |
+| Factor Momentum | 5% | ✅ Active | Sector ETF momentum |
+| Quality Small-Cap Value | 5% | ✅ Active | Small-cap premium |
+| Within-Industry Pairs | 0% | ⛔ Disabled | Cash account cannot short |
+| Sector Rotation | 0% | ⛔ Disabled | Negative backtest Sharpe |
+
+### GP-Discovered Strategies (Pipeline)
+
+In addition to the 8 hand-coded strategies, the GP evolution engine continuously discovers novel strategies. These progress through a promotion pipeline:
+
+```
+CANDIDATE → VALIDATED → PAPER → LIVE
+```
+
+**Current Pipeline Status:**
+- 100+ strategies discovered by GP evolution
+- Strategies in PAPER stage undergo 30+ days of shadow trading
+- LIVE promotion requires: Sharpe > 0.5, max drawdown < 25%, win rate > 40%
+- Each LIVE GP strategy gets 3% allocation
+
+See [AUTONOMOUS_RESEARCH_ENGINE.md](AUTONOMOUS_RESEARCH_ENGINE.md) for details.
 
 ### GA Optimization Targets
 
@@ -248,28 +266,28 @@ Let the genetic algorithm optimize:
 
 ## Implementation Priority
 
-### Phase 1: Fix & Validate (Immediate)
-1. ⚠️ Debug Vol-Managed Momentum (0 trades issue)
-2. 📋 Run Pairs Trading through backtester
-3. 📋 Run Sector Rotation through backtester
-4. 📋 Run RV Breakout through backtester
+### Phase 1: Core Validation ✅ COMPLETE
+1. ✅ All 7 enabled strategies registered with scheduler
+2. ✅ Pairs Trading disabled (cash account constraint)
+3. ✅ Sector Rotation disabled (negative backtest)
+4. ✅ Signals table populating correctly
 
-### Phase 2: Integrate New Strategies (Next)
-1. 🆕 Add Quality Small-Cap Value to registry ✅
-2. 🆕 Add Factor Momentum to registry ✅
-3. Run both through backtester
-4. Add to nightly research pipeline ✅
+### Phase 2: GA/GP Pipeline ✅ COMPLETE
+1. ✅ Parameter optimization running nightly
+2. ✅ GP discovery engine validated (100+ candidates)
+3. ✅ Promotion pipeline operational
+4. ✅ Strategy Loader bridges GP → execution
 
-### Phase 3: GA Optimization (Then)
-1. Configure GA with all 9 strategies
-2. Optimize individual parameters
-3. Optimize portfolio weights
-4. Optimize regime-switching rules
+### Phase 3: Live Validation (CURRENT)
+1. 📋 Monitor first week of live trading signals
+2. 📋 Validate gap-fill strategy timing
+3. 📋 Compare paper vs live P&L divergence
+4. 📋 Tune regime-based position scaling
 
-### Phase 4: Intraday Capability (Later)
-1. Set up consistent intraday data collection
-2. Validate Gap-Fill strategy
-3. Consider adding to live trading
+### Phase 4: Continuous Improvement (ONGOING)
+1. Let GA optimize individual strategy parameters
+2. Monitor GP promotions to LIVE
+3. Track strategy decay and retirement triggers
 
 ---
 
@@ -317,13 +335,17 @@ Tactical:    SR, FM
 
 ### File Locations
 ```
-/strategies/vol_managed_momentum.py      # Tier 1 - NEEDS FIX
-/strategies/gap_fill.py                  # Tier 1 - needs intraday
-/strategies/pairs_trading.py             # Tier 1 - untested
-/strategies/relative_volume_breakout.py  # Tier 1 - untested
-/strategies/quality_small_cap_value.py   # Tier 1 - NEW ✅
-/strategies/factor_momentum.py           # Tier 1 - NEW ✅
-/strategies/vix_regime_rotation.py       # Tier 2 - working
-/strategies/sector_rotation.py           # Tier 2 - untested
-/strategies/mean_reversion.py            # Tier 2 - untested
+strategies/vol_managed_momentum.py       # ✅ Active (10%)
+strategies/mean_reversion.py             # ✅ Active (35%)
+strategies/relative_volume_breakout.py   # ✅ Active (25%)
+strategies/gap_fill.py                   # ✅ Active (10%)
+strategies/vix_regime_rotation.py        # ✅ Active (10%)
+strategies/factor_momentum.py            # ✅ Active (5%)
+strategies/quality_small_cap_value.py    # ✅ Active (5%)
+strategies/pairs_trading.py              # ⛔ Disabled (cash account)
+strategies/sector_rotation.py            # ⛔ Disabled (negative Sharpe)
+
+# GP-Discovered strategies loaded from:
+research/discovery/promotion_pipeline.py # Database of discovered genomes
+execution/strategy_loader.py             # Loads LIVE strategies into scheduler
 ```

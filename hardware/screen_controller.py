@@ -452,22 +452,33 @@ class ScreenController:
         """Render research status page."""
         status = data.get('research_status', 'IDLE')
         gen = data.get('research_generation', 0)
-        max_gen = data.get('research_max_gen', 100)
         sharpe = data.get('research_best_sharpe', 0)
-        eta = data.get('research_eta', 0)
+        phase = data.get('phase', 'unknown')
 
-        # Progress bar
-        progress = int((gen / max_gen) * 14) if max_gen > 0 else 0
-        bar = '#' * progress + '.' * (14 - progress)
+        # Determine display based on status
+        if status == 'IDLE':
+            lines = [
+                "[RESEARCH]",
+                "Status: IDLE",
+                "",
+                "Next: Overnight phase"
+            ]
+        elif status == 'DONE':
+            lines = [
+                "[RESEARCH]",
+                "Status: COMPLETE",
+                f"Generations: {gen}",
+                f"Best Sharpe: {sharpe:.2f}"
+            ]
+        else:
+            # EVOLVING - show live progress
+            lines = [
+                "[RESEARCH]",
+                f"EVOLVING...",
+                f"Generations: {gen}",
+                f"Best Sharpe: {sharpe:.2f}"
+            ]
 
-        eta_str = f"{eta // 60}h{eta % 60:02d}m" if eta >= 60 else f"{eta}m"
-
-        lines = [
-            "[RESEARCH]",
-            f"Status: {status}",
-            f"[{bar}]",
-            f"Gen:{gen}/{max_gen} SR:{sharpe:.2f}"
-        ]
         self._screen.write_all(lines)
 
     def _render_screensaver(self) -> None:

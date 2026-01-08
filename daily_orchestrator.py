@@ -88,11 +88,12 @@ except ImportError:
     HAS_ML_REGIME = False
 
 try:
-    from research.discovery import PromotionPipeline, PromotionCriteria
+    from research.discovery import PromotionPipeline, PromotionCriteria, StrategyStatus
     HAS_PROMOTION_PIPELINE = True
 except ImportError:
     PromotionPipeline = None
     PromotionCriteria = None
+    StrategyStatus = None
     HAS_PROMOTION_PIPELINE = False
 
 try:
@@ -240,7 +241,7 @@ class DailyOrchestrator:
         MarketPhase.PRE_MARKET: PhaseConfig(
             start_hour=8, start_minute=0,
             end_hour=9, end_minute=30,
-            tasks=["refresh_premarket_data", "refresh_data", "system_check", "sync_positions_from_broker", "review_positions", "cancel_stale_orders", "update_regime_detection", "calculate_position_scalars"],
+            tasks=["refresh_premarket_data", "refresh_data", "system_check", "sync_positions_from_broker", "review_positions", "cancel_stale_orders", "update_regime_detection", "calculate_position_scalars", "load_live_strategies"],
             check_interval_seconds=60
         ),
         MarketPhase.INTRADAY_OPEN: PhaseConfig(
@@ -258,13 +259,13 @@ class DailyOrchestrator:
         MarketPhase.MARKET_OPEN: PhaseConfig(
             start_hour=9, start_minute=30,
             end_hour=16, end_minute=0,
-            tasks=["run_scheduler", "monitor_positions", "check_risk_limits", "score_pending_signals", "process_shadow_trades", "check_rapid_gains"],
+            tasks=["run_scheduler", "monitor_positions", "check_risk_limits", "score_pending_signals", "process_shadow_trades"],
             check_interval_seconds=30
         ),
         MarketPhase.POST_MARKET: PhaseConfig(
             start_hour=16, start_minute=0,
             end_hour=17, end_minute=0,
-            tasks=["reconcile_positions", "calculate_pnl", "generate_daily_report", "send_alerts", "update_ensemble_correlations", "run_promotion_pipeline"],
+            tasks=["reconcile_positions", "calculate_pnl", "generate_daily_report", "send_alerts", "update_ensemble_correlations", "update_paper_metrics", "update_live_metrics", "run_promotion_pipeline"],
             check_interval_seconds=60
         ),
         MarketPhase.EVENING: PhaseConfig(
@@ -315,6 +316,7 @@ class DailyOrchestrator:
         self._ml_regime_detector = None
         self._promotion_pipeline = None
         self._volatility_manager = None
+        self._strategy_loader = None
 
         # Intraday components
         self._stream_handler = None
@@ -382,6 +384,9 @@ class DailyOrchestrator:
             # Strategy lifecycle tasks
             "run_promotion_pipeline": self._task_run_promotion_pipeline,
             "calculate_position_scalars": self._task_calculate_position_scalars,
+            "update_paper_metrics": self._task_update_paper_metrics,
+            "update_live_metrics": self._task_update_live_metrics,
+            "load_live_strategies": self._task_load_live_strategies,
 
             # Weekend tasks
             "run_weekend_schedule": self._task_run_weekend_schedule,
@@ -481,7 +486,8 @@ class DailyOrchestrator:
                 shadow_trader=self.shadow_trader,
                 circuit_breaker=self.circuit_breaker,
                 execution_tracker=self.execution_tracker,
-                signal_database=self.execution_tracker.db if self.execution_tracker else None
+                signal_database=self.execution_tracker.db if self.execution_tracker else None,
+                promotion_pipeline=self.promotion_pipeline
             )
             logger.info("ExecutionManager initialized with dependencies")
         return self._execution_manager
@@ -507,8 +513,35 @@ class DailyOrchestrator:
         """Strategy promotion pipeline for lifecycle management."""
         if self._promotion_pipeline is None and HAS_PROMOTION_PIPELINE:
             self._promotion_pipeline = PromotionPipeline()
-            logger.info("Promotion pipeline initialized")
+
+            # Set callbacks for dynamic strategy loading/unloading
+            self._promotion_pipeline.set_callbacks(
+                on_promotion=self._on_strategy_promoted,
+                on_retirement=self._on_strategy_retired
+            )
+
+            logger.info("Promotion pipeline initialized with callbacks")
         return self._promotion_pipeline
+
+    def _on_strategy_promoted(self, strategy_id: str) -> None:
+        """Callback when a strategy is promoted to LIVE."""
+        logger.info(f"Strategy {strategy_id} promoted to LIVE - reloading into scheduler")
+        try:
+            loader = self.strategy_loader
+            if loader and loader.available:
+                loader.reload_strategy(strategy_id)
+        except Exception as e:
+            logger.warning(f"Failed to load promoted strategy {strategy_id}: {e}")
+
+    def _on_strategy_retired(self, strategy_id: str) -> None:
+        """Callback when a strategy is retired."""
+        logger.info(f"Strategy {strategy_id} retired - unloading from scheduler")
+        try:
+            loader = self.strategy_loader
+            if loader:
+                loader.unload_strategy(strategy_id)
+        except Exception as e:
+            logger.warning(f"Failed to unload retired strategy {strategy_id}: {e}")
 
     @property
     def volatility_manager(self):
@@ -517,6 +550,23 @@ class DailyOrchestrator:
             self._volatility_manager = VolatilityManager()
             logger.info("Volatility manager initialized")
         return self._volatility_manager
+
+    @property
+    def strategy_loader(self):
+        """Strategy loader for discovered GP strategies."""
+        if self._strategy_loader is None and HAS_PROMOTION_PIPELINE:
+            try:
+                from execution.strategy_loader import StrategyLoader
+                self._strategy_loader = StrategyLoader(
+                    promotion_pipeline=self.promotion_pipeline,
+                    scheduler=self.scheduler
+                )
+                logger.info("Strategy loader initialized")
+            except ImportError as e:
+                logger.debug(f"Strategy loader not available: {e}")
+            except Exception as e:
+                logger.warning(f"Strategy loader initialization failed: {e}")
+        return self._strategy_loader
 
     # =========================================================================
     # Phase Detection
@@ -2064,45 +2114,55 @@ class DailyOrchestrator:
             return False
 
     def _task_process_shadow_trades(self) -> bool:
-        """Process shadow (paper) trades for strategy validation."""
+        """Process shadow (paper) trades and check for promotion readiness.
+
+        Uses PromotionPipeline as the authority for graduation decisions.
+        ShadowTrader is only used for metrics tracking.
+        """
         if not HAS_SHADOW_TRADER or self.shadow_trader is None:
             logger.debug("Shadow trader not available")
             return True
 
-        try:
-            # Get active shadow strategies
-            shadow_strategies = self.shadow_trader.get_active_strategies()
+        if not HAS_PROMOTION_PIPELINE or self.promotion_pipeline is None:
+            logger.debug("Promotion pipeline not available")
+            return True
 
-            if not shadow_strategies:
-                logger.debug("No active shadow strategies")
+        try:
+            # Get strategies in PAPER status from promotion pipeline
+            paper_strategies = self.promotion_pipeline.get_strategies_by_status(StrategyStatus.PAPER)
+
+            if not paper_strategies:
+                logger.debug("No strategies in PAPER status")
                 return True
 
             processed = 0
-            graduated = []
+            ready_for_live = []
 
-            for strategy_name in shadow_strategies:
+            for strategy_id in paper_strategies:
                 try:
-                    # Check graduation criteria
-                    if self.shadow_trader.check_graduation(strategy_name):
-                        graduated.append(strategy_name)
-                        logger.info(f"Strategy '{strategy_name}' ready for graduation to live trading!")
+                    # Check if ready for promotion using PromotionPipeline criteria
+                    ready, message, metrics = self.promotion_pipeline.check_paper_for_live(strategy_id)
 
-                        # Send alert for graduation
+                    if ready:
+                        ready_for_live.append(strategy_id)
+                        logger.info(f"Strategy '{strategy_id}' ready for LIVE: {message}")
+
+                        # Send alert for promotion readiness
                         self.alert_manager.send_alert(
-                            title=f"Strategy Ready: {strategy_name}",
-                            message=f"Shadow strategy '{strategy_name}' has met graduation criteria.",
-                            level="warning"  # Use level not priority
+                            title=f"Strategy Ready: {strategy_id}",
+                            message=f"Paper strategy '{strategy_id}' meets LIVE criteria. Metrics: {metrics}",
+                            level="warning"
                         )
 
                     processed += 1
 
                 except Exception as e:
-                    logger.warning(f"Failed to process shadow strategy {strategy_name}: {e}")
+                    logger.warning(f"Failed to check promotion for {strategy_id}: {e}")
 
-            if graduated:
-                logger.info(f"Strategies ready for graduation: {graduated}")
+            if ready_for_live:
+                logger.info(f"Strategies ready for LIVE promotion: {ready_for_live}")
 
-            logger.info(f"Processed {processed} shadow strategies")
+            logger.info(f"Checked {processed} paper strategies for promotion")
             return True
 
         except Exception as e:
@@ -2407,6 +2467,157 @@ class DailyOrchestrator:
 
         except Exception as e:
             logger.error(f"Promotion pipeline failed: {e}")
+            return False
+
+    def _task_update_paper_metrics(self) -> bool:
+        """Update paper trading metrics in promotion pipeline from shadow trader."""
+        if not HAS_PROMOTION_PIPELINE or self.promotion_pipeline is None:
+            logger.debug("Promotion pipeline not available")
+            return True
+
+        if not HAS_SHADOW_TRADER or self.shadow_trader is None:
+            logger.debug("Shadow trader not available")
+            return True
+
+        try:
+            logger.info("Updating paper trading metrics...")
+
+            # Get all strategies in PAPER status
+            paper_strategies = self.promotion_pipeline.get_strategies_by_status(StrategyStatus.PAPER)
+
+            if not paper_strategies:
+                logger.debug("No strategies in PAPER status")
+                return True
+
+            updated = 0
+            for strategy_id in paper_strategies:
+                try:
+                    # Get metrics from shadow trader
+                    metrics = self.shadow_trader.get_strategy_metrics(strategy_id)
+                    if not metrics or 'error' in metrics:
+                        continue
+
+                    # Calculate Sharpe ratio
+                    sharpe = self.shadow_trader.calculate_sharpe_ratio(strategy_id)
+
+                    # Calculate max drawdown
+                    max_dd = self.shadow_trader.get_strategy_max_drawdown(strategy_id)
+
+                    # Update promotion pipeline
+                    self.promotion_pipeline.update_paper_metrics(
+                        strategy_id=strategy_id,
+                        trades=int(metrics.get('total_trades', 0)),
+                        pnl=float(metrics.get('total_pnl', 0)),
+                        sharpe=sharpe,
+                        max_drawdown=max_dd,
+                        win_rate=float(metrics.get('win_rate', 0))
+                    )
+                    updated += 1
+
+                except Exception as e:
+                    logger.warning(f"Failed to update paper metrics for {strategy_id}: {e}")
+
+            if updated > 0:
+                logger.info(f"Updated paper metrics for {updated} strategies")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Paper metrics update failed: {e}")
+            return False
+
+    def _task_update_live_metrics(self) -> bool:
+        """Update live trading metrics in promotion pipeline from execution tracker."""
+        if not HAS_PROMOTION_PIPELINE or self.promotion_pipeline is None:
+            logger.debug("Promotion pipeline not available")
+            return True
+
+        try:
+            logger.info("Updating live trading metrics...")
+
+            # Get all strategies in LIVE status
+            live_strategies = self.promotion_pipeline.get_strategies_by_status(StrategyStatus.LIVE)
+
+            if not live_strategies:
+                logger.debug("No strategies in LIVE status")
+                return True
+
+            updated = 0
+            for strategy_id in live_strategies:
+                try:
+                    # Get metrics from execution tracker
+                    if self._tracker:
+                        metrics = self._tracker.get_strategy_performance(strategy_id)
+                        if not metrics:
+                            continue
+
+                        # Calculate Sharpe from daily returns if available
+                        sharpe = 0.0
+                        max_dd = 0.0
+
+                        # Use shadow trader for consistent Sharpe calculation
+                        if HAS_SHADOW_TRADER and self.shadow_trader:
+                            sharpe = self.shadow_trader.calculate_sharpe_ratio(strategy_id)
+                            max_dd = self.shadow_trader.get_strategy_max_drawdown(strategy_id)
+
+                        # Update promotion pipeline
+                        self.promotion_pipeline.update_live_metrics(
+                            strategy_id=strategy_id,
+                            live_days=metrics.get('days_active', 0),
+                            trades=metrics.get('total_trades', 0),
+                            pnl=metrics.get('total_pnl', 0),
+                            sharpe=sharpe,
+                            max_drawdown=max_dd
+                        )
+                        updated += 1
+
+                except Exception as e:
+                    logger.warning(f"Failed to update live metrics for {strategy_id}: {e}")
+
+            if updated > 0:
+                logger.info(f"Updated live metrics for {updated} strategies")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Live metrics update failed: {e}")
+            return False
+
+    def _task_load_live_strategies(self) -> bool:
+        """Load discovered GP strategies with LIVE status into scheduler.
+
+        This bridges the gap between the promotion pipeline (which tracks
+        strategy lifecycle) and the execution scheduler (which runs strategies).
+        """
+        if not HAS_PROMOTION_PIPELINE:
+            logger.debug("Promotion pipeline not available")
+            return True
+
+        try:
+            loader = self.strategy_loader
+            if loader is None:
+                logger.debug("Strategy loader not available")
+                return True
+
+            if not loader.available:
+                logger.debug("Strategy loader not ready (missing dependencies)")
+                return True
+
+            logger.info("Loading discovered strategies into scheduler...")
+
+            loaded = loader.load_live_strategies()
+
+            if loaded > 0:
+                logger.info(f"Loaded {loaded} discovered strategies into scheduler")
+
+                # Update hardware display if available
+                if self._hardware:
+                    self._hardware.set_status('research', 'active')
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Strategy loading failed: {e}")
             return False
 
     def _task_calculate_position_scalars(self) -> bool:
@@ -3620,10 +3831,92 @@ class DailyOrchestrator:
                 'phase_time_remaining': phase_time_str,
             }
 
+            # Add research data during overnight phase
+            if current_phase == MarketPhase.OVERNIGHT:
+                research_data = self._get_research_progress()
+                display_data.update(research_data)
+
             self._hardware.update_display(display_data)
 
         except Exception as e:
             logger.debug(f"Display update failed: {e}")
+
+    def _get_research_progress(self) -> Dict[str, Any]:
+        """Get current research progress from database for LCD display."""
+        result = {
+            'research_status': 'IDLE',
+            'research_generation': 0,
+            'research_max_gen': 100,
+            'research_best_sharpe': 0,
+            'research_eta': 0,
+        }
+
+        try:
+            import sqlite3
+            db_path = Path(__file__).parent / "db" / "research.db"
+            if not db_path.exists():
+                return result
+
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+
+            # Get the current running or most recent run
+            cursor = conn.execute("""
+                SELECT run_id, status, planned_generations, total_generations, start_time
+                FROM ga_runs
+                WHERE status = 'running'
+                ORDER BY start_time DESC
+                LIMIT 1
+            """)
+            row = cursor.fetchone()
+
+            if not row:
+                # No running research - check for recent completed
+                cursor = conn.execute("""
+                    SELECT run_id, status, planned_generations, total_generations
+                    FROM ga_runs
+                    ORDER BY start_time DESC
+                    LIMIT 1
+                """)
+                row = cursor.fetchone()
+                if row and row['status'] == 'completed':
+                    result['research_status'] = 'DONE'
+                conn.close()
+                return result
+
+            # Get progress from ga_history (where generations are actually logged)
+            run_id = row['run_id']
+            planned_gens = row['planned_generations'] or 3
+
+            # Get today's date for filtering
+            from datetime import date
+            today = date.today().isoformat()
+
+            # Count total generations completed today and get best fitness
+            cursor = conn.execute("""
+                SELECT COUNT(*) as gen_count,
+                       MAX(best_fitness) as best_fitness
+                FROM ga_history
+                WHERE run_date = ?
+            """, (today,))
+            progress = cursor.fetchone()
+
+            if progress:
+                completed = progress['gen_count'] or 0
+                best_fitness = progress['best_fitness'] or 0
+
+                result['research_generation'] = completed
+                # Show progress relative to completed (no fixed max during active research)
+                result['research_max_gen'] = max(completed, 21)  # At least 21 (7 strategies * 3 gens)
+                result['research_best_sharpe'] = round(best_fitness, 2)
+                result['research_status'] = 'EVOLVING'
+
+            conn.close()
+
+        except Exception as e:
+            logger.debug(f"Failed to get research progress: {e}")
+
+        return result
 
     def _handle_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully."""

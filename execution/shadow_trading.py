@@ -120,12 +120,6 @@ class ShadowStrategy:
     max_drawdown: float = 0.0
     peak_capital: float = 10000.0
 
-    # Graduation criteria
-    min_trades_to_graduate: int = 30
-    min_win_rate_to_graduate: float = 0.55
-    min_profit_factor_to_graduate: float = 1.5
-    min_days_to_graduate: int = 14
-
     def __post_init__(self):
         if not self.start_time:
             self.start_time = datetime.now().isoformat()
@@ -143,16 +137,6 @@ class ShadowStrategy:
     def days_active(self) -> int:
         start = datetime.fromisoformat(self.start_time)
         return (datetime.now() - start).days
-
-
-@dataclass
-class GraduationReport:
-    """Report on strategy readiness to graduate."""
-    strategy: str
-    ready: bool
-    reasons: List[str]
-    metrics: Dict[str, Any]
-    recommendation: str
 
 
 @dataclass
@@ -366,10 +350,6 @@ class ShadowTrader:
         self,
         name: str,
         initial_capital: float = 10000.0,
-        min_trades: int = 30,
-        min_win_rate: float = 0.55,
-        min_profit_factor: float = 1.5,
-        min_days: int = 14,
     ) -> ShadowStrategy:
         """
         Add a new strategy to shadow trading.
@@ -377,10 +357,6 @@ class ShadowTrader:
         Args:
             name: Strategy name
             initial_capital: Starting capital for shadow trading
-            min_trades: Minimum trades before graduation
-            min_win_rate: Minimum win rate to graduate
-            min_profit_factor: Minimum profit factor to graduate
-            min_days: Minimum days of shadow trading
 
         Returns:
             The created ShadowStrategy
@@ -393,10 +369,6 @@ class ShadowTrader:
             name=name,
             initial_capital=initial_capital,
             current_capital=initial_capital,
-            min_trades_to_graduate=min_trades,
-            min_win_rate_to_graduate=min_win_rate,
-            min_profit_factor_to_graduate=min_profit_factor,
-            min_days_to_graduate=min_days,
         )
 
         self.strategies[name] = strategy
@@ -814,117 +786,8 @@ class ShadowTrader:
             conn.close()
 
     # ========================================================================
-    # GRADUATION
+    # METRICS HELPERS
     # ========================================================================
-
-    def check_graduation(self, name: str) -> GraduationReport:
-        """
-        Check if a strategy is ready to graduate to live trading.
-
-        Args:
-            name: Strategy name
-
-        Returns:
-            GraduationReport with detailed analysis
-        """
-        if name not in self.strategies:
-            return GraduationReport(
-                strategy=name,
-                ready=False,
-                reasons=["Strategy not found"],
-                metrics={},
-                recommendation="Add strategy to shadow trading first"
-            )
-
-        strategy = self.strategies[name]
-        reasons = []
-        passed = True
-
-        # Check trade count
-        if strategy.total_trades < strategy.min_trades_to_graduate:
-            reasons.append(
-                f"Needs more trades: {strategy.total_trades}/{strategy.min_trades_to_graduate}"
-            )
-            passed = False
-
-        # Check win rate
-        if strategy.win_rate < strategy.min_win_rate_to_graduate:
-            reasons.append(
-                f"Win rate too low: {strategy.win_rate:.1%} < {strategy.min_win_rate_to_graduate:.1%}"
-            )
-            passed = False
-
-        # Check profit factor
-        profit_factor = self._calculate_profit_factor(name)
-        if profit_factor < strategy.min_profit_factor_to_graduate:
-            reasons.append(
-                f"Profit factor too low: {profit_factor:.2f} < {strategy.min_profit_factor_to_graduate:.2f}"
-            )
-            passed = False
-
-        # Check time requirement
-        if strategy.days_active < strategy.min_days_to_graduate:
-            reasons.append(
-                f"Needs more time: {strategy.days_active}/{strategy.min_days_to_graduate} days"
-            )
-            passed = False
-
-        # Check drawdown
-        if strategy.max_drawdown > 0.2:  # 20% max drawdown limit
-            reasons.append(f"Max drawdown too high: {strategy.max_drawdown:.1%}")
-            passed = False
-
-        # Check profitability
-        if strategy.return_pct < 0:
-            reasons.append(f"Strategy is unprofitable: {strategy.return_pct:.1f}%")
-            passed = False
-
-        metrics = {
-            'total_trades': strategy.total_trades,
-            'win_rate': strategy.win_rate,
-            'profit_factor': profit_factor,
-            'days_active': strategy.days_active,
-            'max_drawdown': strategy.max_drawdown,
-            'return_pct': strategy.return_pct,
-            'current_capital': strategy.current_capital,
-        }
-
-        if passed:
-            recommendation = "Strategy meets all criteria. Ready for live trading."
-        else:
-            recommendation = "Continue shadow trading. " + " ".join(reasons[:2])
-
-        return GraduationReport(
-            strategy=name,
-            ready=passed,
-            reasons=reasons if not passed else ["All criteria met"],
-            metrics=metrics,
-            recommendation=recommendation
-        )
-
-    def graduate_strategy(self, name: str) -> bool:
-        """
-        Mark a strategy as graduated.
-
-        Args:
-            name: Strategy name
-
-        Returns:
-            True if graduated successfully
-        """
-        if name not in self.strategies:
-            return False
-
-        report = self.check_graduation(name)
-        if not report.ready:
-            logger.warning(f"Strategy {name} not ready to graduate: {report.reasons}")
-            return False
-
-        self.strategies[name].status = ShadowStatus.GRADUATED
-        self._save_strategy(self.strategies[name])
-
-        logger.info(f"Strategy {name} graduated from shadow trading!")
-        return True
 
     def _calculate_profit_factor(self, name: str) -> float:
         """Calculate profit factor for a strategy."""
@@ -1051,6 +914,68 @@ class ShadowTrader:
         finally:
             conn.close()
 
+    def calculate_sharpe_ratio(self, name: str, days: int = 30) -> float:
+        """
+        Calculate annualized Sharpe ratio from daily P&L.
+
+        Args:
+            name: Strategy name
+            days: Number of days to analyze
+
+        Returns:
+            Annualized Sharpe ratio (0.0 if insufficient data)
+        """
+        import numpy as np
+
+        daily_returns = self._get_daily_returns(name, days)
+
+        if len(daily_returns) < 5:
+            # Need at least 5 days for meaningful Sharpe
+            return 0.0
+
+        mean_return = daily_returns.mean()
+        std_return = daily_returns.std()
+
+        if std_return == 0 or np.isnan(std_return):
+            return 0.0
+
+        # Annualized Sharpe: (mean / std) * sqrt(252)
+        sharpe = (mean_return / std_return) * np.sqrt(252)
+
+        return float(sharpe)
+
+    def get_strategy_max_drawdown(self, name: str, days: int = 30) -> float:
+        """
+        Calculate maximum drawdown for a strategy.
+
+        Args:
+            name: Strategy name
+            days: Number of days to analyze
+
+        Returns:
+            Max drawdown as negative percentage (e.g., -15.5 for 15.5% drawdown)
+        """
+        import numpy as np
+
+        daily_returns = self._get_daily_returns(name, days)
+
+        if len(daily_returns) < 2:
+            return 0.0
+
+        # Calculate cumulative returns
+        cumulative = daily_returns.cumsum()
+
+        # Calculate running maximum
+        running_max = cumulative.cummax()
+
+        # Calculate drawdown at each point
+        drawdown = cumulative - running_max
+
+        # Return minimum (most negative) drawdown
+        max_dd = drawdown.min()
+
+        return float(max_dd) if not np.isnan(max_dd) else 0.0
+
     def _get_daily_returns(self, name: str, days: int) -> pd.Series:
         """Get daily returns for a shadow strategy."""
         conn = self._get_conn()
@@ -1117,13 +1042,6 @@ class ShadowTrader:
                 for symbol, pos in strategy.positions.items():
                     print(f"    {symbol}: {pos.shares} @ ${pos.entry_price:.2f} "
                           f"(unrealized: ${pos.unrealized_pnl:.2f})")
-
-            # Graduation check
-            report = self.check_graduation(name)
-            if report.ready:
-                print(f"\n  *** READY TO GRADUATE ***")
-            else:
-                print(f"\n  Graduation status: {report.recommendation}")
 
         print("\n" + "=" * 70)
 
@@ -1205,13 +1123,6 @@ if __name__ == "__main__":
             price=price,
             position_pct=0.1
         )
-
-    # Check graduation
-    print("\nChecking graduation readiness...")
-    report = shadow.check_graduation("test_momentum_v2")
-    print(f"Ready: {report.ready}")
-    print(f"Reasons: {report.reasons}")
-    print(f"Recommendation: {report.recommendation}")
 
     # Print status
     shadow.print_status()

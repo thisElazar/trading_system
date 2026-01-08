@@ -40,6 +40,7 @@ class LEDController:
         self._blink_threads: Dict[str, threading.Event] = {}
         self._breathe_threads: Dict[str, threading.Event] = {}
         self._breathe_pins: set = set()  # Pins currently controlled by lgpio breathing
+        self._breathing_params: Dict[str, Dict] = {}  # LED -> {color, period, min_brightness}
         self._current_colors: Dict[str, str] = {
             'system': 'off',
             'trading': 'off',
@@ -52,17 +53,18 @@ class LEDController:
         Excludes pins that are being controlled by breathing threads.
         """
         with self._lock:
+            # Kill only OUR gpioset process (not others from different processes)
             if self._current_proc:
                 self._current_proc.terminate()
                 try:
                     self._current_proc.wait(timeout=0.1)
                 except subprocess.TimeoutExpired:
                     self._current_proc.kill()
+                self._current_proc = None
 
             # Exclude pins controlled by breathing (lgpio handles those)
             controlled_pins = [p for p in ALL_LED_PINS if p not in self._breathe_pins]
             if not controlled_pins:
-                self._current_proc = None
                 return
 
             settings = [f'{p}={0 if p in pins_on else 1}' for p in controlled_pins]
@@ -137,11 +139,18 @@ class LEDController:
             self._blink_threads[led].set()
             del self._blink_threads[led]
 
-    def _stop_breathe(self, led: str) -> None:
-        """Stop breathing for a specific LED."""
+    def _stop_breathe(self, led: str, clear_params: bool = True) -> None:
+        """Stop breathing for a specific LED.
+
+        Args:
+            led: LED name
+            clear_params: If True, also remove from _breathing_params (permanent stop)
+        """
         if led in self._breathe_threads:
             self._breathe_threads[led].set()
             del self._breathe_threads[led]
+        if clear_params and led in self._breathing_params:
+            del self._breathing_params[led]
 
     def _stop_all_blinks(self) -> None:
         """Stop all blinking and breathing."""
@@ -207,6 +216,13 @@ class LEDController:
         self._stop_blink(led)
         self._stop_breathe(led)
 
+        # Store breathing params for restoration after flash operations
+        self._breathing_params[led] = {
+            'color': color,
+            'period': period,
+            'min_brightness': min_brightness,
+        }
+
         stop_event = threading.Event()
         self._breathe_threads[led] = stop_event
 
@@ -219,9 +235,16 @@ class LEDController:
 
         # Use PWM breathing if lgpio is available
         if LGPIO_AVAILABLE:
-            # Register pin as breathing-controlled and restart gpioset to release it
+            # Register pin as breathing-controlled
             self._breathe_pins.add(pin)
-            self._set_pins(self._compute_all_pins_on())
+
+            # Only restart gpioset if we have an active gpioset process
+            # (This avoids subprocess conflicts when called from research process)
+            if self._current_proc is not None:
+                self._set_pins(self._compute_all_pins_on())
+
+            # Wait a moment before lgpio claims the pin
+            time.sleep(0.1)
 
             def breathe_loop():
                 h = None
@@ -280,19 +303,35 @@ class LEDController:
 
     def flash_all(self, color: str = 'white', times: int = 3, interval: float = 0.1) -> None:
         """Flash all LEDs synchronously (blocking). Restores previous state after."""
-        # Save current state
+        # Save current state (colors AND breathing params)
         saved_colors = self._current_colors.copy()
+        saved_breathing = self._breathing_params.copy()
 
-        self._stop_all_blinks()
+        # Stop all blinks/breathing but preserve params for restoration
+        for event in self._blink_threads.values():
+            event.set()
+        self._blink_threads.clear()
+        for event in self._breathe_threads.values():
+            event.set()
+        self._breathe_threads.clear()
+
+        # Wait for breathing threads to release GPIO pins
+        time.sleep(0.05)
+
+        # Flash sequence
         for _ in range(times):
             self.set_all(color)
             time.sleep(interval)
             self.all_off()
             time.sleep(interval)
 
-        # Restore previous LED state
+        # Restore previous LED state - breathing takes priority
+        for led, params in saved_breathing.items():
+            self.breathe(led, **params)
+
+        # Restore non-breathing LEDs to their static colors
         for led, led_color in saved_colors.items():
-            if led_color != 'off':
+            if led not in saved_breathing and led_color != 'off':
                 self.set_color(led, led_color)
 
     def startup_sequence(self) -> None:

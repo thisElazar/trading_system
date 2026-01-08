@@ -146,6 +146,10 @@ class StrategyRecord:
     retired_at: Optional[datetime] = None
     retirement_reason: Optional[str] = None
 
+    # Execution config
+    genome_json: Optional[str] = None
+    run_time: str = "10:00"  # Default execution time (ET)
+
     def to_dict(self) -> dict:
         result = {}
         for key, value in asdict(self).items():
@@ -188,7 +192,9 @@ class PromotionPipeline:
     def __init__(
         self,
         criteria: PromotionCriteria = None,
-        db_path: Optional[Path] = None
+        db_path: Optional[Path] = None,
+        on_promotion: Optional[callable] = None,
+        on_retirement: Optional[callable] = None
     ):
         """
         Initialize promotion pipeline.
@@ -196,8 +202,14 @@ class PromotionPipeline:
         Args:
             criteria: Promotion criteria thresholds
             db_path: Path to database
+            on_promotion: Callback when strategy is promoted to LIVE
+                          Signature: (strategy_id: str) -> None
+            on_retirement: Callback when strategy is retired
+                           Signature: (strategy_id: str) -> None
         """
         self.criteria = criteria or PromotionCriteria()
+        self._on_promotion_callback = on_promotion
+        self._on_retirement_callback = on_retirement
         self.db_path = db_path or Path(__file__).parent.parent.parent / "data" / "promotion_pipeline.db"
         self.db = get_db()
 
@@ -252,7 +264,10 @@ class PromotionPipeline:
                     retirement_reason TEXT,
 
                     -- Genome/Config
-                    genome_json TEXT
+                    genome_json TEXT,
+
+                    -- Execution config
+                    run_time TEXT DEFAULT '10:00'
                 );
 
                 CREATE TABLE IF NOT EXISTS promotion_history (
@@ -283,6 +298,29 @@ class PromotionPipeline:
                 ON promotion_history(strategy_id);
             """)
 
+            # Migration: Add run_time column if it doesn't exist (for existing DBs)
+            try:
+                conn.execute("SELECT run_time FROM strategy_lifecycle LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE strategy_lifecycle ADD COLUMN run_time TEXT DEFAULT '10:00'")
+
+    def set_callbacks(
+        self,
+        on_promotion: Optional[callable] = None,
+        on_retirement: Optional[callable] = None
+    ) -> None:
+        """
+        Set callbacks for lifecycle events.
+
+        Args:
+            on_promotion: Called when strategy is promoted to LIVE
+            on_retirement: Called when strategy is retired
+        """
+        if on_promotion:
+            self._on_promotion_callback = on_promotion
+        if on_retirement:
+            self._on_retirement_callback = on_retirement
+
     # =========================================================================
     # STRATEGY REGISTRATION
     # =========================================================================
@@ -296,7 +334,8 @@ class PromotionPipeline:
         max_drawdown: float,
         trades: int,
         deflated_sharpe: float,
-        genome_json: Optional[str] = None
+        genome_json: Optional[str] = None,
+        run_time: str = "10:00"
     ) -> StrategyRecord:
         """
         Register a newly discovered strategy as candidate.
@@ -310,6 +349,7 @@ class PromotionPipeline:
             trades: Number of trades in backtest
             deflated_sharpe: Deflated Sharpe Ratio
             genome_json: Serialized genome (optional)
+            run_time: Execution time in HH:MM format (ET), default '10:00'
 
         Returns:
             StrategyRecord for the new candidate
@@ -326,7 +366,9 @@ class PromotionPipeline:
             discovery_sortino=sortino,
             discovery_max_drawdown=max_drawdown,
             discovery_trades=trades,
-            deflated_sharpe=deflated_sharpe
+            deflated_sharpe=deflated_sharpe,
+            genome_json=genome_json,
+            run_time=run_time
         )
 
         # Save to database
@@ -336,16 +378,16 @@ class PromotionPipeline:
                 (strategy_id, status, created_at, updated_at,
                  discovery_generation, discovery_sharpe, discovery_sortino,
                  discovery_max_drawdown, discovery_trades, deflated_sharpe,
-                 genome_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 genome_json, run_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 strategy_id, record.status.value,
                 now.isoformat(), now.isoformat(),
                 generation, sharpe, sortino, max_drawdown, trades,
-                deflated_sharpe, genome_json
+                deflated_sharpe, genome_json, run_time
             ))
 
-        logger.info(f"Registered candidate strategy: {strategy_id}")
+        logger.info(f"Registered candidate strategy: {strategy_id} (run_time={run_time})")
         return record
 
     # =========================================================================
@@ -707,6 +749,13 @@ class PromotionPipeline:
 
         logger.info(f"Promoted {strategy_id} to LIVE trading with {self.criteria.initial_live_allocation:.1%} allocation")
 
+        # Notify callback (e.g., to reload strategy into scheduler)
+        if self._on_promotion_callback:
+            try:
+                self._on_promotion_callback(strategy_id)
+            except Exception as e:
+                logger.warning(f"Promotion callback failed for {strategy_id}: {e}")
+
         return PromotionResult(
             success=True,
             strategy_id=strategy_id,
@@ -769,6 +818,13 @@ class PromotionPipeline:
 
         logger.warning(f"Retired strategy {strategy_id}: {reason.value}")
 
+        # Notify callback (e.g., to unload strategy from scheduler)
+        if self._on_retirement_callback:
+            try:
+                self._on_retirement_callback(strategy_id)
+            except Exception as e:
+                logger.warning(f"Retirement callback failed for {strategy_id}: {e}")
+
         return PromotionResult(
             success=True,
             strategy_id=strategy_id,
@@ -824,8 +880,10 @@ class PromotionPipeline:
                     if data.get(field):
                         data[field] = datetime.fromisoformat(data[field])
 
-                # Remove genome_json from record (keep it separate)
-                data.pop('genome_json', None)
+                # Include genome_json and run_time (needed for strategy loading)
+                # run_time defaults to '10:00' if not present (migration from old DBs)
+                if 'run_time' not in data or data['run_time'] is None:
+                    data['run_time'] = '10:00'
 
                 return StrategyRecord(**data)
 

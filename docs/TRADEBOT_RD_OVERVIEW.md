@@ -4,7 +4,9 @@
 **Timeline:** 3+ months before live capital consideration
 **Focus Areas:** Genetic Algorithm Computation, Architectural Efficiency, Programming Stability
 **Platform:** Raspberry Pi 5 (8GB RAM, NVMe SSD)
-**Last Updated:** January 4, 2026
+**Last Updated:** January 7, 2026
+
+> Related documentation: [DAY_CYCLE.md](DAY_CYCLE.md) (operational schedule), [AUTONOMOUS_RESEARCH_ENGINE.md](AUTONOMOUS_RESEARCH_ENGINE.md) (GP details), [STRATEGY_PORTFOLIO_OVERVIEW.md](STRATEGY_PORTFOLIO_OVERVIEW.md) (strategy analysis)
 
 ---
 
@@ -320,6 +322,50 @@ The system uses purpose-separated databases to avoid lock contention:
 └────────────────────────────────────────────────────────────────────┘
 ```
 
+### Hardware Integration (Pi-Specific)
+
+The system includes physical status indicators for at-a-glance monitoring:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    HARDWARE STATUS PANEL                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────────────┐   ┌──────────────────────┐              │
+│  │   RGB LED Array      │   │   LCD Display        │              │
+│  │  ┌─────┬─────┬─────┐ │   │   (16x2 or 20x4)     │              │
+│  │  │ SYS │ TRD │ RSH │ │   │                      │              │
+│  │  │ 🟢  │ 🔵  │ 🔵  │ │   │  SPY: $478.25 ▲0.3% │              │
+│  │  └─────┴─────┴─────┘ │   │  VIX: 14.2  NORMAL  │              │
+│  └──────────────────────┘   └──────────────────────┘              │
+│                                                                     │
+│  LED Meanings:                                                      │
+│  • System: Green=healthy, Yellow=warning, Red=error                │
+│  • Trading: Green=active, Blue=idle, Off=halted                    │
+│  • Research: Blue (breathing)=evolving, Green=complete             │
+│                                                                     │
+│  ┌──────────────────────┐                                          │
+│  │   Rotary Encoder     │   Click: Scroll LCD pages                │
+│  │       (input)        │   Hold 1-5s: Toggle backlight            │
+│  │        ◎             │   Hold 5s+: Reset LCD                    │
+│  └──────────────────────┘                                          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**LCD Display Pages:**
+- MARKET: SPY price, VIX level, current phase
+- TRADING: Portfolio value, daily P&L
+- POSITIONS: Open positions list
+- SYSTEM: RAM, CPU, uptime
+- RESEARCH: Generation progress, best Sharpe (overnight only)
+
+**Key Files:**
+- `hardware/leds.py` - RGB LED controller with breathing effects
+- `hardware/display.py` - LCD display manager
+- `hardware/encoder.py` - Rotary encoder input handling
+- `hardware/gpio_config.py` - Pin assignments
+
 ---
 
 ## Part III: Programming Stability
@@ -430,7 +476,7 @@ These strategies serve as baselines and generate signals while the GA discovers 
 | Vol-Managed Momentum V2 | Momentum | 1.70 | 0.55 | 10% | Active |
 | Mean Reversion (Bollinger) | Mean Reversion | 1.44 | 0.30 | 30% | Active |
 | Gap-Fill | Intraday | 2.38 | N/A | 10% | Active |
-| Pairs Trading | Mean Reversion | 2.30 | -3.02 | 5% | Debugging |
+| Pairs Trading | Mean Reversion | 2.30 | N/A | 0% | Disabled (cash) |
 | Relative Volume Breakout | Breakout | 2.81 | 0.06 | 25% | Marginal |
 | Quality Small-Cap Value | Value | 1.50 | 0.08 | 5% | Weak |
 | Factor Momentum | Momentum | 0.84 | 0.42 | 5% | Moderate |

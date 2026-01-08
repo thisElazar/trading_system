@@ -237,6 +237,10 @@ class PersistentGAOptimizer:
     MAX_MUTATION_RATE = 0.4               # Cap at 40% mutation rate
     BASE_MUTATION_RATE = 0.15             # Reset to this when improvement found
 
+    # Hard reset settings (last resort for deeply stuck populations)
+    HARD_RESET_THRESHOLD = 10             # Reset population after 10 gens without improvement
+    HARD_RESET_PRESERVE_ELITES = 2        # Keep top N individuals during reset
+
     def __init__(
         self,
         strategy_name: str,
@@ -474,6 +478,60 @@ class PersistentGAOptimizer:
 
         return self._current_mutation_rate
 
+    def _hard_reset_population(self, generation: int) -> bool:
+        """
+        Reset the entire population except elites - last resort for deep stagnation.
+
+        This is triggered after HARD_RESET_THRESHOLD generations without improvement,
+        when all other anti-stagnation measures have failed.
+
+        Args:
+            generation: Current generation number
+
+        Returns:
+            True if reset was performed
+        """
+        if self.generations_without_improvement < self.HARD_RESET_THRESHOLD:
+            return False
+
+        logger.warning(
+            f"  🔄 HARD RESET: {self.generations_without_improvement} generations "
+            f"without improvement - resetting population"
+        )
+
+        # Preserve elite individuals
+        sorted_pop = sorted(
+            self.optimizer.population,
+            key=lambda x: x.fitness,
+            reverse=True
+        )
+        elites = sorted_pop[:self.HARD_RESET_PRESERVE_ELITES]
+
+        # Create fresh random population
+        new_population = list(elites)  # Start with elites
+        n_new = len(self.optimizer.population) - len(elites)
+
+        for _ in range(n_new):
+            new_ind = self.optimizer._create_individual(generation)
+            new_population.append(new_ind)
+
+        # Replace population
+        self.optimizer.population = new_population
+
+        # Reset stagnation counter (give fresh population a chance)
+        self.generations_without_improvement = 0
+
+        # Reset mutation rate to base
+        self._current_mutation_rate = self.BASE_MUTATION_RATE
+        self.config.mutation_rate = self._current_mutation_rate
+
+        logger.info(
+            f"  Hard reset complete: Preserved {len(elites)} elites, "
+            f"created {n_new} new individuals"
+        )
+
+        return True
+
     def _individual_to_dict(self, ind: Individual) -> dict:
         """Convert Individual to JSON-serializable dict."""
         return {
@@ -691,6 +749,17 @@ class PersistentGAOptimizer:
                     f"Gen best = {gen_best.fitness:.4f}, "
                     f"All-time best = {self.best_ever_fitness:.4f}"
                 )
+
+            # === HARD RESET CHECK ===
+            # If stagnating for too long despite all measures, reset population
+            if self._hard_reset_population(self.current_generation):
+                # Re-evaluate the new population
+                if self.config.parallel:
+                    self.optimizer._evaluate_population_parallel(self.optimizer.population)
+                else:
+                    for ind in self.optimizer.population:
+                        if ind.fitness == 0:
+                            ind.fitness = self.optimizer._evaluate_fitness(ind)
 
             # === ADAPTIVE MUTATION ===
             # Increase mutation rate when stagnating, reset when improving
