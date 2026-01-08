@@ -233,6 +233,9 @@ class RapidBacktester:
         'slippage_bps': 5,
     }
 
+    # Cache size limit to prevent OOM during long research runs
+    MAX_PERIOD_CACHE_ENTRIES = 10
+
     def __init__(
         self,
         period_library: MarketPeriodLibrary = None,
@@ -427,6 +430,20 @@ class RapidBacktester:
         self._data_cache = data.copy()
         logger.info(f"Cached data for {len(data)} symbols")
 
+    def clear_cache(self):
+        """
+        Clear all cached data to free memory.
+
+        Call this between strategy runs during nightly research
+        to prevent unbounded memory growth.
+        """
+        cache_size = len(self._period_data_cache)
+        self._period_data_cache.clear()
+        self._data_cache.clear()
+        self._vix_data = None
+        if cache_size > 0:
+            logger.info(f"Cleared {cache_size} cached period data entries")
+
     def _get_period_data(
         self,
         period: MarketPeriod,
@@ -437,6 +454,11 @@ class RapidBacktester:
 
         if cache_key in self._period_data_cache:
             return self._period_data_cache[cache_key]
+
+        # Evict oldest cache entries if at limit (prevents OOM during long runs)
+        while len(self._period_data_cache) >= self.MAX_PERIOD_CACHE_ENTRIES:
+            oldest_key = next(iter(self._period_data_cache))
+            del self._period_data_cache[oldest_key]
 
         symbols = symbols or list(self._data_cache.keys())
         period_data = {}

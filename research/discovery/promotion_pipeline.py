@@ -951,6 +951,116 @@ class PromotionPipeline:
             ))
 
 
+    def process_all_promotions(self) -> Dict[str, int]:
+        """
+        Process all strategies through the promotion pipeline.
+
+        Iterates through strategies at each stage (LIVE, PAPER, VALIDATED, CANDIDATE)
+        and checks if they should be promoted or retired. Executes promotions/retirements
+        for eligible strategies.
+
+        Processing order (reverse to avoid immediate re-evaluation):
+        1. LIVE -> Check for retirement (performance decay, max drawdown)
+        2. PAPER -> Check for promotion to LIVE or retirement (paper failure)
+        3. VALIDATED -> Check for promotion to PAPER
+        4. CANDIDATE -> Check for promotion to VALIDATED (if validation metrics exist)
+
+        Returns:
+            Dict with keys:
+            - 'promoted': Number of strategies promoted to next stage
+            - 'retired': Number of strategies retired
+        """
+        promoted_count = 0
+        retired_count = 0
+
+        # Stage 1: Check LIVE strategies for retirement
+        live_strategies = self.get_strategies_by_status(StrategyStatus.LIVE)
+        for strategy_id in live_strategies:
+            try:
+                should_retire, reason, metrics = self.check_live_for_retirement(strategy_id)
+                if should_retire:
+                    # Determine retirement reason from message
+                    if "drawdown" in reason.lower():
+                        retire_reason = RetirementReason.MAX_DRAWDOWN
+                    elif "sharpe" in reason.lower() or "performance" in reason.lower():
+                        retire_reason = RetirementReason.PERFORMANCE_DECAY
+                    else:
+                        retire_reason = RetirementReason.PERFORMANCE_DECAY
+
+                    result = self.retire_strategy(strategy_id, retire_reason)
+                    if result.success:
+                        retired_count += 1
+            except Exception as e:
+                pass  # Continue processing other strategies
+
+        # Stage 2: Check PAPER strategies for promotion to LIVE or retirement
+        paper_strategies = self.get_strategies_by_status(StrategyStatus.PAPER)
+        for strategy_id in paper_strategies:
+            try:
+                # Check if paper strategy should be retired due to poor performance
+                record = self.get_strategy_record(strategy_id)
+                if record and record.paper_days >= self.criteria.min_paper_days // 2:
+                    # Severe negative Sharpe after observation period
+                    if record.paper_sharpe < -0.5:
+                        result = self.retire_strategy(strategy_id, RetirementReason.PAPER_FAILURE)
+                        if result.success:
+                            retired_count += 1
+                        continue
+                    # Severe drawdown
+                    if record.paper_max_drawdown < self.criteria.max_paper_drawdown * 1.25:
+                        result = self.retire_strategy(strategy_id, RetirementReason.PAPER_FAILURE)
+                        if result.success:
+                            retired_count += 1
+                        continue
+
+                # Check if ready for promotion to live
+                ready, message, metrics = self.check_paper_for_live(strategy_id)
+                if ready:
+                    result = self.promote_to_live(strategy_id)
+                    if result.success:
+                        promoted_count += 1
+            except Exception as e:
+                pass  # Continue processing other strategies
+
+        # Stage 3: Check VALIDATED strategies for promotion to PAPER
+        validated_strategies = self.get_strategies_by_status(StrategyStatus.VALIDATED)
+        for strategy_id in validated_strategies:
+            try:
+                ready, message, metrics = self.check_validated_for_paper(strategy_id)
+                if ready:
+                    result = self.promote_to_paper(strategy_id)
+                    if result.success:
+                        promoted_count += 1
+            except Exception as e:
+                pass  # Continue processing other strategies
+
+        # Stage 4: Check CANDIDATE strategies for promotion to VALIDATED
+        # Note: This requires validation metrics to be already populated
+        candidate_strategies = self.get_strategies_by_status(StrategyStatus.CANDIDATE)
+        for strategy_id in candidate_strategies:
+            try:
+                ready, message, metrics = self.check_candidate_for_validation(strategy_id)
+                if ready:
+                    # Get validation metrics from the record
+                    record = self.get_strategy_record(strategy_id)
+                    if record and record.walk_forward_efficiency > 0 and record.monte_carlo_confidence > 0:
+                        result = self.promote_to_validated(
+                            strategy_id,
+                            walk_forward_efficiency=record.walk_forward_efficiency,
+                            monte_carlo_confidence=record.monte_carlo_confidence,
+                            validation_periods=record.validation_periods_passed or 3
+                        )
+                        if result.success:
+                            promoted_count += 1
+            except Exception as e:
+                pass  # Continue processing other strategies
+
+        return {
+            'promoted': promoted_count,
+            'retired': retired_count
+        }
+
+
 # =============================================================================
 # DEMO
 # =============================================================================

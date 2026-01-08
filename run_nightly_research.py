@@ -45,7 +45,9 @@ Design principles:
 """
 
 import argparse
+import gc
 import logging
+import signal
 import sys
 import time
 import uuid
@@ -54,6 +56,19 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing as mp
+
+# Global shutdown flag for graceful termination
+_shutdown_requested = False
+
+def _handle_shutdown_signal(signum, frame):
+    """Handle SIGTERM/SIGINT for graceful shutdown."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    logging.getLogger('nightly_research').warning(f"Received signal {signum}, requesting shutdown...")
+
+# Register signal handlers at module load
+signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
 # ============================================================================
 # PARALLEL FITNESS EVALUATION INFRASTRUCTURE
@@ -77,7 +92,10 @@ _parallel_fitness_context = {
 def _init_parallel_worker():
     """Initialize worker process (called once per worker)."""
     # Workers inherit the global context via fork()
-    pass
+    # CRITICAL: Workers must ignore signals - only main process handles shutdown
+    # This prevents zombie workers when SIGTERM is sent to the process group
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 def evaluate_genes_parallel(genes: dict) -> float:
     """
@@ -310,8 +328,10 @@ QUICK_GA_CONFIG = GeneticConfig(
 ENABLE_STRATEGY_DISCOVERY = True  # Enabled for nightly runs
 
 # Discovery configuration
+# Memory-safe settings: population reduced from 50 to 30, with batched evaluation
+# Batches of 10 individuals with GC between batches (see evolution_engine.py)
 DISCOVERY_CONFIG = {
-    'population_size': 50,        # GP population size
+    'population_size': 30,        # GP population size (reduced from 50 for Pi stability)
     'generations_per_session': 20,  # Generations per nightly run
     'hours': 2.0,                 # Max hours for discovery (overrides generations)
     'novelty_weight': 0.3,        # Balance between fitness and novelty
@@ -319,11 +339,11 @@ DISCOVERY_CONFIG = {
     'checkpoint_frequency': 5,    # Save checkpoint every N generations
 }
 
-# Pi-optimized discovery config (smaller for limited resources)
+# Pi-optimized discovery config (even smaller for limited resources / quick mode)
 PI_DISCOVERY_CONFIG = {
-    'population_size': 30,
-    'generations_per_session': 15,
-    'hours': 1.5,
+    'population_size': 20,        # Minimal population for quick tests
+    'generations_per_session': 10,
+    'hours': 1.0,
     'novelty_weight': 0.3,
     'min_trades': 50,
     'checkpoint_frequency': 5,
@@ -1808,6 +1828,10 @@ class NightlyResearchEngine:
         # ====================================================================
         # PHASE 1: Parameter Optimization (existing strategies)
         # ====================================================================
+        if _shutdown_requested:
+            logger.warning("Shutdown requested before Phase 1, exiting")
+            return {'success': False, 'error': 'Shutdown requested'}
+
         if not skip_param_optimization:
             logger.info("\n" + "-" * 50)
             logger.info("PHASE 1: Parameter Optimization")
@@ -1865,9 +1889,17 @@ class NightlyResearchEngine:
                     logger.warning("GA results intervention rejected, improvements will not be applied")
                     # Note: Results are already saved by evolve_strategy, this is informational
 
+            # Clear memory between phases to prevent OOM during long research runs
+            gc.collect()
+            logger.info("Memory cleared after Phase 1")
+
         # ====================================================================
         # PHASE 2: Strategy Discovery (novel strategies via GP)
         # ====================================================================
+        if _shutdown_requested:
+            logger.warning("Shutdown requested before Phase 2, exiting")
+            return {'success': True, 'partial': True, 'error': 'Shutdown after Phase 1'}
+
         if self.enable_discovery and not skip_discovery:
             logger.info("\n" + "-" * 50)
             logger.info("PHASE 2: Strategy Discovery (GP)")
@@ -1896,9 +1928,17 @@ class NightlyResearchEngine:
                     logger.warning("Discovered strategy intervention rejected")
                     # Mark discovered strategies as needing review
 
+            # Clear memory between phases to prevent OOM during long research runs
+            gc.collect()
+            logger.info("Memory cleared after Phase 2")
+
         # ====================================================================
         # PHASE 3: Adaptive GA (regime-matched multi-scale testing)
         # ====================================================================
+        if _shutdown_requested:
+            logger.warning("Shutdown requested before Phase 3, exiting")
+            return {'success': True, 'partial': True, 'error': 'Shutdown after Phase 2'}
+
         if self.enable_adaptive and not skip_adaptive:
             logger.info("\n" + "-" * 50)
             logger.info("PHASE 3: Adaptive GA (Regime-Matched)")
@@ -1945,6 +1985,10 @@ class NightlyResearchEngine:
                 improvements += adaptive_results.get('improvements_found', 0)
             else:
                 errors.append(f"Adaptive GA: {adaptive_results.get('error', 'Unknown error')}")
+
+            # Clear memory after Phase 3 to prevent OOM during long research runs
+            gc.collect()
+            logger.info("Memory cleared after Phase 3")
 
         # Summary
         end_time = datetime.now()

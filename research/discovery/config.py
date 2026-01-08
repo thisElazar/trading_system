@@ -13,8 +13,9 @@ class EvolutionConfig:
     """Configuration for autonomous evolution."""
 
     # Population settings
-    population_size: int = 100
-    generations_per_session: int = 50
+    # Reduced from 100 to 30 for Pi stability; batched evaluation in evolution_engine.py
+    population_size: int = 30
+    generations_per_session: int = 20
 
     # Genetic operators
     crossover_rate: float = 0.8
@@ -69,8 +70,9 @@ class EvolutionConfig:
     log_frequency: int = 5            # Log every N generations
 
     # Parallel evaluation
-    n_workers: int = 1                # Number of parallel evaluators
-    parallel_enabled: bool = False  # Disabled - too memory-hungry for Pi
+    # Now safe to enable: batched evaluation with GC between batches (evolution_engine.py)
+    n_workers: int = 4                # Use all cores
+    parallel_enabled: bool = True     # Safe with batched evaluation
 
     # Validation
     train_ratio: float = 0.7          # 70% train, 30% test
@@ -128,9 +130,9 @@ class PrimitiveConfig:
 # Default configurations
 DEFAULT_CONFIG = EvolutionConfig()
 PI_CONFIG = EvolutionConfig(
-    population_size=50,        # Smaller for Pi
-    generations_per_session=30,
-    n_workers=2,               # Pi has 4 cores but leave some headroom
+    population_size=30,        # Memory-safe for Pi (batched in groups of 10)
+    generations_per_session=20,
+    n_workers=4,               # Use all cores; batching prevents memory issues
     max_runtime_hours=6.0
 )
 

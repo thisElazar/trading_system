@@ -203,14 +203,15 @@ class GeneticOptimizer:
         logger.info(f"Evaluating {len(to_evaluate)} individuals in parallel with {self.config.n_workers} workers")
 
         try:
-            # Import the module-level parallel evaluation function
-            from run_nightly_research import evaluate_genes_parallel
-            
+            # Import the module-level parallel evaluation function and worker initializer
+            from run_nightly_research import evaluate_genes_parallel, _init_parallel_worker
+
             # Use multiprocessing Pool with fork context (Linux) for shared globals
             import multiprocessing as mp
             ctx = mp.get_context('fork')
-            
-            with ctx.Pool(processes=self.config.n_workers) as pool:
+
+            # Pass initializer to ensure workers ignore SIGTERM (prevents zombie workers)
+            with ctx.Pool(processes=self.config.n_workers, initializer=_init_parallel_worker) as pool:
                 # Map genes to fitness values
                 genes_list = [ind.genes for _, ind in to_evaluate]
                 results = pool.map(evaluate_genes_parallel, genes_list)

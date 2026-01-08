@@ -19,6 +19,7 @@ Migration topologies:
 import random
 import logging
 import copy
+import gc
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -26,6 +27,20 @@ from enum import Enum
 
 import numpy as np
 import pandas as pd
+
+# Memory monitoring
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    psutil = None
+    HAS_PSUTIL = False
+
+# Memory thresholds for Pi (4GB RAM)
+MEMORY_WARNING_MB = 600   # Warn when available < 600MB
+MEMORY_CRITICAL_MB = 300  # Abort when available < 300MB
+MAX_CACHE_SIZE_PER_ISLAND = 100  # Max fitness cache entries per island
+MAX_PARETO_FRONT_SIZE = 50  # Limit global Pareto front
 
 from .config import EvolutionConfig, IslandConfig
 from .strategy_genome import StrategyGenome, GenomeFactory
@@ -157,6 +172,9 @@ class IslandEvolutionEngine:
         else:
             self.map_elites = None
 
+        # Memory monitoring
+        self._memory_warning_logged = False
+
         # Initialize islands
         self._initialize_islands()
 
@@ -180,6 +198,91 @@ class IslandEvolutionEngine:
 
             self.islands.append(island)
             logger.debug(f"Island {i}: mutation={island.mutation_rate:.2f}, depth={island.max_tree_depth}")
+
+    def _check_memory(self) -> tuple:
+        """
+        Check available memory and return status.
+
+        Returns:
+            (is_ok, available_mb) - is_ok is False if memory is critical
+        """
+        if not HAS_PSUTIL:
+            return True, 0  # Can't check, assume OK
+
+        try:
+            mem = psutil.virtual_memory()
+            available_mb = mem.available / (1024 * 1024)
+
+            if available_mb < MEMORY_CRITICAL_MB:
+                logger.error(f"CRITICAL: Memory very low ({available_mb:.0f}MB available)")
+                return False, available_mb
+            elif available_mb < MEMORY_WARNING_MB:
+                if not self._memory_warning_logged:
+                    logger.warning(f"Memory getting low ({available_mb:.0f}MB available)")
+                    self._memory_warning_logged = True
+            else:
+                self._memory_warning_logged = False
+
+            return True, available_mb
+        except Exception as e:
+            logger.debug(f"Memory check failed: {e}")
+            return True, 0
+
+    def _prune_caches(self):
+        """
+        Prune fitness/behavior caches to keep only entries for current population.
+        This prevents unbounded memory growth over generations.
+        """
+        total_pruned = 0
+
+        for island in self.islands:
+            # Get current population genome IDs
+            current_ids = {g.genome_id for g in island.population}
+
+            # Prune fitness cache
+            old_size = len(island.fitness_cache)
+            if old_size > MAX_CACHE_SIZE_PER_ISLAND:
+                # Keep entries for current population, prune the rest
+                island.fitness_cache = {
+                    gid: fitness for gid, fitness in island.fitness_cache.items()
+                    if gid in current_ids
+                }
+
+            # Prune behavior cache similarly
+            old_behavior_size = len(island.behavior_cache)
+            if old_behavior_size > MAX_CACHE_SIZE_PER_ISLAND:
+                island.behavior_cache = {
+                    gid: behavior for gid, behavior in island.behavior_cache.items()
+                    if gid in current_ids
+                }
+
+            pruned = old_size - len(island.fitness_cache)
+            total_pruned += pruned
+
+        if total_pruned > 0:
+            logger.debug(f"Pruned {total_pruned} stale cache entries")
+
+        return total_pruned
+
+    def _cleanup_generation(self):
+        """
+        Perform memory cleanup after a generation.
+        Prunes caches and triggers garbage collection.
+        """
+        # Prune caches
+        self._prune_caches()
+
+        # Limit Pareto front size
+        if len(self.global_pareto_front) > MAX_PARETO_FRONT_SIZE:
+            # Keep only the best by Sortino
+            self.global_pareto_front = sorted(
+                self.global_pareto_front,
+                key=lambda g: g.fitness_values[0] if g.fitness_values else -999,
+                reverse=True
+            )[:MAX_PARETO_FRONT_SIZE]
+
+        # Force garbage collection every generation to reclaim memory
+        gc.collect()
 
     def initialize_populations(self):
         """Initialize population for each island."""
@@ -246,9 +349,9 @@ class IslandEvolutionEngine:
         island.fitness_cache[genome.genome_id] = fitness
         island.behavior_cache[genome.genome_id] = behavior
 
-        # Store on genome
-        genome.backtest_result = result
+        # Store only essential metrics on genome (NOT full backtest result - saves memory)
         genome.fitness_values = fitness.to_tuple()
+        # Don't store: genome.backtest_result = result (equity curves consume too much memory)
 
         self.total_strategies_evaluated += 1
 
@@ -495,9 +598,20 @@ class IslandEvolutionEngine:
             # Add immigrants
             island.population.extend(immigrants)
 
-    def evolve_generation(self):
-        """Evolve all islands for one generation."""
+    def evolve_generation(self) -> bool:
+        """
+        Evolve all islands for one generation.
+
+        Returns:
+            True if evolution should continue, False if memory critical
+        """
         self.current_generation += 1
+
+        # Check memory before evolution
+        mem_ok, available_mb = self._check_memory()
+        if not mem_ok:
+            logger.error(f"Aborting evolution due to critical memory ({available_mb:.0f}MB)")
+            return False
 
         # Evolve each island
         for island in self.islands:
@@ -562,6 +676,11 @@ class IslandEvolutionEngine:
             if should_intervene:
                 logger.warning(f"Global diversity intervention triggered: {reason}")
                 self._inject_diversity_all_islands()
+
+        # Memory cleanup at end of generation
+        self._cleanup_generation()
+
+        return True  # Continue evolution
 
     def _inject_diversity_all_islands(self):
         """Inject random individuals into all islands to combat convergence."""
@@ -656,7 +775,11 @@ class IslandEvolutionEngine:
                 logger.info("Generation limit reached")
                 break
 
-            self.evolve_generation()
+            # Evolve and check for memory abort
+            should_continue = self.evolve_generation()
+            if not should_continue:
+                logger.warning("Evolution stopped due to memory constraints")
+                break
 
             # Log progress
             if self.current_generation % 5 == 0 or self.current_generation <= 3:

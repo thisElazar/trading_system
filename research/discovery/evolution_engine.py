@@ -15,11 +15,26 @@ import logging
 import json
 import signal
 import copy
+import gc
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Memory monitoring
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    psutil = None
+    HAS_PSUTIL = False
+
+# Memory thresholds for Pi (4GB RAM)
+MEMORY_WARNING_MB = 600
+MEMORY_CRITICAL_MB = 300
+MAX_CACHE_SIZE = 200  # Max fitness cache entries
+MAX_PARETO_FRONT_SIZE = 50
 # Shared memory and persistent pool for efficient parallelism
 from .shared_data import SharedDataManager
 from .parallel_pool import PersistentWorkerPool
@@ -260,6 +275,54 @@ class EvolutionEngine:
         signal.signal(signal.SIGTERM, handle_shutdown)
         signal.signal(signal.SIGINT, handle_shutdown)
 
+    def _check_memory(self) -> tuple:
+        """Check available memory. Returns (is_ok, available_mb)."""
+        if not HAS_PSUTIL:
+            return True, 0
+
+        try:
+            mem = psutil.virtual_memory()
+            available_mb = mem.available / (1024 * 1024)
+
+            if available_mb < MEMORY_CRITICAL_MB:
+                logger.error(f"CRITICAL: Memory very low ({available_mb:.0f}MB available)")
+                return False, available_mb
+            elif available_mb < MEMORY_WARNING_MB:
+                logger.warning(f"Memory getting low ({available_mb:.0f}MB available)")
+
+            return True, available_mb
+        except Exception as e:
+            logger.debug(f"Memory check failed: {e}")
+            return True, 0
+
+    def _prune_caches(self):
+        """Prune caches to keep only entries for current population."""
+        current_ids = {g.genome_id for g in self.population}
+
+        if len(self.fitness_cache) > MAX_CACHE_SIZE:
+            self.fitness_cache = {
+                gid: f for gid, f in self.fitness_cache.items()
+                if gid in current_ids
+            }
+            self.behavior_cache = {
+                gid: b for gid, b in self.behavior_cache.items()
+                if gid in current_ids
+            }
+
+    def _cleanup_generation(self):
+        """Perform memory cleanup after a generation."""
+        self._prune_caches()
+
+        # Limit Pareto front size
+        if len(self.pareto_front) > MAX_PARETO_FRONT_SIZE:
+            self.pareto_front = sorted(
+                self.pareto_front,
+                key=lambda g: self.fitness_cache.get(g.genome_id, FitnessVector(0, 0, 0, 0, 0)).sortino,
+                reverse=True
+            )[:MAX_PARETO_FRONT_SIZE]
+
+        gc.collect()
+
     def initialize_population(self, size: int = None):
         """
         Initialize random population.
@@ -422,9 +485,9 @@ class EvolutionEngine:
         self.fitness_cache[genome.genome_id] = fitness
         self.behavior_cache[genome.genome_id] = behavior
 
-        # Store backtest result on genome
-        genome.backtest_result = result
+        # Store only essential metrics on genome (NOT full backtest result - saves memory)
         genome.fitness_values = fitness.to_tuple()
+        # Don't store: genome.backtest_result = result (equity curves consume too much memory)
 
         self.total_strategies_evaluated += 1
 
@@ -444,7 +507,12 @@ class EvolutionEngine:
 
         Uses shared memory for data and persistent workers to avoid
         respawning processes and copying data each generation.
+
+        Memory-safe batching: Evaluates in batches of 10 with GC and cooldown
+        between batches to prevent memory exhaustion on Pi.
         """
+        import time
+
         if not self.config.parallel_enabled:
             self.evaluate_population()
             return
@@ -459,50 +527,74 @@ class EvolutionEngine:
         if not to_evaluate:
             return
 
-        logger.info(f"Evaluating {len(to_evaluate)} individuals in parallel with {self.config.n_workers} workers")
+        # Batch configuration for memory safety
+        BATCH_SIZE = 10  # Evaluate 10 at a time instead of all 50
+        COOLDOWN_SECONDS = 1.5  # Rest between batches
+
+        total_to_eval = len(to_evaluate)
+        logger.info(f"Evaluating {total_to_eval} individuals in batches of {BATCH_SIZE} with {self.config.n_workers} workers")
 
         # Serialize genomes - data is in shared memory, not passed
         config_dict = asdict(self.config)
-        genome_data_list = [self.factory.serialize_genome(g) for g in to_evaluate]
+
+        # Split into batches
+        batches = [to_evaluate[i:i + BATCH_SIZE] for i in range(0, len(to_evaluate), BATCH_SIZE)]
+
+        success_count = 0
 
         try:
-            # Use persistent pool - no ProcessPoolExecutor recreation
-            raw_results = self._worker_pool.evaluate_batch(genome_data_list, config_dict)
+            for batch_idx, batch_genomes in enumerate(batches):
+                batch_num = batch_idx + 1
 
-            # Process results in main thread (novelty calculation needs shared archive)
-            success_count = 0
-            for genome, result in zip(to_evaluate, raw_results):
-                if not result.get("success", False):
-                    logger.warning(f"Worker failed for {genome.genome_id}: {result.get('error', 'unknown')}")
-                    continue
+                # Serialize this batch
+                genome_data_list = [self.factory.serialize_genome(g) for g in batch_genomes]
 
-                success_count += 1
+                # Evaluate batch
+                raw_results = self._worker_pool.evaluate_batch(genome_data_list, config_dict)
 
-                # Reconstruct behavior vector
-                behavior = BehaviorVector(*result["behavior_array"])
+                # Process results in main thread (novelty calculation needs shared archive)
+                for genome, result in zip(batch_genomes, raw_results):
+                    if not result.get("success", False):
+                        logger.warning(f"Worker failed for {genome.genome_id}: {result.get('error', 'unknown')}")
+                        continue
 
-                # Calculate novelty (requires access to shared novelty archive)
-                novelty = self.novelty_archive.calculate_novelty(behavior)
+                    success_count += 1
 
-                # Calculate fitness vector
-                backtest_result = result["result"]
-                fitness = calculate_fitness_vector(
-                    result=backtest_result,
-                    novelty_score=novelty,
-                    total_trials=self.total_strategies_evaluated + 1
-                )
+                    # Reconstruct behavior vector
+                    behavior = BehaviorVector(*result["behavior_array"])
 
-                # Cache results
-                self.fitness_cache[genome.genome_id] = fitness
-                self.behavior_cache[genome.genome_id] = behavior
+                    # Calculate novelty (requires access to shared novelty archive)
+                    novelty = self.novelty_archive.calculate_novelty(behavior)
 
-                # Store on genome
-                genome.backtest_result = backtest_result
-                genome.fitness_values = fitness.to_tuple()
+                    # Calculate fitness vector
+                    backtest_result = result["result"]
+                    fitness = calculate_fitness_vector(
+                        result=backtest_result,
+                        novelty_score=novelty,
+                        total_trials=self.total_strategies_evaluated + 1
+                    )
 
-                self.total_strategies_evaluated += 1
+                    # Cache results
+                    self.fitness_cache[genome.genome_id] = fitness
+                    self.behavior_cache[genome.genome_id] = behavior
 
-            logger.info(f"Parallel evaluation complete: {success_count} succeeded")
+                    # Store only fitness values on genome (NOT backtest_result - saves memory)
+                    genome.fitness_values = fitness.to_tuple()
+
+                    self.total_strategies_evaluated += 1
+
+                # Memory cleanup between batches
+                gc.collect()
+
+                # Log progress
+                evaluated_so_far = min((batch_idx + 1) * BATCH_SIZE, total_to_eval)
+                logger.info(f"  Batch {batch_num}/{len(batches)}: {evaluated_so_far}/{total_to_eval} evaluated")
+
+                # Cooldown between batches (except after last batch)
+                if batch_idx < len(batches) - 1:
+                    time.sleep(COOLDOWN_SECONDS)
+
+            logger.info(f"Parallel evaluation complete: {success_count}/{total_to_eval} succeeded")
 
         except Exception as e:
             logger.warning(f"Parallel execution failed ({e}), falling back to sequential")
@@ -565,10 +657,21 @@ class EvolutionEngine:
 
         return selected
 
-    def evolve_generation(self):
-        """Evolve one generation."""
+    def evolve_generation(self) -> bool:
+        """
+        Evolve one generation.
+
+        Returns:
+            True if evolution should continue, False if memory critical
+        """
         self.current_generation += 1
         logger.info(f"Generation {self.current_generation}")
+
+        # Check memory before evolution
+        mem_ok, available_mb = self._check_memory()
+        if not mem_ok:
+            logger.error(f"Aborting evolution due to critical memory ({available_mb:.0f}MB)")
+            return False
 
         # Evaluate current population (parallel if enabled)
         self.evaluate_population_parallel()
@@ -676,6 +779,11 @@ class EvolutionEngine:
 
         # Replace population with offspring
         self.population = offspring[:self.config.population_size]
+
+        # Memory cleanup at end of generation
+        self._cleanup_generation()
+
+        return True  # Continue evolution
 
     def _tournament_select(self, candidates: List[StrategyGenome]) -> StrategyGenome:
         """Tournament selection."""
@@ -787,7 +895,11 @@ class EvolutionEngine:
                 logger.info("Time limit reached")
                 break
 
-            self.evolve_generation()
+            # Evolve and check for memory abort
+            should_continue = self.evolve_generation()
+            if not should_continue:
+                logger.warning("Evolution stopped due to memory constraints")
+                break
 
             # Checkpoint periodically
             if self.current_generation % self.config.checkpoint_frequency == 0:

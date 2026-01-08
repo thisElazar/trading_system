@@ -477,14 +477,22 @@ def get_strategy_stats() -> List[Dict[str, Any]]:
             return []
 
         df = pd.read_sql_query(
-            """SELECT strategy, total_trades, winning_trades,
-                      win_rate, total_pnl, sharpe_ratio, max_drawdown_pct,
+            """SELECT strategy, total_trades, winning_trades, losing_trades,
+                      win_rate, total_pnl, avg_pnl, profit_factor,
+                      sharpe_ratio, max_drawdown_pct,
                       is_enabled, last_trade_date
                FROM strategy_stats
                ORDER BY total_pnl DESC""",
             conn
         )
         conn.close()
+
+        # Format wins as "wins/total" for display
+        if not df.empty:
+            df['wins_display'] = df.apply(
+                lambda r: f"{int(r['winning_trades'])}/{int(r['total_trades'])}"
+                if r['total_trades'] > 0 else "-", axis=1
+            )
 
         return df.to_dict('records') if not df.empty else []
     except Exception as e:
@@ -1703,6 +1711,28 @@ def get_orchestrator_status() -> Dict[str, Any]:
                         task_name = task_match.group(1)
                         if task_name not in task_results:
                             task_results[task_name] = 'failed'
+                # Track tasks that have started (for detecting running tasks)
+                elif 'Starting task:' in line:
+                    task_match = re.search(r'Starting task: (\w+)', line)
+                    if task_match:
+                        task_name = task_match.group(1)
+                        # Only mark as running if not already completed/failed
+                        if task_name not in task_results:
+                            task_results[task_name] = 'running'
+
+            # Check for actually running research subprocess
+            try:
+                for p in psutil.process_iter(['pid', 'cmdline']):
+                    try:
+                        cmdline = p.info.get('cmdline') or []
+                        if any('run_nightly_research.py' in arg for arg in cmdline):
+                            # Research subprocess is running - mark task as running
+                            task_results['run_nightly_research'] = 'running'
+                            break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception:
+                pass
 
             # Convert task results to list
             status['task_details'] = [
@@ -2208,7 +2238,7 @@ def create_equity_chart():
 
 
 def create_strategy_table():
-    """Create strategy performance table."""
+    """Create strategy performance table with wins display."""
     return dbc.Card([
         dbc.CardHeader(html.H5("Strategy Performance", className="mb-0")),
         dbc.CardBody([
@@ -2216,15 +2246,15 @@ def create_strategy_table():
                 id='strategy-table',
                 columns=[
                     {"name": "Strategy", "id": "strategy"},
-                    {"name": "Trades", "id": "total_trades", "type": "numeric"},
-                    {"name": "Win Rate", "id": "win_rate", "type": "numeric",
-                     "format": {"specifier": ".1%"}},
+                    {"name": "Wins", "id": "wins_display"},
+                    {"name": "Win %", "id": "win_rate", "type": "numeric",
+                     "format": {"specifier": ".0%"}},
                     {"name": "P&L", "id": "total_pnl", "type": "numeric",
-                     "format": {"specifier": "+,.0f"}},
+                     "format": {"specifier": "$,.2f"}},
+                    {"name": "Avg P&L", "id": "avg_pnl", "type": "numeric",
+                     "format": {"specifier": "$,.2f"}},
                     {"name": "Sharpe", "id": "sharpe_ratio", "type": "numeric",
                      "format": {"specifier": ".2f"}},
-                    {"name": "Max DD", "id": "max_drawdown_pct", "type": "numeric",
-                     "format": {"specifier": ".1%"}},
                     {"name": "Enabled", "id": "is_enabled"},
                 ],
                 style_table={'overflowX': 'auto'},
@@ -2234,11 +2264,59 @@ def create_strategy_table():
                     'textAlign': 'right',
                     'padding': '8px',
                 },
+                style_cell_conditional=[
+                    {'if': {'column_id': 'strategy'}, 'textAlign': 'left'},
+                    {'if': {'column_id': 'wins_display'}, 'textAlign': 'center', 'fontWeight': 'bold'},
+                ],
                 style_header={
                     'backgroundColor': '#444',
                     'fontWeight': 'bold',
                     'textAlign': 'center',
                 },
+                style_data_conditional=[
+                    # Green for positive P&L
+                    {
+                        'if': {
+                            'filter_query': '{total_pnl} > 0',
+                            'column_id': 'total_pnl'
+                        },
+                        'color': '#00bc8c',
+                        'fontWeight': 'bold'
+                    },
+                    # Red for negative P&L
+                    {
+                        'if': {
+                            'filter_query': '{total_pnl} < 0',
+                            'column_id': 'total_pnl'
+                        },
+                        'color': '#e74c3c',
+                        'fontWeight': 'bold'
+                    },
+                    # Green for high win rate (>60%)
+                    {
+                        'if': {
+                            'filter_query': '{win_rate} > 0.6',
+                            'column_id': 'win_rate'
+                        },
+                        'color': '#00bc8c',
+                    },
+                    # Yellow for medium win rate (40-60%)
+                    {
+                        'if': {
+                            'filter_query': '{win_rate} >= 0.4 && {win_rate} <= 0.6',
+                            'column_id': 'win_rate'
+                        },
+                        'color': '#f39c12',
+                    },
+                    # Red for low win rate (<40%)
+                    {
+                        'if': {
+                            'filter_query': '{win_rate} < 0.4 && {win_rate} > 0',
+                            'column_id': 'win_rate'
+                        },
+                        'color': '#e74c3c',
+                    },
+                ],
                 page_size=10,
             )
         ])
@@ -4384,7 +4462,12 @@ def update_dashboard(n_intervals, n_clicks, startup_intervals):
         # Build task list
         task_items = []
         for task in orch_status['task_details'][:6]:  # Show up to 6 tasks
-            task_icon = "check-circle text-success" if task['status'] == 'success' else "times-circle text-danger"
+            if task['status'] == 'success':
+                task_icon = "check-circle text-success"
+            elif task['status'] == 'running':
+                task_icon = "spinner fa-spin text-info"
+            else:
+                task_icon = "times-circle text-danger"
             task_items.append(
                 html.Div([
                     html.I(className=f"fas fa-{task_icon} me-2"),

@@ -27,8 +27,10 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Callable
 from pathlib import Path
+import gc
 import json
 import traceback
+import psutil
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -46,7 +48,7 @@ from execution.signal_tracker import ExecutionTracker
 from execution.alpaca_connector import AlpacaConnector
 from execution.alerts import AlertManager
 from execution.circuit_breaker import CircuitBreakerManager, CircuitBreakerConfig
-from config import CIRCUIT_BREAKER, WEEKEND_CONFIG, ALPACA_API_KEY, ALPACA_SECRET_KEY
+from config import CIRCUIT_BREAKER, WEEKEND_CONFIG, ALPACA_API_KEY, ALPACA_SECRET_KEY, DATABASES
 
 # Intelligence modules
 try:
@@ -124,6 +126,15 @@ except ImportError:
     RapidGainScaler = None
     RapidGainConfig = None
     HAS_RAPID_GAIN_SCALER = False
+
+# Hardware integration (optional - Pi 5 status LEDs)
+try:
+    from hardware.integration import get_hardware_status, HardwareStatus
+    HAS_HARDWARE = True
+except ImportError:
+    get_hardware_status = None
+    HardwareStatus = None
+    HAS_HARDWARE = False
 
 # Setup logging
 LOG_DIR = Path(__file__).parent / "logs"
@@ -206,6 +217,9 @@ class OrchestratorState:
     is_running: bool = False
     scheduler_thread: Optional[threading.Thread] = None
 
+    # Per-phase task completion tracking (prevents redundant execution within a phase)
+    phase_tasks_completed: Dict[str, set] = field(default_factory=dict)
+
     # Weekend phase state
     weekend_sub_phase: Optional[WeekendSubPhase] = None
     weekend_tasks_completed: List[str] = field(default_factory=list)
@@ -226,7 +240,7 @@ class DailyOrchestrator:
         MarketPhase.PRE_MARKET: PhaseConfig(
             start_hour=8, start_minute=0,
             end_hour=9, end_minute=30,
-            tasks=["refresh_data", "system_check", "sync_positions_from_broker", "review_positions", "cancel_stale_orders", "update_regime_detection", "calculate_position_scalars"],
+            tasks=["refresh_premarket_data", "refresh_data", "system_check", "sync_positions_from_broker", "review_positions", "cancel_stale_orders", "update_regime_detection", "calculate_position_scalars"],
             check_interval_seconds=60
         ),
         MarketPhase.INTRADAY_OPEN: PhaseConfig(
@@ -256,7 +270,7 @@ class DailyOrchestrator:
         MarketPhase.EVENING: PhaseConfig(
             start_hour=17, start_minute=0,
             end_hour=21, end_minute=30,
-            tasks=["cleanup_logs", "backup_databases", "cleanup_databases"],
+            tasks=["refresh_eod_data", "cleanup_logs", "backup_databases", "cleanup_databases"],
             check_interval_seconds=300
         ),
         MarketPhase.OVERNIGHT: PhaseConfig(
@@ -307,9 +321,25 @@ class DailyOrchestrator:
         self._intraday_strategies: List = []
         self._intraday_positions: Dict[str, Any] = {}  # Track intraday positions
 
+        # Hardware status interface (Pi 5 LEDs)
+        self._hardware: Optional[HardwareStatus] = None
+
+        # VIX cache for efficient display updates
+        self._vix_cache: float = 0.0
+        self._vix_cache_time: float = 0.0
+        self._vix_cache_ttl: float = 30.0  # Cache VIX for 30 seconds
+
+        if HAS_HARDWARE:
+            try:
+                self._hardware = get_hardware_status()
+                logger.info("Hardware status interface initialized")
+            except Exception as e:
+                logger.warning(f"Hardware initialization failed: {e}")
+
         # Task registry
         self._task_registry: Dict[str, Callable] = {
             # Pre-market tasks
+            "refresh_premarket_data": self._task_refresh_premarket_data,
             "refresh_data": self._task_refresh_data,
             "system_check": self._task_system_check,
             "sync_positions_from_broker": self._task_sync_positions_from_broker,
@@ -328,6 +358,7 @@ class DailyOrchestrator:
             "send_alerts": self._task_send_alerts,
 
             # Evening tasks
+            "refresh_eod_data": self._task_refresh_eod_data,
             "cleanup_logs": self._task_cleanup_logs,
             "backup_databases": self._task_backup_databases,
 
@@ -591,6 +622,169 @@ class DailyOrchestrator:
             return True
         except Exception as e:
             logger.error(f"Data refresh failed: {e}")
+            return False
+
+    def _task_refresh_premarket_data(self) -> bool:
+        """Fetch fresh daily data from Alpaca before market open.
+
+        This ensures strategies have yesterday's closing prices and any
+        pre-market moves before generating signals.
+        """
+        logger.info("Fetching fresh pre-market data from Alpaca...")
+        try:
+            from data.fetchers.daily_bars import DailyBarsFetcher
+            from data.fetchers.vix import VIXFetcher
+
+            start = time.time()
+            fetcher = DailyBarsFetcher()
+
+            # Get symbols we need to refresh - prioritize open positions + strategy universe
+            symbols_to_refresh = set()
+
+            # 1. Add symbols from open positions (critical)
+            try:
+                open_positions = self.execution_tracker.db.get_open_positions()
+                for pos in open_positions:
+                    symbols_to_refresh.add(pos.get('symbol', pos.get('ticker', '')))
+                logger.info(f"Added {len(open_positions)} symbols from open positions")
+            except Exception as e:
+                logger.warning(f"Could not get open positions: {e}")
+
+            # 2. Add core ETFs and major indices
+            core_symbols = ['SPY', 'QQQ', 'IWM', 'DIA', 'VIX', 'TLT', 'GLD', 'XLF', 'XLE', 'XLK']
+            symbols_to_refresh.update(core_symbols)
+
+            # 3. Add random sample of universe for broader coverage (limit for Pi memory)
+            import random
+            all_symbols = self.data_manager.get_available_symbols()
+            sample_size = min(100, len(all_symbols))  # Max 100 additional symbols
+            if all_symbols:
+                random.seed(int(datetime.now().strftime('%Y%m%d')))  # Consistent daily sample
+                sample = random.sample(all_symbols, sample_size)
+                symbols_to_refresh.update(sample)
+
+            symbols_list = list(symbols_to_refresh)
+            logger.info(f"Refreshing {len(symbols_list)} symbols for pre-market")
+
+            # Fetch fresh data
+            success_count = 0
+            fail_count = 0
+            for i, symbol in enumerate(symbols_list):
+                try:
+                    df = fetcher.fetch_symbol(symbol, force=True)  # Force fresh fetch
+                    if df is not None and not df.empty:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    logger.debug(f"Failed to refresh {symbol}: {e}")
+
+                # Progress logging every 50 symbols
+                if (i + 1) % 50 == 0:
+                    logger.info(f"Pre-market refresh progress: {i + 1}/{len(symbols_list)}")
+
+            # Also refresh VIX
+            try:
+                vix_fetcher = VIXFetcher()
+                vix_df = vix_fetcher.fetch_from_yahoo(days=30)
+                if vix_df is not None and not vix_df.empty:
+                    current_vix = vix_fetcher.get_current_vix()
+                    logger.info(f"VIX refreshed: current={current_vix:.2f}")
+            except Exception as e:
+                logger.warning(f"VIX refresh failed: {e}")
+
+            elapsed = time.time() - start
+            logger.info(f"Pre-market data refresh complete: {success_count} success, {fail_count} failed in {elapsed:.1f}s")
+
+            return success_count > 0
+
+        except Exception as e:
+            logger.error(f"Pre-market data refresh failed: {e}")
+            return False
+
+    def _task_refresh_eod_data(self) -> bool:
+        """Fetch end-of-day data for the full universe after market close.
+
+        This captures the complete day's trading data so overnight research
+        and next day's pre-market scan have fresh EOD prices.
+        """
+        logger.info("Fetching EOD data for full universe...")
+        try:
+            from data.fetchers.daily_bars import DailyBarsFetcher
+            from data.fetchers.vix import VIXFetcher
+
+            start = time.time()
+            fetcher = DailyBarsFetcher()
+
+            # Get all available symbols for full refresh
+            all_symbols = fetcher.get_available_symbols()
+            if not all_symbols:
+                # Fallback to cached symbols
+                all_symbols = self.data_manager.get_available_symbols()
+
+            logger.info(f"EOD refresh starting for {len(all_symbols)} symbols")
+
+            success_count = 0
+            fail_count = 0
+
+            for i, symbol in enumerate(all_symbols):
+                try:
+                    df = fetcher.fetch_symbol(symbol, force=True)
+                    if df is not None and not df.empty:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    logger.debug(f"Failed to refresh {symbol}: {e}")
+
+                # Progress logging every 100 symbols
+                if (i + 1) % 100 == 0:
+                    logger.info(f"EOD refresh progress: {i + 1}/{len(all_symbols)} ({success_count} success)")
+
+            # Refresh VIX data
+            try:
+                vix_fetcher = VIXFetcher()
+                vix_df = vix_fetcher.fetch_from_yahoo(days=365)
+                if vix_df is not None and not vix_df.empty:
+                    current_vix = vix_fetcher.get_current_vix()
+                    logger.info(f"VIX EOD refresh: {len(vix_df)} rows, current={current_vix:.2f}")
+            except Exception as e:
+                logger.warning(f"VIX EOD refresh failed: {e}")
+
+            elapsed = time.time() - start
+            logger.info(f"EOD data refresh complete: {success_count}/{len(all_symbols)} symbols in {elapsed:.1f}s")
+
+            # Log to performance database
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(DATABASES["performance"]))
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS data_refresh_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        refresh_type TEXT,
+                        total_symbols INTEGER,
+                        success INTEGER,
+                        failed INTEGER,
+                        duration_sec REAL
+                    )
+                """)
+                cursor.execute("""
+                    INSERT INTO data_refresh_log (timestamp, refresh_type, total_symbols, success, failed, duration_sec)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (datetime.now().isoformat(), 'eod', len(all_symbols), success_count, fail_count, elapsed))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Failed to log EOD refresh: {e}")
+
+            return success_count > len(all_symbols) * 0.5  # Success if >50% fetched
+
+        except Exception as e:
+            logger.error(f"EOD data refresh failed: {e}")
             return False
 
     def _task_system_check(self) -> bool:
@@ -1183,13 +1377,21 @@ class DailyOrchestrator:
         """Run nightly research engine."""
         logger.info("Starting nightly research...")
 
-        # Check if already run today
+        # Check if already run today (success)
         last_run = self.state.last_task_run.get("run_nightly_research")
         if last_run:
             hours_since = (datetime.now(self.tz) - last_run).total_seconds() / 3600
             if hours_since < 20:  # Don't run more than once per day
                 logger.info(f"Nightly research already ran {hours_since:.1f} hours ago")
                 return True
+
+        # Check if recently failed - use 1 hour cooldown to prevent retry storm
+        last_attempt = self.state.last_task_run.get("run_nightly_research_attempt")
+        if last_attempt:
+            hours_since_attempt = (datetime.now(self.tz) - last_attempt).total_seconds() / 3600
+            if hours_since_attempt < 1.0:  # 1 hour cooldown after failure
+                logger.info(f"Nightly research attempted {hours_since_attempt:.1f}h ago (failed), waiting for cooldown")
+                return True  # Return True to mark phase complete, retry after cooldown
 
         try:
             import subprocess
@@ -1198,6 +1400,35 @@ class DailyOrchestrator:
             if not research_script.exists():
                 logger.warning("Nightly research script not found")
                 return False
+
+            # Wait for memory to be available before launching research (prevents OOM)
+            # Throttle instead of skip - wait up to 5 minutes for memory to clear
+            for attempt in range(10):
+                mem_status = self._check_memory_status()
+                if mem_status['available_mb'] >= 1500:  # Need 1.5GB minimum for research
+                    break
+                logger.info(f"Waiting for memory ({mem_status['available_mb']:.0f}MB available, need 1500MB)...")
+                gc.collect()  # Force garbage collection
+                time.sleep(30)  # Wait 30 seconds between checks
+            else:
+                logger.warning("Memory still low after 5 min wait, proceeding anyway with swap")
+            # Always proceed - swap file will catch overflow
+
+            # Start research LED breathing and update display with full data
+            if self._hardware:
+                self._hardware.set_research_active(True)
+                # Push full display data first
+                self._update_hardware_display(MarketPhase.OVERNIGHT)
+                # Then update research-specific fields
+                self._hardware.update_display({
+                    'research_status': 'STARTING',
+                    'research_generation': 0,
+                    'research_max_gen': 100,
+                    'research_best_sharpe': 0,
+                })
+
+            # Track that we're attempting research (for retry cooldown)
+            self.state.last_task_run["run_nightly_research_attempt"] = datetime.now(self.tz)
 
             # Run as subprocess so it doesn't block
             logger.info("Launching nightly research subprocess...")
@@ -1208,25 +1439,64 @@ class DailyOrchestrator:
                 cwd=str(Path(__file__).parent)
             )
 
-            # Wait for completion with timeout
+            # Poll for completion with periodic display updates
             timeout_hours = 4
-            try:
-                stdout, _ = process.communicate(timeout=timeout_hours * 3600)
+            timeout_secs = timeout_hours * 3600
+            display_update_interval = 30  # Update display every 30 seconds
+            start_time = time.time()
+            last_display_update = 0
 
-                if process.returncode == 0:
-                    logger.info("Nightly research completed successfully")
-                    return True
-                else:
-                    logger.error(f"Nightly research failed with code {process.returncode}")
+            while True:
+                # Check if process finished
+                if process.poll() is not None:
+                    break
+
+                # Check for timeout
+                elapsed = time.time() - start_time
+                if elapsed >= timeout_secs:
+                    logger.warning(f"Nightly research timed out after {timeout_hours} hours")
+                    process.kill()
+                    if self._hardware:
+                        self._hardware.set_research_active(False)
                     return False
 
-            except subprocess.TimeoutExpired:
-                logger.warning(f"Nightly research timed out after {timeout_hours} hours")
-                process.kill()
+                # Check for shutdown
+                if self.shutdown_event.is_set():
+                    logger.info("Shutdown requested during research - terminating")
+                    process.terminate()
+                    if self._hardware:
+                        self._hardware.set_research_active(False)
+                    return False
+
+                # Update display periodically
+                if time.time() - last_display_update >= display_update_interval:
+                    self._update_hardware_display(MarketPhase.OVERNIGHT)
+                    # Also update research status
+                    if self._hardware:
+                        self._hardware.update_display({
+                            'research_status': 'EVOLVING',
+                        })
+                    last_display_update = time.time()
+
+                # Brief sleep before next poll
+                time.sleep(1)
+
+            # Process finished - check result
+            if process.returncode == 0:
+                logger.info("Nightly research completed successfully")
+                if self._hardware:
+                    self._hardware.set_research_complete()
+                return True
+            else:
+                logger.error(f"Nightly research failed with code {process.returncode}")
+                if self._hardware:
+                    self._hardware.set_research_active(False)
                 return False
 
         except Exception as e:
             logger.error(f"Nightly research failed: {e}")
+            if self._hardware:
+                self._hardware.set_research_active(False)
             return False
 
     # =========================================================================
@@ -1821,7 +2091,7 @@ class DailyOrchestrator:
                         self.alert_manager.send_alert(
                             title=f"Strategy Ready: {strategy_name}",
                             message=f"Shadow strategy '{strategy_name}' has met graduation criteria.",
-                            priority="high"
+                            level="warning"  # Use level not priority
                         )
 
                     processed += 1
@@ -2984,7 +3254,9 @@ class DailyOrchestrator:
 
             if result:
                 logger.info(f"Task {task_name} completed in {elapsed:.1f}s")
-                self.state.tasks_completed_today.append(task_name)
+                # Only add to daily list if not already present (avoid duplicates in report)
+                if task_name not in self.state.tasks_completed_today:
+                    self.state.tasks_completed_today.append(task_name)
                 self.state.last_task_run[task_name] = datetime.now(self.tz)
             else:
                 logger.warning(f"Task {task_name} returned False after {elapsed:.1f}s")
@@ -3016,10 +3288,21 @@ class DailyOrchestrator:
         """
         config = self.get_phase_config(phase)
         results = {}
+        phase_key = phase.value
+
+        # Initialize phase completion tracking if needed
+        if phase_key not in self.state.phase_tasks_completed:
+            self.state.phase_tasks_completed[phase_key] = set()
 
         logger.info(f"Running tasks for phase: {phase.value}")
 
         for task_name in config.tasks:
+            # Check if task already completed in this phase (once-per-phase tasks)
+            if task_name in self.state.phase_tasks_completed[phase_key]:
+                logger.debug(f"Skipping {task_name}, already completed this phase")
+                results[task_name] = True
+                continue
+
             # Check if task was already run recently (within check interval)
             last_run = self.state.last_task_run.get(task_name)
             if last_run:
@@ -3029,7 +3312,12 @@ class DailyOrchestrator:
                     results[task_name] = True
                     continue
 
-            results[task_name] = self.run_task(task_name)
+            result = self.run_task(task_name)
+            results[task_name] = result
+
+            # Mark task as completed for this phase if successful
+            if result:
+                self.state.phase_tasks_completed[phase_key].add(task_name)
 
         return results
 
@@ -3051,6 +3339,17 @@ class DailyOrchestrator:
         logger.info("=" * 60)
 
         self.state.is_running = True
+
+        # Run hardware startup sequence
+        if self._hardware:
+            logger.info("Calling hardware startup sequence...")
+            try:
+                self._hardware.startup()
+                logger.info("Hardware startup complete")
+            except Exception as e:
+                logger.error(f"Hardware startup failed: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
 
         try:
             while not self.shutdown_event.is_set():
@@ -3084,11 +3383,16 @@ class DailyOrchestrator:
                     self.state.current_phase = current_phase
                     self.state.phase_started_at = datetime.now(self.tz)
 
+                    # Update hardware LEDs for new phase
+                    if self._hardware:
+                        self._hardware.set_phase(current_phase.value)
+
                     # Reset daily stats at start of pre-market
                     if current_phase == MarketPhase.PRE_MARKET:
                         self.state.tasks_completed_today = []
                         self.state.errors_today = []
                         self.state.daily_stats = {}
+                        self.state.phase_tasks_completed = {}  # Reset per-phase tracking
 
                         # Reset weekend state for next weekend
                         if previous_phase == MarketPhase.WEEKEND:
@@ -3150,6 +3454,10 @@ class DailyOrchestrator:
                 total = len(results)
                 logger.info(f"Phase {current_phase.value}: {passed}/{total} tasks succeeded")
 
+                # Update hardware display with current data
+                if self._hardware:
+                    self._update_hardware_display(current_phase)
+
                 if once:
                     break
 
@@ -3167,8 +3475,155 @@ class DailyOrchestrator:
             logger.info("Orchestrator stopped")
 
     def _interruptible_sleep(self, seconds: float):
-        """Sleep that can be interrupted by shutdown event."""
-        self.shutdown_event.wait(seconds)
+        """Sleep that can be interrupted by shutdown event.
+
+        During market hours, updates display every 5 seconds for live SPY/VIX tracking.
+        """
+        display_interval = 5.0  # Update display every 5 seconds during market hours
+        elapsed = 0.0
+
+        while elapsed < seconds and not self.shutdown_event.is_set():
+            # Determine sleep chunk (5 seconds or remaining time)
+            sleep_chunk = min(display_interval, seconds - elapsed)
+            self.shutdown_event.wait(sleep_chunk)
+            elapsed += sleep_chunk
+
+            # Update display during market hours for live price tracking
+            if self._hardware and not self.shutdown_event.is_set():
+                current_phase = self.get_current_phase()
+                if current_phase in (MarketPhase.MARKET_OPEN, MarketPhase.INTRADAY_OPEN,
+                                     MarketPhase.INTRADAY_ACTIVE, MarketPhase.PRE_MARKET):
+                    self._update_hardware_display(current_phase)
+
+    def _update_hardware_display(self, current_phase: MarketPhase) -> None:
+        """Update LCD display with current system data."""
+        try:
+            # Get account info if available
+            portfolio_value = 0
+            daily_pnl = 0
+            daily_pnl_pct = 0
+            position_count = 0
+            cash_pct = 0
+            position_list = []
+
+            try:
+                account = self.broker.get_account()
+                if account:
+                    portfolio_value = float(account.portfolio_value)
+                    cash = float(account.cash) if account.cash else 0
+                    cash_pct = (cash / portfolio_value * 100) if portfolio_value > 0 else 0
+
+                positions = self.broker.get_positions()
+                position_count = len(positions) if positions else 0
+
+                # Calculate daily P&L from positions' unrealized P&L
+                if positions:
+                    daily_pnl = sum(p.unrealized_pnl for p in positions)
+                    if portfolio_value > 0:
+                        daily_pnl_pct = (daily_pnl / portfolio_value) * 100
+
+                    # Convert positions to list of dicts for display
+                    for p in positions:
+                        position_list.append({
+                            'symbol': p.symbol,
+                            'qty': int(p.qty),
+                            'unrealized_pnl': p.unrealized_pnl
+                        })
+            except Exception:
+                pass  # Use defaults if broker unavailable
+
+            # Get market data
+            spy_price = 0
+            vix = 0
+            try:
+                spy_data = self.broker.get_latest_price('SPY')
+                if spy_data is not None:
+                    spy_price = float(spy_data)
+
+                # Get VIX with caching (30-second TTL to reduce API calls)
+                now = time.time()
+                if now - self._vix_cache_time < self._vix_cache_ttl and self._vix_cache > 0:
+                    vix = self._vix_cache
+                else:
+                    # Fetch fresh VIX from yfinance (intraday if market open)
+                    try:
+                        import yfinance as yf
+                        vix_ticker = yf.Ticker('^VIX')
+                        # Try intraday first (1-minute data)
+                        vix_hist = vix_ticker.history(period='1d', interval='1m')
+                        if not vix_hist.empty:
+                            vix = float(vix_hist['Close'].iloc[-1])
+                        else:
+                            # Fallback to daily
+                            vix_hist = vix_ticker.history(period='5d')
+                            if not vix_hist.empty:
+                                vix = float(vix_hist['Close'].iloc[-1])
+                        # Update cache
+                        if vix > 0:
+                            self._vix_cache = vix
+                            self._vix_cache_time = now
+                    except Exception:
+                        # Fallback to cached data manager
+                        vix_data = self.data_manager.get_vix()
+                        if vix_data is not None:
+                            vix = float(vix_data)
+            except Exception:
+                pass
+
+            # Get system metrics
+            memory_pct = psutil.virtual_memory().percent
+            cpu_pct = psutil.cpu_percent(interval=None)
+
+            # Get ZRAM usage
+            zram_pct = 0
+            try:
+                swap = psutil.swap_memory()
+                if swap.total > 0:
+                    zram_pct = swap.percent
+            except Exception:
+                pass
+
+            # Calculate uptime
+            uptime_str = "--"
+            if self.state.phase_started_at:
+                uptime_secs = (datetime.now(self.tz) - self.state.phase_started_at).total_seconds()
+                if uptime_secs >= 86400:  # Days
+                    uptime_str = f"{int(uptime_secs // 86400)}d {int((uptime_secs % 86400) // 3600)}h"
+                elif uptime_secs >= 3600:  # Hours
+                    uptime_str = f"{int(uptime_secs // 3600)}h {int((uptime_secs % 3600) // 60)}m"
+                else:
+                    uptime_str = f"{int(uptime_secs // 60)}m"
+
+            # Calculate time to next phase
+            time_remaining = self.time_until_next_phase()
+            total_secs = int(time_remaining.total_seconds())
+            if total_secs >= 3600:
+                phase_time_str = f"{total_secs // 3600}h {(total_secs % 3600) // 60}m"
+            else:
+                phase_time_str = f"{total_secs // 60}m"
+
+            # Build display data
+            display_data = {
+                'phase': current_phase.value,
+                'portfolio_value': portfolio_value,
+                'daily_pnl': daily_pnl,
+                'daily_pnl_pct': daily_pnl_pct,
+                'position_count': position_count,
+                'positions': position_list,
+                'cash_pct': cash_pct,
+                'spy_price': spy_price,
+                'vix': vix,
+                'memory_pct': memory_pct,
+                'zram_pct': zram_pct,
+                'cpu_pct': cpu_pct,
+                'uptime': uptime_str,
+                'phase_time_remaining': phase_time_str,
+            }
+
+            self._hardware.update_display(display_data)
+
+        except Exception as e:
+            logger.debug(f"Display update failed: {e}")
 
     def _handle_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -3195,6 +3650,11 @@ class DailyOrchestrator:
         # Generate final report if we have data
         if self.state.daily_stats:
             self._task_generate_daily_report()
+
+        # Shutdown hardware
+        if self._hardware:
+            logger.info("Shutting down hardware...")
+            self._hardware.shutdown()
 
     # =========================================================================
     # Status and Monitoring

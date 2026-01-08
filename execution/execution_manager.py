@@ -77,8 +77,14 @@ class ExecutionManagerConfig:
     max_daily_trades: int = 50
 
     # Routing
+    # Paper trading mode: route to Alpaca paper even before graduation
+    # This allows testing order flow while shadow trading builds track record
     require_graduation_for_live: bool = True
-    graduation_override_strategies: List[str] = field(default_factory=list)
+    graduation_override_strategies: List[str] = field(default_factory=lambda: [
+        "mean_reversion",
+        "vol_managed_momentum",
+        "relative_volume_breakout",
+    ])
 
     # Conviction
     min_conviction_to_execute: float = 0.40

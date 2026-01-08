@@ -47,6 +47,11 @@ def _pool_initializer(shared_metadata: Dict[str, Any]):
     """
     global _worker_initialized, _worker_data, _worker_vix
 
+    # CRITICAL: Workers must ignore signals - only main process handles shutdown
+    # This prevents zombie workers when SIGTERM is sent to the process group
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     if _worker_initialized:
         return
 

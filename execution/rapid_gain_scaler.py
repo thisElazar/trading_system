@@ -383,18 +383,21 @@ class RapidGainScaler:
             cursor.execute("""
                 UPDATE positions
                 SET quantity = ?,
-                    scaled_at = ?,
-                    updated_at = ?
+                    scaled_at = ?
                 WHERE symbol = ? AND status = 'open'
-            """, (shares_remaining, now, now, symbol))
+            """, (shares_remaining, now, symbol))
 
+            rows_updated = cursor.rowcount
             conn.commit()
             conn.close()
 
-            logger.debug(f"Updated {symbol} position: {shares_remaining} shares remaining, marked as scaled")
+            if rows_updated > 0:
+                logger.info(f"Updated {symbol} position: {shares_remaining} shares remaining, marked as scaled")
+            else:
+                logger.error(f"CRITICAL: Failed to update {symbol} position in DB - no rows matched! Trim may repeat.")
 
         except Exception as e:
-            logger.warning(f"Failed to update position after trim for {symbol}: {e}")
+            logger.error(f"CRITICAL: Database update failed for {symbol} after trim: {e} - Trim may repeat!")
 
     def get_eligible_positions(self) -> List[Dict[str, Any]]:
         """
