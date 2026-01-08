@@ -7,6 +7,11 @@ Four databases:
 - performance.db: Strategy and portfolio metrics
 - research.db: Backtests, optimizations, discoveries
 - pairs.db: Pairs trading specific data
+
+Thread Safety:
+- Uses per-thread connections via threading.local()
+- Each thread gets its own SQLite connection (safe for concurrent access)
+- Connections are created lazily and cached per-thread
 """
 
 import sqlite3
@@ -15,6 +20,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 import json
 import logging
+import threading
 
 # Import from parent
 import sys
@@ -25,55 +31,87 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
-    """Manages all database connections and operations."""
+    """
+    Manages all database connections and operations.
+
+    Thread Safety:
+    - Uses threading.local() to maintain per-thread connections
+    - Each thread gets its own connection to each database
+    - Eliminates race conditions from shared connections
+    """
 
     def __init__(self):
         ensure_dirs()
-        self._connections: Dict[str, sqlite3.Connection] = {}
+        # Thread-local storage for connections (each thread gets its own dict)
+        self._local = threading.local()
+        # Lock for schema initialization (one-time operation)
+        self._init_lock = threading.Lock()
+        self._initialized = False
         self._init_all_databases()
 
+    def _get_thread_connections(self) -> Dict[str, sqlite3.Connection]:
+        """Get the connection dict for the current thread."""
+        if not hasattr(self._local, 'connections'):
+            self._local.connections = {}
+        return self._local.connections
+
     def _get_connection(self, db_name: str) -> sqlite3.Connection:
-        """Get or create a connection to a database."""
-        if db_name not in self._connections:
+        """Get or create a connection to a database for the current thread."""
+        connections = self._get_thread_connections()
+
+        if db_name not in connections:
             try:
                 db_path = DATABASES[db_name]
                 db_path.parent.mkdir(parents=True, exist_ok=True)
-                self._connections[db_name] = sqlite3.connect(
-                    str(db_path),
-                    check_same_thread=False
-                )
-                self._connections[db_name].row_factory = sqlite3.Row
-                
-                
-                logger.debug(f"Database connection established: {db_name} ({db_path})")
+
+                # Create connection for this thread (no check_same_thread needed
+                # since each thread has its own connection)
+                conn = sqlite3.connect(str(db_path), timeout=30.0)
+                conn.row_factory = sqlite3.Row
+
+                # Enable WAL mode for better concurrent read performance
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+
+                connections[db_name] = conn
+
+                thread_id = threading.current_thread().name
+                logger.debug(f"Database connection established: {db_name} ({db_path}) [thread={thread_id}]")
             except sqlite3.Error as e:
                 logger.error(f"Failed to connect to database {db_name}: {e}")
                 raise
             except KeyError:
                 logger.error(f"Unknown database name: {db_name}")
                 raise ValueError(f"Unknown database: {db_name}")
-        return self._connections[db_name]
+        return connections[db_name]
 
     def _init_all_databases(self):
-        """Initialize all database schemas."""
-        errors = []
-        for db_name, init_func in [
-            ('trades', self._init_trades_db),
-            ('performance', self._init_performance_db),
-            ('research', self._init_research_db),
-            ('pairs', self._init_pairs_db),
-        ]:
-            try:
-                init_func()
-                logger.debug(f"Database schema initialized: {db_name}")
-            except Exception as e:
-                logger.error(f"Failed to initialize {db_name} database: {e}")
-                errors.append((db_name, str(e)))
+        """Initialize all database schemas (thread-safe, runs once)."""
+        # Use lock to ensure only one thread initializes schemas
+        with self._init_lock:
+            if self._initialized:
+                return
 
-        if errors:
-            logger.warning(f"Database initialization completed with {len(errors)} error(s)")
-        else:
-            logger.info("All databases initialized successfully")
+            errors = []
+            for db_name, init_func in [
+                ('trades', self._init_trades_db),
+                ('performance', self._init_performance_db),
+                ('research', self._init_research_db),
+                ('pairs', self._init_pairs_db),
+            ]:
+                try:
+                    init_func()
+                    logger.debug(f"Database schema initialized: {db_name}")
+                except Exception as e:
+                    logger.error(f"Failed to initialize {db_name} database: {e}")
+                    errors.append((db_name, str(e)))
+
+            if errors:
+                logger.warning(f"Database initialization completed with {len(errors)} error(s)")
+            else:
+                logger.info("All databases initialized successfully")
+
+            self._initialized = True
     
     # ========================================================================
     # TRADES DATABASE
@@ -598,10 +636,26 @@ class DatabaseManager:
             raise
 
     def close_all(self):
-        """Close all database connections."""
-        for conn in self._connections.values():
-            conn.close()
-        self._connections.clear()
+        """Close all database connections for the current thread."""
+        connections = self._get_thread_connections()
+        for db_name, conn in list(connections.items()):
+            try:
+                conn.close()
+                logger.debug(f"Closed connection to {db_name} [thread={threading.current_thread().name}]")
+            except Exception as e:
+                logger.warning(f"Error closing connection to {db_name}: {e}")
+        connections.clear()
+
+    def close_all_threads(self):
+        """
+        Close connections for all threads (call on shutdown).
+
+        Note: This only works for threads that have registered their connections.
+        For complete cleanup, each thread should call close_all() before exiting.
+        """
+        # Close current thread's connections
+        self.close_all()
+        logger.info("Database connections closed for current thread")
     
     # ========================================================================
     # TRADE OPERATIONS

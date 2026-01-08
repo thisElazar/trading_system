@@ -377,7 +377,107 @@ class SignalDatabase:
         finally:
             if conn:
                 conn.close()
-    
+
+    def cleanup_orphaned_signals(self, max_age_hours: int = 24) -> Dict[str, int]:
+        """
+        Clean up orphaned signals on startup to prevent duplicate trades.
+
+        This should be called during system startup/recovery to handle:
+        - Pending signals from crashed sessions that might re-execute
+        - Submitted signals that never got confirmation
+        - Old signals beyond the max age window
+
+        Args:
+            max_age_hours: Signals older than this are marked expired
+
+        Returns:
+            Dict with counts: {'expired': N, 'cancelled': M, 'orphaned_positions': P}
+        """
+        conn = None
+        results = {'expired': 0, 'cancelled': 0, 'orphaned_positions': 0}
+
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+
+            now = datetime.now()
+            cutoff = (now - timedelta(hours=max_age_hours)).isoformat()
+
+            # 1. Expire all pending signals older than max_age_hours
+            cursor.execute("""
+                UPDATE signals
+                SET status = 'expired'
+                WHERE status = 'pending' AND created_at < ?
+            """, (cutoff,))
+            results['expired'] = cursor.rowcount
+
+            # 2. Cancel submitted signals older than max_age (broker likely rejected)
+            cursor.execute("""
+                UPDATE signals
+                SET status = 'cancelled'
+                WHERE status = 'submitted' AND created_at < ?
+            """, (cutoff,))
+            results['cancelled'] = cursor.rowcount
+
+            # 3. Find orphaned positions (open in DB but signal is expired/cancelled)
+            cursor.execute("""
+                SELECT p.id, p.symbol, p.strategy_name
+                FROM positions p
+                LEFT JOIN signals s ON p.signal_id = s.id
+                WHERE p.status = 'open'
+                  AND (s.status IN ('expired', 'cancelled') OR s.id IS NULL)
+            """)
+            orphaned = cursor.fetchall()
+            results['orphaned_positions'] = len(orphaned)
+
+            if orphaned:
+                for pos_id, symbol, strategy in orphaned:
+                    logger.warning(f"ORPHAN DETECTED: Position {symbol} ({strategy}) "
+                                  f"has expired/cancelled/missing signal - needs broker reconciliation")
+
+            conn.commit()
+
+            if any(results.values()):
+                logger.info(f"Orphan cleanup: {results['expired']} signals expired, "
+                           f"{results['cancelled']} cancelled, {results['orphaned_positions']} orphaned positions")
+
+            return results
+
+        except sqlite3.Error as e:
+            logger.error(f"Failed to cleanup orphaned signals: {e}")
+            return results
+        finally:
+            if conn:
+                conn.close()
+
+    def get_stale_pending_signals(self, max_age_hours: int = 24) -> List[StoredSignal]:
+        """
+        Get pending signals that are older than max_age_hours.
+        Used for recovery review before auto-expiring.
+        """
+        conn = None
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+
+            cutoff = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
+
+            cursor.execute("""
+                SELECT * FROM signals
+                WHERE status = 'pending' AND created_at < ?
+                ORDER BY created_at
+            """, (cutoff,))
+
+            rows = cursor.fetchall()
+            return [StoredSignal(**dict(row)) for row in rows]
+
+        except sqlite3.Error as e:
+            logger.error(f"Failed to get stale pending signals: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
     # Execution operations
     def record_execution(self, execution: Execution) -> int:
         """Record an execution."""

@@ -10,16 +10,22 @@ This module provides the ExecutionManager class which coordinates:
 - Audit trail logging
 
 All signals MUST flow through ExecutionManager before execution.
+
+Thread Safety:
+- Uses threading.Lock to prevent TOCTOU race conditions
+- Position checks and order submissions are atomic
+- Pending symbols tracked to prevent duplicate orders
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Set
 from enum import Enum
 import logging
 import sqlite3
 import json
 import os
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -251,12 +257,19 @@ class ExecutionManager:
         self.order_executor = None  # OrderExecutor
         self.signal_database = None  # SignalDatabase
         self.promotion_pipeline = None  # PromotionPipeline (graduation authority)
+        self.broker = None  # AlpacaConnector (persistent connection)
 
         # State tracking
         self._strategy_graduation_cache: Dict[str, bool] = {}
         self._daily_trade_count: int = 0
         self._daily_trade_reset_date: str = ""
         self._last_rebalance_times: Dict[str, datetime] = {}
+
+        # Thread safety for position operations (prevents TOCTOU race conditions)
+        self._position_lock = threading.Lock()
+        self._pending_symbols: Set[str] = set()  # Symbols with orders in flight
+        self._held_symbols_cache: Set[str] = set()  # Cached held symbols
+        self._held_symbols_cache_time: datetime = datetime.min
 
         # Initialize database
         self._init_decision_logging()
@@ -272,7 +285,8 @@ class ExecutionManager:
         execution_tracker=None,
         order_executor=None,
         signal_database=None,
-        promotion_pipeline=None
+        promotion_pipeline=None,
+        broker=None
     ):
         """Inject dependencies after construction."""
         if signal_scorer:
@@ -291,6 +305,8 @@ class ExecutionManager:
             self.signal_database = signal_database
         if promotion_pipeline:
             self.promotion_pipeline = promotion_pipeline
+        if broker:
+            self.broker = broker
 
         logger.info("ExecutionManager dependencies injected")
 
@@ -449,31 +465,102 @@ class ExecutionManager:
 
     def _already_holds_position(self, symbol: str) -> bool:
         """
-        Check if we already hold a position in this symbol.
+        Check if we already hold a position in this symbol (thread-safe).
 
-        Checks both Alpaca (actual broker positions) and internal DB
-        to prevent duplicate entries.
+        Uses locking and caching to prevent TOCTOU race conditions where
+        multiple signals could pass the check before any order is placed.
+
+        Checks:
+        1. Pending symbols (orders in flight)
+        2. Cached held symbols (refreshed every 5 seconds)
+        3. Internal DB as backup
         """
-        # Check Alpaca positions (source of truth for actual holdings)
-        try:
-            from execution.alpaca_connector import AlpacaConnector
-            broker = AlpacaConnector(paper=True)
-            alpaca_positions = broker.get_positions()
-            alpaca_symbols = {pos.symbol for pos in alpaca_positions}
-            if symbol in alpaca_symbols:
-                logger.debug(f"Found existing Alpaca position in {symbol}")
+        with self._position_lock:
+            # 1. Check pending symbols first (orders in flight)
+            if symbol in self._pending_symbols:
+                logger.debug(f"Found {symbol} in pending orders")
                 return True
-        except Exception as e:
-            logger.warning(f"Failed to check Alpaca positions: {e}")
 
-        # Also check internal DB as backup
-        internal_positions = self._get_current_positions()
-        internal_symbols = {pos.symbol for pos in internal_positions}
-        if symbol in internal_symbols:
-            logger.debug(f"Found existing DB position in {symbol}")
+            # 2. Check/refresh held symbols cache
+            cache_age = (datetime.now() - self._held_symbols_cache_time).total_seconds()
+            if cache_age > 5.0:  # Refresh cache every 5 seconds
+                self._refresh_held_symbols_cache()
+
+            if symbol in self._held_symbols_cache:
+                logger.debug(f"Found existing position in {symbol}")
+                return True
+
+            # 3. Check internal DB as backup
+            internal_positions = self._get_current_positions()
+            internal_symbols = {pos.symbol for pos in internal_positions}
+            if symbol in internal_symbols:
+                logger.debug(f"Found existing DB position in {symbol}")
+                return True
+
+            return False
+
+    def _refresh_held_symbols_cache(self) -> None:
+        """Refresh the cache of held symbols from broker (called within lock)."""
+        try:
+            broker = self._get_broker()
+            if broker:
+                positions = broker.get_positions()
+                self._held_symbols_cache = {pos.symbol for pos in positions}
+                self._held_symbols_cache_time = datetime.now()
+                logger.debug(f"Refreshed held symbols cache: {len(self._held_symbols_cache)} positions")
+            else:
+                logger.warning("No broker available for position check")
+        except Exception as e:
+            logger.warning(f"Failed to refresh held symbols cache: {e}")
+
+    def _get_broker(self):
+        """Get the broker connection, creating one if needed."""
+        if self.broker is None:
+            try:
+                from execution.alpaca_connector import AlpacaConnector
+                self.broker = AlpacaConnector(paper=True)
+                logger.info("Created persistent AlpacaConnector for ExecutionManager")
+            except Exception as e:
+                logger.error(f"Failed to create broker connection: {e}")
+                return None
+        return self.broker
+
+    def mark_symbol_pending(self, symbol: str) -> bool:
+        """
+        Mark a symbol as pending (order about to be placed).
+
+        Returns False if symbol is already held or pending.
+        This should be called right before placing an order.
+        """
+        with self._position_lock:
+            # Double-check not already held
+            if symbol in self._pending_symbols:
+                logger.warning(f"Cannot mark {symbol} pending - already pending")
+                return False
+
+            if symbol in self._held_symbols_cache:
+                logger.warning(f"Cannot mark {symbol} pending - already held")
+                return False
+
+            self._pending_symbols.add(symbol)
+            logger.debug(f"Marked {symbol} as pending")
             return True
 
-        return False
+    def unmark_symbol_pending(self, symbol: str, was_filled: bool = False) -> None:
+        """
+        Remove a symbol from pending status after order completes.
+
+        Args:
+            symbol: The symbol to unmark
+            was_filled: If True, add to held cache; if False, just remove from pending
+        """
+        with self._position_lock:
+            self._pending_symbols.discard(symbol)
+            if was_filled:
+                self._held_symbols_cache.add(symbol)
+                logger.debug(f"Order filled: {symbol} moved from pending to held")
+            else:
+                logger.debug(f"Order not filled: {symbol} removed from pending")
 
     def _score_signal(
         self,
@@ -1065,8 +1152,9 @@ class ExecutionManager:
 
         # Get actual positions from Alpaca (source of truth)
         try:
-            from execution.alpaca_connector import AlpacaConnector
-            broker = AlpacaConnector(paper=True)
+            broker = self._get_broker()
+            if not broker:
+                raise RuntimeError("Broker not available")
             positions = broker.get_positions()
         except Exception as e:
             logger.error(f"Failed to get Alpaca positions for reconciliation: {e}")

@@ -206,43 +206,131 @@ class AlpacaConnector:
     # -------------------------------------------------------------------------
     
     def submit_market_order(
-        self, 
-        symbol: str, 
-        qty: int, 
+        self,
+        symbol: str,
+        qty: int,
         side: str,  # 'buy' or 'sell'
-        time_in_force: str = 'day'
+        time_in_force: str = 'day',
+        wait_for_fill: bool = True,
+        fill_timeout_seconds: float = 30.0
     ) -> Optional[BrokerOrder]:
-        """Submit a market order."""
+        """
+        Submit a market order.
+
+        Args:
+            symbol: Stock symbol
+            qty: Number of shares
+            side: 'buy' or 'sell'
+            time_in_force: 'day' or 'gtc'
+            wait_for_fill: If True, wait for order to fill and return actual filled qty
+            fill_timeout_seconds: Max time to wait for fill
+
+        Returns:
+            BrokerOrder with actual filled_qty (may differ from requested qty)
+        """
         try:
             order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
             tif = TimeInForce.DAY if time_in_force == 'day' else TimeInForce.GTC
-            
+
             order_data = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=order_side,
                 time_in_force=tif
             )
-            
+
             order = self.trading_client.submit_order(order_data)
-            
-            logger.info(f"✓ Market order submitted: {side.upper()} {qty} {symbol}")
-            
+            order_id = str(order.id)
+
+            logger.info(f"✓ Market order submitted: {side.upper()} {qty} {symbol} (order_id={order_id})")
+
+            # Wait for fill if requested
+            if wait_for_fill:
+                order = self._wait_for_order_fill(order_id, fill_timeout_seconds)
+                if order is None:
+                    logger.error(f"Order {order_id} did not fill within {fill_timeout_seconds}s")
+                    return None
+
+            filled_qty = float(order.filled_qty) if order.filled_qty else 0
+            filled_price = float(order.filled_avg_price) if order.filled_avg_price else None
+
+            # Log partial fill warning
+            if filled_qty > 0 and filled_qty < qty:
+                logger.warning(
+                    f"PARTIAL FILL: {symbol} requested {qty} shares, only {int(filled_qty)} filled "
+                    f"({filled_qty/qty*100:.1f}%)"
+                )
+            elif filled_qty == 0:
+                logger.error(f"ORDER NOT FILLED: {symbol} {qty} shares - status={order.status.value}")
+
             return BrokerOrder(
-                id=str(order.id),
+                id=order_id,
                 symbol=order.symbol,
                 side=order.side.value,
-                qty=float(order.qty),
+                qty=float(order.qty),  # Requested qty
                 order_type='market',
                 status=order.status.value,
-                filled_qty=float(order.filled_qty) if order.filled_qty else 0,
-                filled_avg_price=float(order.filled_avg_price) if order.filled_avg_price else None,
+                filled_qty=filled_qty,  # ACTUAL filled qty
+                filled_avg_price=filled_price,
                 submitted_at=order.submitted_at,
                 filled_at=order.filled_at
             )
-            
+
         except Exception as e:
             logger.error(f"Order failed: {side} {qty} {symbol} - {e}")
+            return None
+
+    def _wait_for_order_fill(
+        self,
+        order_id: str,
+        timeout_seconds: float = 30.0,
+        poll_interval: float = 0.5
+    ):
+        """
+        Wait for an order to reach a terminal state (filled, cancelled, etc).
+
+        Args:
+            order_id: The order ID to track
+            timeout_seconds: Maximum time to wait
+            poll_interval: Time between status checks
+
+        Returns:
+            The final order object, or None if timeout
+        """
+        import time
+        start_time = time.time()
+
+        terminal_statuses = {
+            'filled', 'canceled', 'cancelled', 'expired', 'rejected',
+            'done_for_day', 'replaced'
+        }
+
+        while time.time() - start_time < timeout_seconds:
+            try:
+                order = self.trading_client.get_order_by_id(order_id)
+                status = order.status.value.lower()
+
+                if status in terminal_statuses:
+                    return order
+
+                # Also check if partially filled and no more fills coming
+                if status == 'partially_filled':
+                    # For market orders during market hours, partial fills
+                    # should complete quickly. If stuck, return what we have.
+                    if time.time() - start_time > 10.0:
+                        logger.warning(f"Order {order_id} stuck in partial fill, returning current state")
+                        return order
+
+                time.sleep(poll_interval)
+
+            except Exception as e:
+                logger.warning(f"Error checking order {order_id}: {e}")
+                time.sleep(poll_interval)
+
+        # Timeout - return last known state
+        try:
+            return self.trading_client.get_order_by_id(order_id)
+        except Exception:
             return None
     
     def submit_limit_order(

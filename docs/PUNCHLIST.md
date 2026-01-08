@@ -11,12 +11,15 @@
 | Category | P0 | P1 | P2 | Resolved | Total |
 |----------|----|----|----|---------:|------:|
 | Bugs | 1 | 2 | 1 | 4 | 8 |
-| Architecture | 1 | 3 | 2 | 0 | 6 |
-| Stability | 0 | 0 | 1 | 4 | 5 |
+| Architecture | 0 | 3 | 2 | 1 | 6 |
+| Stability | 0 | 0 | 1 | 9 | 10 |
 | Research/GA | 1 | 2 | 3 | 0 | 6 |
-| **Total** | **3** | **7** | **7** | **8** | **25** |
+| GP Research Gaps | 2 | 4 | 5 | 0 | 11 |
+| **Total** | **4** | **11** | **12** | **14** | **41** |
 
-**Resolved This Session:** BUG-001 (pairs/cash account), BUG-002 (timezone), BUG-005 (signals table), BUG-007 (test data cleanup), ARCH-003 (error logging), STAB-002 (backups), STAB-003 (log rotation), STAB-005 (version pinning)
+**Resolved Jan 4:** BUG-001 (pairs/cash account), BUG-002 (timezone), BUG-005 (signals table), BUG-007 (test data cleanup), ARCH-003 (error logging), STAB-002 (backups), STAB-003 (log rotation), STAB-005 (version pinning)
+
+**Resolved Jan 8:** ARCH-001 (startup recovery), STAB-006 (DB thread safety), STAB-007 (TOCTOU race), STAB-008 (partial fills), STAB-009 (screen cache), STAB-010 (VIX timeout)
 
 ---
 
@@ -196,17 +199,32 @@ DELETE FROM circuit_breaker_state WHERE reason LIKE '%test%'
 ### P0 - Critical
 
 #### ARCH-001: Single Point of Failure - Daily Orchestrator
-**Status:** Design concern
-**Impact:** If orchestrator crashes, entire system stops
+**Status:** RESOLVED (2026-01-08)
+**Impact:** Crash recovery now handled gracefully
 
-**Current State:**
-- Systemd auto-restarts on failure (10s delay)
-- But crash during order execution could leave positions orphaned
+**Solution Applied:**
+Added comprehensive startup recovery sequence to `daily_orchestrator.py`:
 
-**Next Steps:**
-1. Add position reconciliation on startup
-2. Store orchestrator state checkpoint before critical operations
-3. Consider watchdog process (not the aggressive one that caused issues)
+1. **Orphan Signal Cleanup** (`signal_tracker.py`)
+   - Expires stale pending signals (>24h)
+   - Cancels old submitted signals
+   - Identifies orphaned positions
+
+2. **Broker Credential Validation**
+   - Validates API connection before trading
+   - Logs account equity for confirmation
+
+3. **Position Reconciliation**
+   - Syncs local DB with broker positions
+   - Warns about positions closed externally
+
+4. **Market Holiday Check**
+   - Uses Alpaca calendar API to detect holidays
+   - Prevents unnecessary trading attempts
+
+**Files Modified:**
+- `daily_orchestrator.py` - Added `_startup_recovery()` method
+- `execution/signal_tracker.py` - Added `cleanup_orphaned_signals()` method
 
 ---
 
@@ -502,20 +520,370 @@ vol_managed_momentum gen 6: 8.88
 
 ---
 
+## GP RESEARCH GAPS (Literature Review - January 2026)
+
+*Based on synthesis of academic literature and practitioner insights on genetic programming for autonomous trading strategy discovery. See `GP_RESEARCH_SYNTHESIS.md` for full research document.*
+
+### P0 - Critical (Significant Research Gaps)
+
+#### GP-007: Paper Trading Duration Too Short
+**Status:** Configuration issue
+**Impact:** Cannot distinguish skill from luck with current thresholds
+
+**Research Basis:**
+> "For swing trading generating 2-4 trades weekly, this translates to **6 months minimum** for preliminary validation (120 trades) and **12-18 months** for confident deployment."
+> — Section 2: Promotion Pipelines
+
+**Current Config:**
+```python
+# promotion_pipeline.py PromotionCriteria
+min_paper_days: int = 14      # WAY too short
+min_paper_trades: int = 10    # Not statistically significant
+```
+
+**Required Fix:**
+```python
+min_paper_days: int = 90       # 3 months minimum
+min_paper_trades: int = 60     # Approaching statistical significance
+```
+
+**Files:** `research/discovery/promotion_pipeline.py`
+
+**Rationale:** With only 14 days and 10 trades, you have ~10% of the statistical power needed. The research explicitly states a minimum of 120 trades for preliminary validation.
+
+---
+
+#### GP-008: CPCV Validation Not Implemented
+**Status:** Major gap
+**Impact:** High risk of promoting overfit strategies
+
+**Research Basis:**
+> "**Combinatorial Purged Cross-Validation (CPCV)**, developed by López de Prado, divides data into S subsets forming symmetric train/test combinations. With S=16, this generates 12,780 unique backtests, producing a distribution of performance metrics rather than single-point estimates."
+> — Section 2: Promotion Pipelines
+>
+> "The **Probability of Backtest Overfitting** metric measures the probability that the in-sample optimal strategy underperforms the median out-of-sample. After testing only 7 strategy configurations, a researcher should expect to find a 2-year backtest with Sharpe >1.0 even when true out-of-sample Sharpe equals zero."
+> — Section 2: Promotion Pipelines
+
+**Current State:**
+- Walk-forward validation exists
+- Monte Carlo simulation exists
+- But CPCV and PBO calculation are NOT implemented
+
+**Required Implementation:**
+New module: `research/validation/cpcv.py`
+
+```python
+def cpcv_backtest(strategy, data, n_splits=16, purge_days=5, embargo_pct=0.05):
+    """
+    Combinatorial Purged Cross-Validation (López de Prado, 2018).
+
+    Args:
+        n_splits: Number of folds (S=16 recommended → 12,780 combinations)
+        purge_days: Days to remove between train/test to prevent leakage
+        embargo_pct: Fraction of test data to skip after each train fold
+
+    Returns:
+        Distribution of performance metrics for PBO calculation
+    """
+
+def calculate_pbo(oos_performances: List[float]) -> float:
+    """
+    Probability of Backtest Overfitting.
+
+    Returns probability that in-sample optimal underperforms OOS median.
+    Reject strategies with PBO > 5%.
+    """
+```
+
+**References:**
+- López de Prado, "Advances in Financial Machine Learning" (2018), Chapter 12
+- Bailey & López de Prado, "The Probability of Backtest Overfitting" (2014)
+- López de Prado, "The Three Types of Backtests" (July 2024)
+
+---
+
+### P1 - High (Important Improvements)
+
+#### GP-009: Add Calmar Ratio to Fitness
+**Status:** Missing from fitness function
+**Impact:** Not capturing swing trading risk appropriately
+
+**Research Basis:**
+> "The Calmar Ratio (CAGR/Maximum Drawdown) proves particularly relevant for swing trading where drawdown survival matters more than volatility smoothness."
+> — Section 1: Fitness Functions
+>
+> "**Practical recommendation:** Use a weighted composite: `0.4×Sharpe + 0.35×Calmar + 0.15×(normalized_trade_count) + 0.10×(1/complexity)`."
+> — Section 1: Fitness Functions
+
+**Current Fitness (multi_objective.py):**
+- Sortino ✅
+- Max Drawdown ✅
+- CVaR 95% ✅
+- Novelty ✅
+- Deflated Sharpe (informational) ✅
+
+**Missing:** Calmar Ratio (CAGR / |MaxDD|)
+
+**Fix:** Add to `multi_objective.py`:
+```python
+def calculate_calmar_ratio(result: BacktestResult) -> float:
+    """Calmar = CAGR / abs(MaxDD). Critical for swing trading."""
+    if result.max_drawdown_pct == 0:
+        return 0.0
+    cagr = result.annual_return if hasattr(result, 'annual_return') else 0.0
+    return cagr / abs(result.max_drawdown_pct)
+```
+
+---
+
+#### GP-010: HMM-Based Regime Detection
+**Status:** Using RandomForest instead of HMM
+**Impact:** Missing latent state modeling and transition probabilities
+
+**Research Basis:**
+> "For **regime detection**, Gaussian Hidden Markov Models with 2-3 states remain the most established approach."
+> — Section 3: Regime-Adaptive Evolution
+>
+> "The **Statistical Jump Model** (Princeton, 2024) represents an emerging alternative that enhances regime persistence through jump penalties at state transitions, reducing annual turnover to approximately 44%."
+> — Section 3: Regime-Adaptive Evolution
+
+**Current State (`ml_regime_detector.py`):**
+- Uses RandomForestClassifier / GradientBoostingClassifier
+- Classifies based on features, doesn't model state transitions
+- No persistence modeling
+
+**Recommended Addition:**
+```python
+from hmmlearn import GaussianHMM
+
+class HMMRegimeDetector:
+    """2-3 state Gaussian HMM for regime detection."""
+
+    def __init__(self, n_states=2):
+        self.model = GaussianHMM(
+            n_components=n_states,
+            covariance_type="diag",
+            n_iter=100
+        )
+
+    def detect_regime(self, features) -> Tuple[int, float]:
+        """Returns (regime_id, probability)."""
+        state_probs = self.model.predict_proba(features)
+        regime = np.argmax(state_probs[-1])
+        return regime, state_probs[-1, regime]
+```
+
+**References:**
+- Nystrup et al. (2016), "Regime-switching strategies in global equity portfolios"
+- Hamilton (1989), "A new approach to the economic analysis of nonstationary time series"
+
+---
+
+#### GP-011: Regime-Specialist Islands
+**Status:** Islands vary by mutation/depth, not by regime
+**Impact:** Not evolving regime-appropriate specialists
+
+**Research Basis:**
+> "Research strongly supports **evolving regime-specialist strategies** then combining them through ensemble switching, rather than forcing cross-regime robustness on individual strategies."
+> — Section 3: Regime-Adaptive Evolution
+>
+> "Island model genetic algorithms provide natural architecture for regime-specialist evolution. The recommended configuration maintains four islands: low-volatility specialists with trend-following bias, high-volatility specialists with mean-reversion/defensive bias, transition specialists focusing on regime-change detection, and a generalist pool for cross-regime robust strategies."
+> — Section 3: Regime-Adaptive Evolution
+>
+> "**Migration policy** should use low rates (2-5% every 50 generations) for within-regime islands to preserve specialization."
+> — Section 3: Regime-Adaptive Evolution
+
+**Current Config (`config.py`):**
+```python
+migration_rate: float = 0.15           # TOO HIGH (research: 2-5%)
+migration_interval: int = 5            # TOO FREQUENT (research: 50 gens)
+```
+
+**Recommended Config:**
+```python
+@dataclass
+class RegimeIslandConfig(IslandConfig):
+    num_islands: int = 4
+    migration_rate: float = 0.03       # 3% migration
+    migration_interval: int = 50       # Every 50 generations
+    island_roles: List[str] = field(default_factory=lambda: [
+        "low_vol_specialist",      # Trend-following bias
+        "high_vol_specialist",     # Mean-reversion/defensive bias
+        "transition_specialist",   # Regime-change detection
+        "generalist"               # Cross-regime robust
+    ])
+```
+
+**Files:** `research/discovery/config.py`, `research/discovery/island_model.py`
+
+---
+
+#### GP-012: Novelty Pulsation for Plateaus
+**Status:** Fixed novelty weight, no plateau-triggered exploration
+**Impact:** May get stuck in local optima
+
+**Research Basis:**
+> "For **novelty-fitness weighting**, adaptive temporal switching outperforms fixed ratios. 'Novelty Pulsation' (Shahrzad et al., 2019) systematically alternates between novelty selection and local optimization: when the system hits fitness plateaus, it shifts to novelty exploration before returning to objective optimization. This approach shows order-of-magnitude faster convergence than fixed weighting in deceptive landscapes."
+> — Section 5: Quality-Diversity
+
+**Current State:**
+- Fixed `novelty_weight: 0.3` in config
+- `DiversityMonitor` triggers injection but doesn't shift selection pressure
+
+**Recommended Addition to `evolution_engine.py`:**
+```python
+def _detect_plateau(self, window: int = 10, threshold: float = 0.05) -> bool:
+    """Detect if evolution has stagnated."""
+    if self.current_generation < window:
+        return False
+    recent_best = [self.generation_stats.get(g, {}).get('best_sortino', 0)
+                   for g in range(self.current_generation - window, self.current_generation)]
+    return (max(recent_best) - min(recent_best)) < threshold
+
+def get_effective_novelty_weight(self) -> float:
+    """Pulsate novelty weight based on plateau detection."""
+    if self._detect_plateau():
+        logger.info("Plateau detected - shifting to exploration (novelty=0.7)")
+        return 0.7  # High exploration
+    return self.config.novelty_weight  # Normal: 0.3
+```
+
+**Reference:** Shahrzad et al. (2019), "Novelty Pulsation: A Method for Maintaining Diversity in Multi-Objective Optimization"
+
+---
+
+### P2 - Medium (Nice to Have)
+
+#### GP-013: Self-Adaptive Mutation Rates
+**Status:** Island-level variation only
+**Impact:** Not fully exploiting adaptive potential
+
+**Research Basis:**
+> "The GA should respond to decay through **self-adaptive parameter control**. Encode mutation and crossover rates within chromosomes, allowing parameters to evolve alongside strategy genes. Research shows augmented self-adaptive approaches outperform static parameter tuning by **65-584%** in solution diversity."
+> — Section 6: Strategy Decay Detection
+
+**Current:** Mutation rates vary by island but not per-individual.
+
+**Recommended:** Add mutation_rate and crossover_rate fields to `StrategyGenome` and evolve them.
+
+---
+
+#### GP-014: Omega Ratio for Non-Normal Distributions
+**Status:** Not implemented
+**Impact:** Missing full distribution capture
+
+**Research Basis:**
+> "The Omega Ratio captures all moments of return distribution rather than just mean and variance, making it superior for the non-normal distributions typical in evolved strategies."
+> — Section 1: Fitness Functions
+
+**Implementation:**
+```python
+def calculate_omega_ratio(returns: pd.Series, threshold: float = 0.0) -> float:
+    """Omega = sum(returns > threshold) / sum(returns < threshold)"""
+    gains = returns[returns > threshold].sum()
+    losses = abs(returns[returns < threshold].sum())
+    return gains / losses if losses > 0 else float('inf')
+```
+
+---
+
+#### GP-015: 2-Day Lag Before Regime Changes
+**Status:** Unknown
+**Impact:** Potential whipsaws from noisy detection
+
+**Research Basis:**
+> "**Key implementation insight:** Include a 2-day lag before acting on regime changes to reduce whipsaws from noisy detection."
+> — Section 3: Regime-Adaptive Evolution
+
+**Check:** Verify if `ml_regime_detector.py` or ensemble switching has lag before propagating regime signals.
+
+---
+
+#### GP-016: Alpha Decay Detection System
+**Status:** Partial (only live Sharpe monitored)
+**Impact:** May not catch decay early enough
+
+**Research Basis:**
+> "Detection frameworks monitor **rolling Sharpe ratio** (36-month windows) for trend identification, **factor correlation** increases indicating crowding, and **slippage growth** suggesting capacity constraints."
+> — Section 6: Strategy Decay Detection
+>
+> "Track Pearson correlation between strategy returns and known crowded factors—values above 0.6 signal crowding risk requiring retirement consideration."
+> — Section 6: Strategy Decay Detection
+
+**Current:** `promotion_pipeline.py` checks `live_sharpe < 0.3` for retirement.
+
+**Needed:**
+1. Rolling 36-month Sharpe calculation (not just current)
+2. Correlation with momentum/value factors (>0.6 = crowding)
+3. Slippage trend monitoring
+
+---
+
+#### GP-017: Behavioral Descriptor Enhancement
+**Status:** 7D vector, missing some recommended dimensions
+**Impact:** May not capture full behavioral diversity
+
+**Research Basis:**
+> "The recommended behavioral descriptor vector: `[Sharpe, MaxDD, Recovery_Time, Trade_Frequency, Market_Beta, Profit_Factor, Volatility, Win_Rate]`. This captures both performance characteristics and strategy mechanics."
+> — Section 5: Quality-Diversity
+
+**Current BehaviorVector (7D):**
+- trade_frequency ✅
+- avg_hold_period ✅
+- long_short_ratio ✅
+- return_autocorr ✅
+- drawdown_depth ✅
+- benchmark_corr (≈ Market_Beta) ✅
+- signal_variance ✅
+
+**Missing:** Recovery_Time, Profit_Factor, explicit Sharpe
+
+**Note:** Current implementation is reasonable, this is a refinement.
+
+---
+
+### Quick Wins (Effort vs Impact)
+
+| ID | Fix | Effort | Impact | Files |
+|----|-----|--------|--------|-------|
+| GP-007 | Change 2 numbers | 5 min | HIGH | promotion_pipeline.py |
+| GP-009 | Add Calmar ratio | 30 min | MEDIUM | multi_objective.py |
+| GP-011 | Reduce migration rate | 5 min | MEDIUM | config.py |
+| GP-012 | Add plateau detection | 1 hour | MEDIUM | evolution_engine.py |
+| GP-015 | Add regime change lag | 30 min | LOW | ml_regime_detector.py |
+
+---
+
+### References
+
+1. López de Prado, M. (2018). *Advances in Financial Machine Learning*. Wiley.
+2. Bailey, D. H. & López de Prado, M. (2014). "The Probability of Backtest Overfitting." *Journal of Computational Finance*.
+3. López de Prado, M. (2024). "The Three Types of Backtests."
+4. Vivek et al. (2024). "Comparison of AGE-MOEA, NSGA-II, and MOEA/D for Trading." *Computational Economics*.
+5. Nystrup et al. (2016). "Regime-switching strategies in global equity portfolios."
+6. Mouret, J.-B. & Clune, J. (2015). "Illuminating search spaces by mapping elites."
+7. Shahrzad et al. (2019). "Novelty Pulsation: A Method for Maintaining Diversity."
+8. Menoita & Vanneschi (2025). "Vectorial GP for Trading" (strongly-typed VGP always among the best).
+9. Esfahanipour et al. (2011). "Conditional Sharpe Ratio using CVaR."
+10. arXiv:2501.03919 (Jan 2025). "Structured portfolios and predictor-level diversity."
+11. arXiv:2008.09471 (2020). "GA-MSSR: Combining Sharpe and Sterling ratios."
+
+---
+
 ## Quick Reference: Top 10 Priorities
 
 | # | ID | Description | Effort | Impact | Status |
 |---|-----|-------------|--------|--------|--------|
-| 1 | ~~BUG-001~~ | ~~Fix pairs trading~~ | - | - | RESOLVED (cash account constraint) |
-| 2 | ~~BUG-002~~ | ~~Fix ML regime datetime error~~ | - | - | RESOLVED |
+| 1 | **GP-007** | **Paper trading duration too short (14d → 90d)** | **5 min** | **HIGH** | **NEW** |
+| 2 | **GP-008** | **Implement CPCV validation + PBO threshold** | **High** | **HIGH** | **NEW** |
 | 3 | GA-003 | Validate GP discovery pipeline | Medium | High | VALIDATED (working) |
 | 4 | BUG-004 | Live validate gap-fill strategy | Low | High | Pending (monitor first week) |
-| 5 | ARCH-002 | Add real-time P&L to dashboard | Medium | Medium | |
-| 6 | GA-001 | Add GA stagnation detection/recovery | Medium | Medium | |
-| 7 | BUG-005 | Debug empty signals table | Low | Medium | |
-| 8 | ~~STAB-002~~ | ~~Implement database backups~~ | - | - | RESOLVED |
+| 5 | GP-009 | Add Calmar ratio to fitness | Low | Medium | NEW |
+| 6 | GP-011 | Reduce migration rate (15% → 3%) | 5 min | Medium | NEW |
+| 7 | GP-012 | Add novelty pulsation for plateaus | 1 hour | Medium | NEW |
+| 8 | ARCH-002 | Add real-time P&L to dashboard | Medium | Medium | |
 | 9 | BUG-003 | Re-evaluate sector rotation with GA params | Low | Low | |
-| 10 | ~~ARCH-003~~ | ~~Wire up error_log to database~~ | - | - | RESOLVED |
+| 10 | GP-010 | Add HMM regime detection option | Medium | Medium | NEW |
 
 ---
 
@@ -603,6 +971,13 @@ python3 -c "from execution.alpaca_connector import AlpacaConnector; c = AlpacaCo
 | 2026-01-08 | GA-001 IMPLEMENTED - Added hard reset mechanism for deeply stuck populations (10+ gens without improvement) |
 | 2026-01-08 | LED fix - Removed blanket pkill that caused cross-process GPIO conflicts |
 | 2026-01-08 | LCD fix - Research display now queries ga_history table, cleaner format |
+| 2026-01-08 | GP RESEARCH GAPS section added - 11 new items (GP-007 to GP-017) based on academic literature synthesis |
+| 2026-01-08 | **ARCH-001 RESOLVED** - Startup recovery sequence added (orphan cleanup, broker validation, position reconciliation, market holiday check) |
+| 2026-01-08 | **STAB-006 FIXED** - Database thread safety: SQLite now uses per-thread connections with WAL mode |
+| 2026-01-08 | **STAB-007 FIXED** - Position race condition (TOCTOU): Added locks and pending symbol tracking to ExecutionManager |
+| 2026-01-08 | **STAB-008 FIXED** - Partial fill handling: Orders now wait for fill with timeout, partial fills properly recorded |
+| 2026-01-08 | **STAB-009 FIXED** - Screen cache: Persistent JSON cache for instant LCD display on restart |
+| 2026-01-08 | **STAB-010 FIXED** - VIX fetch timeout: 10-second timeout prevents orchestrator hanging |
 
 ---
 

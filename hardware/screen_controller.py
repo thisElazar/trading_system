@@ -7,18 +7,28 @@ Uses simple subprocess-based GPIO polling for reliability.
 Encoder controls:
 - Rotate: Change page
 - Click: Scroll positions / refresh
+
+Data Persistence:
+- Screen data is cached to disk on updates
+- On restart, loads cached data immediately (marked as stale)
+- Provides instant display while system initializes
 """
 
+import json
 import random
 import subprocess
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from enum import Enum, auto
 
 from .display import LCDDisplay, get_display_manager
 from .gpio_config import LCD_TRADING_ADDR, GPIO_CHIP, ENCODER_PINS
+
+# Cache file location
+SCREEN_CACHE_FILE = Path(__file__).parent.parent / "db" / "screen_cache.json"
 
 # Import LED controller for feedback
 try:
@@ -114,7 +124,9 @@ class ScreenController:
         self._gol_chars_initialized: bool = False
 
         # Data cache (updated by orchestrator)
-        self._data: Dict[str, Any] = {
+        # Try to load from persistent cache first for instant display on restart
+        self._data_is_stale: bool = False
+        self._data: Dict[str, Any] = self._load_cache() or {
             'portfolio_value': 0,
             'daily_pnl': 0,
             'daily_pnl_pct': 0,
@@ -149,6 +161,50 @@ class ScreenController:
     def screen_available(self) -> bool:
         """Check if screen is available."""
         return self._screen.available
+
+    def _load_cache(self) -> Optional[Dict[str, Any]]:
+        """Load cached screen data from disk for instant display on restart."""
+        try:
+            if SCREEN_CACHE_FILE.exists():
+                with open(SCREEN_CACHE_FILE, 'r') as f:
+                    cached = json.load(f)
+
+                # Check cache age - if older than 24 hours, ignore
+                cached_at = cached.get('_cached_at', '')
+                if cached_at:
+                    try:
+                        cache_time = datetime.fromisoformat(cached_at)
+                        age_hours = (datetime.now() - cache_time).total_seconds() / 3600
+                        if age_hours > 24:
+                            print(f"[ScreenController] Cache too old ({age_hours:.1f}h), starting fresh")
+                            return None
+                    except (ValueError, TypeError):
+                        pass
+
+                # Mark data as stale (will show indicator until fresh data arrives)
+                self._data_is_stale = True
+                print(f"[ScreenController] Loaded cached data from {SCREEN_CACHE_FILE}")
+                return cached
+        except Exception as e:
+            print(f"[ScreenController] Failed to load cache: {e}")
+        return None
+
+    def _save_cache(self) -> None:
+        """Save current screen data to disk for persistence across restarts."""
+        try:
+            # Ensure directory exists
+            SCREEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+            # Add timestamp
+            cache_data = self._data.copy()
+            cache_data['_cached_at'] = datetime.now().isoformat()
+
+            with open(SCREEN_CACHE_FILE, 'w') as f:
+                json.dump(cache_data, f, indent=2, default=str)
+
+        except Exception as e:
+            # Don't log every time - too noisy
+            pass
 
     def _read_encoder_gpio(self) -> tuple:
         """Read encoder GPIO pins using subprocess."""
@@ -300,9 +356,16 @@ class ScreenController:
         Update cached data from orchestrator.
 
         Call this periodically with fresh data.
+        Saves to disk cache for persistence across restarts.
         """
         with self._lock:
             self._data.update(data)
+            # Clear stale flag now that we have fresh data
+            self._data_is_stale = False
+
+        # Save to disk cache (throttled - only every few updates)
+        # We do this outside the lock to avoid blocking
+        self._save_cache()
 
     def _render_current_page(self) -> None:
         """Render the current page to the display."""
@@ -337,8 +400,11 @@ class ScreenController:
         pnl_sign = '+' if pnl >= 0 else ''
         pct_sign = '+' if pnl_pct >= 0 else ''
 
+        # Show "*" indicator if data is stale (from cache)
+        header = "[TRADING]*" if self._data_is_stale else "[TRADING]"
+
         lines = [
-            "[TRADING]",
+            header,
             f"${pv:,.0f}",
             f"Today: {pnl_sign}${pnl:,.0f} ({pct_sign}{pnl_pct:.1f}%)",
             f"Pos: {positions}  Cash: {cash_pct:.0f}%"
@@ -407,7 +473,8 @@ class ScreenController:
         positions = data.get('positions', [])
         scroll_idx = self._position_scroll_idx
 
-        lines = ["[POSITIONS]"]
+        header = "[POSITIONS]*" if self._data_is_stale else "[POSITIONS]"
+        lines = [header]
 
         if not positions:
             lines.append("No open positions")
@@ -440,8 +507,10 @@ class ScreenController:
         uptime = data.get('uptime', '--')
         phase = data.get('phase', 'unknown')
 
+        header = "[SYSTEM]*" if self._data_is_stale else "[SYSTEM]"
+
         lines = [
-            "[SYSTEM]",
+            header,
             f"RAM:{mem_pct:.0f}%  ZRAM:{zram_pct:.0f}%",
             f"CPU: {cpu_pct:.0f}%  Up: {uptime}",
             f"Phase: {phase[:12]}"

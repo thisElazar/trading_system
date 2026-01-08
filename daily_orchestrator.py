@@ -48,7 +48,7 @@ from execution.signal_tracker import ExecutionTracker
 from execution.alpaca_connector import AlpacaConnector
 from execution.alerts import AlertManager
 from execution.circuit_breaker import CircuitBreakerManager, CircuitBreakerConfig
-from config import CIRCUIT_BREAKER, WEEKEND_CONFIG, ALPACA_API_KEY, ALPACA_SECRET_KEY, DATABASES
+from config import CIRCUIT_BREAKER, WEEKEND_CONFIG, ALPACA_API_KEY, ALPACA_SECRET_KEY, DATABASES, INTRADAY_EXIT_CONFIG
 
 # Intelligence modules
 try:
@@ -841,6 +841,7 @@ class DailyOrchestrator:
         """Run system health checks."""
         logger.info("Running system checks...")
         checks = {
+            "api_credentials": False,
             "data_manager": False,
             "broker_connection": False,
             "database": False,
@@ -848,6 +849,15 @@ class DailyOrchestrator:
         }
 
         try:
+            # Check API credentials are configured
+            if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+                if len(ALPACA_API_KEY) > 10 and len(ALPACA_SECRET_KEY) > 10:
+                    checks["api_credentials"] = True
+                else:
+                    logger.error("API credentials appear invalid (too short)")
+            else:
+                logger.error("ALPACA_API_KEY or ALPACA_SECRET_KEY not configured!")
+
             # Check data manager
             if self.data_manager.cache:
                 checks["data_manager"] = True
@@ -855,12 +865,16 @@ class DailyOrchestrator:
                 syms = self.data_manager.get_available_symbols()[:10]; self.data_manager.load_all(symbols=syms)  # Only 10 for check
                 checks["data_manager"] = len(self.data_manager.cache) > 0
 
-            # Check broker connection
+            # Check broker connection (validates credentials actually work)
             try:
                 account = self.broker.get_account()
-                checks["broker_connection"] = account is not None
+                if account is not None:
+                    checks["broker_connection"] = True
+                    logger.info(f"Broker account verified: ${float(account.equity):,.2f} equity")
+                else:
+                    logger.error("Broker returned None account - check API credentials")
             except Exception as e:
-                logger.warning(f"Broker check failed: {e}")
+                logger.error(f"Broker check failed (likely bad credentials): {e}")
 
             # Check database
             try:
@@ -884,11 +898,174 @@ class DailyOrchestrator:
                 status_str = "OK" if status else "FAILED"
                 logger.info(f"  {check}: {status_str}")
 
-            return passed >= 3  # At least 3 of 4 must pass
+            # Broker connection is critical - fail if not working
+            if not checks["broker_connection"]:
+                logger.error("CRITICAL: Broker connection failed - trading disabled until resolved")
+                return False
+
+            return passed >= 4  # At least 4 of 5 must pass
 
         except Exception as e:
             logger.error(f"System check error: {e}")
             return False
+
+    def _startup_recovery(self) -> bool:
+        """
+        Run startup recovery sequence to ensure clean state after restart/crash.
+
+        This handles:
+        1. Expire/cancel orphaned signals that could cause duplicate trades
+        2. Validate broker positions match local database
+        3. Log any discrepancies for manual review
+
+        Returns:
+            True if recovery completed successfully
+        """
+        logger.info("=" * 60)
+        logger.info("STARTUP RECOVERY SEQUENCE")
+        logger.info("=" * 60)
+
+        recovery_success = True
+
+        try:
+            # 1. Clean up orphaned signals (prevents duplicate trades)
+            logger.info("Step 1: Cleaning up orphaned signals...")
+            try:
+                signal_db = self.execution_tracker.db
+                cleanup_results = signal_db.cleanup_orphaned_signals(max_age_hours=24)
+
+                if cleanup_results['expired'] > 0:
+                    logger.warning(f"Expired {cleanup_results['expired']} stale pending signals")
+                if cleanup_results['cancelled'] > 0:
+                    logger.warning(f"Cancelled {cleanup_results['cancelled']} stale submitted signals")
+                if cleanup_results['orphaned_positions'] > 0:
+                    logger.error(f"ATTENTION: Found {cleanup_results['orphaned_positions']} orphaned positions - need broker sync")
+                    recovery_success = False
+            except Exception as e:
+                logger.error(f"Signal cleanup failed: {e}")
+                recovery_success = False
+
+            # 2. Validate API credentials before anything else
+            logger.info("Step 2: Validating broker credentials...")
+            try:
+                if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+                    logger.error("CRITICAL: API credentials not configured!")
+                    recovery_success = False
+                else:
+                    account = self.broker.get_account()
+                    if account:
+                        logger.info(f"Broker connection OK - Account equity: ${float(account.equity):,.2f}")
+                    else:
+                        logger.error("CRITICAL: Broker returned no account data")
+                        recovery_success = False
+            except Exception as e:
+                logger.error(f"CRITICAL: Broker validation failed: {e}")
+                recovery_success = False
+
+            # 3. Compare local positions vs broker positions
+            logger.info("Step 3: Reconciling positions with broker...")
+            try:
+                local_positions = self.execution_tracker.db.get_open_positions()
+                broker_positions = self.broker.get_positions()
+
+                local_symbols = {p.symbol for p in local_positions}
+                broker_symbols = {p.symbol for p in broker_positions}
+
+                # Find discrepancies
+                in_local_not_broker = local_symbols - broker_symbols
+                in_broker_not_local = broker_symbols - local_symbols
+
+                if in_local_not_broker:
+                    logger.warning(f"Positions in DB but not broker: {in_local_not_broker}")
+                    logger.warning("These may have been closed externally - will sync")
+
+                if in_broker_not_local:
+                    logger.warning(f"Positions in broker but not DB: {in_broker_not_local}")
+                    logger.warning("These may have been opened externally - will sync")
+
+                if not in_local_not_broker and not in_broker_not_local:
+                    logger.info(f"Position reconciliation OK - {len(broker_symbols)} positions match")
+
+            except Exception as e:
+                logger.error(f"Position reconciliation failed: {e}")
+                # Don't fail recovery for this - sync task will handle it
+
+            # 4. Check for market holiday
+            logger.info("Step 4: Checking market calendar...")
+            try:
+                is_holiday = self._is_market_holiday()
+                if is_holiday:
+                    logger.warning("TODAY IS A MARKET HOLIDAY - Trading will be skipped")
+                else:
+                    logger.info("Market is open today")
+            except Exception as e:
+                logger.warning(f"Could not check market calendar: {e}")
+
+            logger.info("=" * 60)
+            if recovery_success:
+                logger.info("STARTUP RECOVERY COMPLETE - System ready")
+            else:
+                logger.error("STARTUP RECOVERY COMPLETED WITH ERRORS - Review above")
+            logger.info("=" * 60)
+
+            return recovery_success
+
+        except Exception as e:
+            logger.error(f"Startup recovery failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    def _is_market_holiday(self) -> bool:
+        """
+        Check if today is a US market holiday.
+
+        Returns:
+            True if market is closed for holiday
+        """
+        try:
+            # Try to use Alpaca's calendar API
+            from datetime import date
+            from alpaca.trading.requests import GetCalendarRequest
+            today = date.today()
+
+            # Get calendar from broker's trading client
+            request = GetCalendarRequest(start=today, end=today)
+            calendar = self.broker.trading_client.get_calendar(request)
+
+            if not calendar:
+                # No trading day returned = holiday
+                logger.info(f"No market calendar entry for {today} - likely holiday")
+                return True
+
+            # Calendar returns trading days only
+            cal_date = calendar[0].date if hasattr(calendar[0], 'date') else str(calendar[0])
+            if str(cal_date) != str(today):
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.warning(f"Could not check market calendar via API: {e}")
+
+            # Fallback: hardcoded 2026 NYSE holidays
+            from datetime import date
+            today = date.today()
+
+            NYSE_HOLIDAYS_2026 = [
+                date(2026, 1, 1),   # New Year's Day
+                date(2026, 1, 19),  # MLK Day
+                date(2026, 2, 16),  # Presidents Day
+                date(2026, 4, 3),   # Good Friday
+                date(2026, 5, 25),  # Memorial Day
+                date(2026, 6, 19),  # Juneteenth
+                date(2026, 7, 3),   # Independence Day (observed)
+                date(2026, 9, 7),   # Labor Day
+                date(2026, 11, 26), # Thanksgiving
+                date(2026, 12, 25), # Christmas
+            ]
+
+            return today in NYSE_HOLIDAYS_2026
 
     def _task_sync_positions_from_broker(self) -> bool:
         """Sync local position database with broker's actual positions.
@@ -1033,7 +1210,7 @@ class DailyOrchestrator:
             return False
 
     def _task_monitor_positions(self) -> bool:
-        """Monitor positions for risk limits during market hours."""
+        """Monitor positions for risk limits and TP/SL exits during market hours."""
         try:
             positions = self.broker.get_positions()
             account = self.broker.get_account()
@@ -1045,13 +1222,22 @@ class DailyOrchestrator:
             # AccountInfo is a dataclass
             equity = account.equity
 
-            # Check position concentration
+            # Get exit config
+            exit_config = INTRADAY_EXIT_CONFIG
+            tp_pct = exit_config.get("take_profit_pct", 0.10)
+            sl_pct = exit_config.get("stop_loss_pct", 0.08)
+            exit_enabled = exit_config.get("enabled", True)
+            log_checks = exit_config.get("log_checks", False)
+
+            exits_executed = []
+
             for pos in positions:
                 # BrokerPosition is a dataclass
                 symbol = pos.symbol
                 market_value = pos.market_value
                 concentration = market_value / equity if equity > 0 else 0
 
+                # Check position concentration
                 if concentration > 0.20:  # 20% max per position
                     logger.warning(f"High concentration: {symbol} is {concentration:.1%} of portfolio")
                     self.alert_manager.send_alert(
@@ -1059,11 +1245,274 @@ class DailyOrchestrator:
                         level="warning"
                     )
 
+                # Check TP/SL exits
+                if exit_enabled:
+                    entry_price = float(pos.avg_entry_price)
+                    current_price = float(pos.current_price)
+                    qty = int(float(pos.qty))
+
+                    if entry_price <= 0 or qty <= 0:
+                        continue
+
+                    gain_pct = (current_price - entry_price) / entry_price
+
+                    if log_checks:
+                        logger.debug(f"{symbol}: entry=${entry_price:.2f}, current=${current_price:.2f}, gain={gain_pct:.2%}")
+
+                    # Check take-profit
+                    if gain_pct >= tp_pct:
+                        logger.info(f"TAKE PROFIT: {symbol} hit +{gain_pct:.2%} (threshold: +{tp_pct:.0%})")
+                        exit_result = self._execute_exit(
+                            symbol=symbol,
+                            qty=qty,
+                            entry_price=entry_price,
+                            current_price=current_price,
+                            reason="take_profit",
+                            gain_pct=gain_pct
+                        )
+                        if exit_result:
+                            exits_executed.append(exit_result)
+
+                    # Check stop-loss
+                    elif gain_pct <= -sl_pct:
+                        logger.info(f"STOP LOSS: {symbol} hit {gain_pct:.2%} (threshold: -{sl_pct:.0%})")
+                        exit_result = self._execute_exit(
+                            symbol=symbol,
+                            qty=qty,
+                            entry_price=entry_price,
+                            current_price=current_price,
+                            reason="stop_loss",
+                            gain_pct=gain_pct
+                        )
+                        if exit_result:
+                            exits_executed.append(exit_result)
+
+            # Send summary alert if any exits
+            if exits_executed:
+                tp_exits = [e for e in exits_executed if e.get("reason") == "take_profit"]
+                sl_exits = [e for e in exits_executed if e.get("reason") == "stop_loss"]
+                summary = f"Executed {len(exits_executed)} exits: {len(tp_exits)} TP, {len(sl_exits)} SL"
+                logger.info(summary)
+                self.alert_manager.send_alert(summary, level="info")
+
             return True
 
         except Exception as e:
             logger.error(f"Position monitoring failed: {e}")
+            logger.debug(traceback.format_exc())
             return False
+
+    def _execute_exit(
+        self,
+        symbol: str,
+        qty: int,
+        entry_price: float,
+        current_price: float,
+        reason: str,
+        gain_pct: float
+    ) -> Optional[Dict[str, Any]]:
+        """Execute an exit order for a position.
+
+        Args:
+            symbol: Stock symbol
+            qty: Number of shares to sell
+            entry_price: Original entry price
+            current_price: Current market price
+            reason: Exit reason ('take_profit' or 'stop_loss')
+            gain_pct: Percentage gain/loss
+
+        Returns:
+            Dict with exit details if successful, None if failed
+        """
+        try:
+            # Submit market sell order (waits for fill by default)
+            order = self.broker.submit_market_order(
+                symbol=symbol,
+                qty=qty,
+                side='sell',
+                time_in_force='day'
+            )
+
+            if order:
+                # Use ACTUAL filled quantity and price (handles partial fills)
+                filled_qty = int(order.filled_qty) if order.filled_qty else 0
+                filled_price = order.filled_avg_price if order.filled_avg_price else current_price
+
+                if filled_qty == 0:
+                    logger.error(f"Exit order for {symbol} not filled (status={order.status})")
+                    return None
+
+                # Warn about partial fills
+                if filled_qty < qty:
+                    logger.warning(
+                        f"PARTIAL EXIT: {symbol} requested {qty} shares, only {filled_qty} filled. "
+                        f"Remaining {qty - filled_qty} shares still open!"
+                    )
+
+                # Calculate P&L using actual filled quantity
+                pnl = filled_qty * (filled_price - entry_price)
+                actual_gain_pct = (filled_price - entry_price) / entry_price if entry_price > 0 else 0
+
+                logger.info(
+                    f"EXIT EXECUTED: {symbol} - Sold {filled_qty} shares @ ${filled_price:.2f} "
+                    f"({reason}, P&L: ${pnl:+.2f})"
+                )
+
+                # Record in database with actual filled values
+                self._record_exit_trade(
+                    symbol=symbol,
+                    qty=filled_qty,  # Use actual filled qty
+                    entry_price=entry_price,
+                    exit_price=filled_price,
+                    reason=reason,
+                    pnl=pnl,
+                    gain_pct=actual_gain_pct
+                )
+
+                return {
+                    "symbol": symbol,
+                    "qty": filled_qty,  # Return actual filled qty
+                    "requested_qty": qty,
+                    "entry_price": entry_price,
+                    "exit_price": filled_price,
+                    "reason": reason,
+                    "pnl": pnl,
+                    "gain_pct": actual_gain_pct,
+                    "partial_fill": filled_qty < qty
+                }
+            else:
+                logger.error(f"Exit order failed for {symbol}: no order returned")
+                return None
+
+        except Exception as e:
+            logger.error(f"Failed to execute exit for {symbol}: {e}")
+            logger.debug(traceback.format_exc())
+            return None
+
+    def _record_exit_trade(
+        self,
+        symbol: str,
+        qty: int,
+        entry_price: float,
+        exit_price: float,
+        reason: str,
+        pnl: float,
+        gain_pct: float
+    ) -> None:
+        """Record an exit trade in the database and update strategy stats."""
+        try:
+            import sqlite3
+            from config import DATABASES
+
+            conn = sqlite3.connect(str(DATABASES['trades']))
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+
+            # Look up original strategy from positions table
+            cursor.execute("""
+                SELECT strategy_name FROM positions
+                WHERE symbol = ? AND status = 'open'
+                LIMIT 1
+            """, (symbol,))
+            row = cursor.fetchone()
+            original_strategy = row[0] if row else 'unknown'
+
+            # Update positions table - mark as closed
+            cursor.execute("""
+                UPDATE positions
+                SET status = 'closed',
+                    closed_at = ?,
+                    exit_price = ?,
+                    exit_reason = ?,
+                    realized_pnl = ?
+                WHERE symbol = ? AND status = 'open'
+            """, (now, exit_price, reason, pnl, symbol))
+
+            # Record in trades table with ORIGINAL strategy (not 'intraday_exit')
+            cursor.execute("""
+                INSERT OR IGNORE INTO trades (
+                    timestamp, symbol, strategy, side, quantity,
+                    entry_price, exit_price, exit_timestamp,
+                    pnl, pnl_percent, status, exit_reason,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                now, symbol, original_strategy, 'SELL', qty,
+                entry_price, exit_price, now,
+                pnl, gain_pct * 100, 'CLOSED', reason,
+                now, now
+            ))
+
+            conn.commit()
+            conn.close()
+
+            # Update strategy stats in performance database
+            self._update_strategy_stats(original_strategy, pnl, gain_pct, is_win=(pnl > 0))
+
+            logger.info(f"Recorded exit for {symbol} ({original_strategy}): {reason}, P&L ${pnl:.2f}")
+
+        except Exception as e:
+            logger.warning(f"Failed to record exit trade for {symbol}: {e}")
+
+    def _update_strategy_stats(
+        self,
+        strategy: str,
+        pnl: float,
+        pnl_pct: float,
+        is_win: bool
+    ) -> None:
+        """Update strategy performance stats after a trade closes."""
+        try:
+            import sqlite3
+            from config import DATABASES
+
+            perf_db = DATABASES.get('performance')
+            if not perf_db:
+                return
+
+            conn = sqlite3.connect(str(perf_db))
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+
+            # Upsert strategy stats
+            cursor.execute("""
+                INSERT INTO strategy_stats (strategy, total_trades, winning_trades, losing_trades,
+                                           total_pnl, last_trade_date, updated_at)
+                VALUES (?, 1, ?, ?, ?, ?, ?)
+                ON CONFLICT(strategy) DO UPDATE SET
+                    total_trades = total_trades + 1,
+                    winning_trades = winning_trades + ?,
+                    losing_trades = losing_trades + ?,
+                    total_pnl = total_pnl + ?,
+                    avg_pnl = (total_pnl + ?) / (total_trades + 1),
+                    win_rate = CAST(winning_trades + ? AS REAL) / (total_trades + 1),
+                    best_trade = MAX(best_trade, ?),
+                    worst_trade = MIN(worst_trade, ?),
+                    last_trade_date = ?,
+                    updated_at = ?
+            """, (
+                strategy,
+                1 if is_win else 0,  # winning_trades for INSERT
+                0 if is_win else 1,  # losing_trades for INSERT
+                pnl,                 # total_pnl for INSERT
+                now, now,            # dates for INSERT
+                1 if is_win else 0,  # winning_trades increment
+                0 if is_win else 1,  # losing_trades increment
+                pnl,                 # total_pnl increment
+                pnl,                 # for avg calculation
+                1 if is_win else 0,  # for win_rate calculation
+                pnl if pnl > 0 else None,  # best_trade
+                pnl if pnl < 0 else None,  # worst_trade
+                now, now
+            ))
+
+            conn.commit()
+            conn.close()
+
+            logger.debug(f"Updated strategy_stats for {strategy}: pnl=${pnl:.2f}, win={is_win}")
+
+        except Exception as e:
+            logger.warning(f"Failed to update strategy stats for {strategy}: {e}")
 
     def _task_check_risk_limits(self) -> bool:
         """Check overall portfolio risk limits and circuit breakers."""
@@ -1201,48 +1650,218 @@ class DailyOrchestrator:
             return False
 
     def _task_generate_daily_report(self) -> bool:
-        """Generate end-of-day report."""
+        """Generate comprehensive end-of-day trading journal."""
         logger.info("Generating daily report...")
         try:
+            import sqlite3
+            from config import DATABASES
+
             now = datetime.now(self.tz)
+            today_str = now.strftime('%Y-%m-%d')
             report_file = LOG_DIR / f"daily_report_{now.strftime('%Y%m%d')}.txt"
 
+            # Fetch today's data from databases
+            trades_today = []
+            positions_opened = []
+            positions_closed = []
+            open_positions = []
+            strategy_performance = {}
+
+            try:
+                conn = sqlite3.connect(str(DATABASES['trades']))
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                # Get today's closed trades
+                cursor.execute("""
+                    SELECT symbol, strategy, side, quantity, entry_price, exit_price,
+                           pnl, pnl_percent, exit_reason, timestamp
+                    FROM trades
+                    WHERE date(timestamp) = date('now', 'localtime')
+                      AND status = 'CLOSED'
+                    ORDER BY timestamp DESC
+                """)
+                trades_today = [dict(row) for row in cursor.fetchall()]
+
+                # Get positions opened today
+                cursor.execute("""
+                    SELECT symbol, strategy_name, quantity, entry_price, take_profit, stop_loss, opened_at
+                    FROM positions
+                    WHERE date(opened_at) = date('now', 'localtime')
+                    ORDER BY opened_at DESC
+                """)
+                positions_opened = [dict(row) for row in cursor.fetchall()]
+
+                # Get positions closed today
+                cursor.execute("""
+                    SELECT symbol, strategy_name, quantity, entry_price, exit_price,
+                           realized_pnl, exit_reason, closed_at
+                    FROM positions
+                    WHERE date(closed_at) = date('now', 'localtime')
+                      AND status = 'closed'
+                    ORDER BY closed_at DESC
+                """)
+                positions_closed = [dict(row) for row in cursor.fetchall()]
+
+                # Get current open positions
+                cursor.execute("""
+                    SELECT symbol, strategy_name, quantity, entry_price, current_price,
+                           unrealized_pnl, take_profit, stop_loss
+                    FROM positions
+                    WHERE status = 'open'
+                    ORDER BY symbol
+                """)
+                open_positions = [dict(row) for row in cursor.fetchall()]
+
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error fetching trade data: {e}")
+
+            # Get strategy performance from performance db
+            try:
+                perf_conn = sqlite3.connect(str(DATABASES['performance']))
+                perf_conn.row_factory = sqlite3.Row
+                cursor = perf_conn.cursor()
+                cursor.execute("""
+                    SELECT strategy, total_trades, winning_trades, total_pnl, win_rate
+                    FROM strategy_stats
+                    WHERE total_trades > 0
+                    ORDER BY total_pnl DESC
+                """)
+                for row in cursor.fetchall():
+                    strategy_performance[row['strategy']] = dict(row)
+                perf_conn.close()
+            except Exception as e:
+                logger.warning(f"Error fetching strategy stats: {e}")
+
+            # Get account info
+            account = self.broker.get_account() if self.broker else None
+            broker_positions = self.broker.get_positions() if self.broker else []
+
+            # Calculate daily stats
+            total_realized = sum(t.get('pnl', 0) or 0 for t in trades_today)
+            winning_trades = [t for t in trades_today if (t.get('pnl') or 0) > 0]
+            losing_trades = [t for t in trades_today if (t.get('pnl') or 0) < 0]
+            best_trade = max(trades_today, key=lambda x: x.get('pnl') or 0) if trades_today else None
+            worst_trade = min(trades_today, key=lambda x: x.get('pnl') or 0) if trades_today else None
+
+            # Calculate unrealized P&L from broker positions
+            total_unrealized = sum(float(p.unrealized_pnl or 0) for p in broker_positions)
+
             with open(report_file, 'w') as f:
-                f.write(f"Daily Trading Report - {now.strftime('%Y-%m-%d')}\n")
-                f.write("=" * 60 + "\n\n")
+                f.write("=" * 70 + "\n")
+                f.write(f"  DAILY TRADING JOURNAL - {today_str}\n")
+                f.write("=" * 70 + "\n\n")
 
-                # Account summary
-                f.write("ACCOUNT SUMMARY\n")
-                f.write("-" * 40 + "\n")
-                for key, value in self.state.daily_stats.items():
-                    if isinstance(value, float):
-                        f.write(f"  {key}: ${value:.2f}\n" if 'pct' not in key else f"  {key}: {value:.2f}%\n")
-                    else:
-                        f.write(f"  {key}: {value}\n")
+                # ===== DAILY P&L SUMMARY =====
+                f.write("📊 DAILY P&L SUMMARY\n")
+                f.write("-" * 50 + "\n")
+                f.write(f"  Realized P&L:      ${total_realized:>+10.2f}\n")
+                f.write(f"  Unrealized P&L:    ${total_unrealized:>+10.2f}\n")
+                f.write(f"  Combined:          ${total_realized + total_unrealized:>+10.2f}\n")
+                f.write(f"\n")
+                f.write(f"  Trades Today:      {len(trades_today):>10}\n")
+                f.write(f"  Winners:           {len(winning_trades):>10}  (${sum(t.get('pnl', 0) or 0 for t in winning_trades):+.2f})\n")
+                f.write(f"  Losers:            {len(losing_trades):>10}  (${sum(t.get('pnl', 0) or 0 for t in losing_trades):+.2f})\n")
+                if trades_today:
+                    win_rate = len(winning_trades) / len(trades_today) * 100
+                    f.write(f"  Win Rate:          {win_rate:>9.1f}%\n")
                 f.write("\n")
 
-                # Tasks completed
-                f.write("TASKS COMPLETED\n")
-                f.write("-" * 40 + "\n")
-                for task in self.state.tasks_completed_today:
-                    f.write(f"  - {task}\n")
+                # ===== ACCOUNT STATUS =====
+                f.write("💰 ACCOUNT STATUS\n")
+                f.write("-" * 50 + "\n")
+                if account:
+                    f.write(f"  Equity:            ${account.equity:>10,.2f}\n")
+                    f.write(f"  Cash:              ${account.cash:>10,.2f}\n")
+                    f.write(f"  Buying Power:      ${account.buying_power:>10,.2f}\n")
+                f.write(f"  Open Positions:    {len(broker_positions):>10}\n")
                 f.write("\n")
 
-                # Errors
-                if self.state.errors_today:
-                    f.write("ERRORS\n")
-                    f.write("-" * 40 + "\n")
-                    for error in self.state.errors_today:
-                        f.write(f"  - {error.get('task')}: {error.get('error')}\n")
+                # ===== TODAY'S TRADES =====
+                f.write("📈 TODAY'S TRADES\n")
+                f.write("-" * 50 + "\n")
+                if trades_today:
+                    for t in trades_today:
+                        pnl = t.get('pnl') or 0
+                        pnl_pct = t.get('pnl_percent') or 0
+                        icon = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
+                        f.write(f"  {icon} {t['symbol']:6} | {t['strategy']:25} | "
+                               f"${pnl:>+8.2f} ({pnl_pct:>+5.1f}%) | {t.get('exit_reason', '-')}\n")
+                else:
+                    f.write("  No trades executed today\n")
+                f.write("\n")
+
+                # ===== BEST & WORST TRADES =====
+                if best_trade or worst_trade:
+                    f.write("🏆 BEST & WORST TRADES\n")
+                    f.write("-" * 50 + "\n")
+                    if best_trade and (best_trade.get('pnl') or 0) > 0:
+                        f.write(f"  Best:  {best_trade['symbol']:6} | ${best_trade.get('pnl', 0):>+.2f} | {best_trade.get('strategy', '-')}\n")
+                    if worst_trade and (worst_trade.get('pnl') or 0) < 0:
+                        f.write(f"  Worst: {worst_trade['symbol']:6} | ${worst_trade.get('pnl', 0):>+.2f} | {worst_trade.get('strategy', '-')}\n")
                     f.write("\n")
 
-                f.write(f"\nReport generated at {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
+                # ===== STRATEGY PERFORMANCE =====
+                f.write("📊 STRATEGY PERFORMANCE (All-Time)\n")
+                f.write("-" * 50 + "\n")
+                if strategy_performance:
+                    for strat, stats in strategy_performance.items():
+                        win_rate = (stats.get('win_rate') or 0) * 100
+                        f.write(f"  {strat:25} | {stats['winning_trades']}/{stats['total_trades']} wins | "
+                               f"${stats['total_pnl']:>+8.2f} | {win_rate:.0f}%\n")
+                else:
+                    f.write("  No strategy data available\n")
+                f.write("\n")
+
+                # ===== OPEN POSITIONS =====
+                f.write("📋 OPEN POSITIONS (Overnight Holdings)\n")
+                f.write("-" * 50 + "\n")
+                if broker_positions:
+                    for p in sorted(broker_positions, key=lambda x: float(x.unrealized_pnl or 0), reverse=True):
+                        pnl = float(p.unrealized_pnl or 0)
+                        icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+                        entry = float(p.avg_entry_price)
+                        current = float(p.current_price)
+                        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+                        f.write(f"  {icon} {p.symbol:6} | {int(float(p.qty)):>4} shares | "
+                               f"${entry:>7.2f} → ${current:>7.2f} | ${pnl:>+8.2f} ({pnl_pct:>+5.1f}%)\n")
+                else:
+                    f.write("  No open positions\n")
+                f.write("\n")
+
+                # ===== POSITIONS OPENED TODAY =====
+                if positions_opened:
+                    f.write("🆕 POSITIONS OPENED TODAY\n")
+                    f.write("-" * 50 + "\n")
+                    for p in positions_opened:
+                        f.write(f"  {p['symbol']:6} | {p.get('strategy_name', '-'):20} | "
+                               f"{p.get('quantity', 0)} @ ${p.get('entry_price', 0):.2f}\n")
+                    f.write("\n")
+
+                # ===== ERRORS & ISSUES =====
+                if self.state.errors_today:
+                    f.write("⚠️ ERRORS & ISSUES\n")
+                    f.write("-" * 50 + "\n")
+                    seen = set()
+                    for error in self.state.errors_today:
+                        err_key = f"{error.get('task')}:{error.get('error')}"
+                        if err_key not in seen:
+                            f.write(f"  • {error.get('task')}: {error.get('error')[:60]}\n")
+                            seen.add(err_key)
+                    f.write("\n")
+
+                # ===== FOOTER =====
+                f.write("=" * 70 + "\n")
+                f.write(f"  Report generated at {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
+                f.write("=" * 70 + "\n")
 
             logger.info(f"Daily report saved: {report_file}")
             return True
 
         except Exception as e:
             logger.error(f"Report generation failed: {e}")
+            logger.debug(traceback.format_exc())
             return False
 
     def _task_send_alerts(self) -> bool:
@@ -3487,6 +4106,22 @@ class DailyOrchestrator:
 
             return False
 
+    # Tasks that should only run ONCE per phase (initialization tasks)
+    # All other tasks run repeatedly based on check_interval_seconds
+    ONCE_PER_PHASE_TASKS = {
+        "run_scheduler",           # Start scheduler thread once
+        "start_intraday_stream",   # Start stream once at market open
+        "stop_intraday_stream",    # Stop stream once
+        "detect_gaps",             # Detect gaps once at open
+        "run_nightly_research",    # Run research once per night
+        "train_ml_regime_model",   # Train once per night
+        "load_live_strategies",    # Load strategies once at pre-market
+        "refresh_data",            # Refresh data once per phase
+        "refresh_premarket_data",  # Refresh premarket data once
+        "refresh_eod_data",        # Refresh EOD data once
+        "run_weekend_schedule",    # Weekend tasks dispatched once
+    }
+
     def run_phase_tasks(self, phase: MarketPhase) -> Dict[str, bool]:
         """
         Run all tasks for a specific phase.
@@ -3508,13 +4143,15 @@ class DailyOrchestrator:
         logger.info(f"Running tasks for phase: {phase.value}")
 
         for task_name in config.tasks:
-            # Check if task already completed in this phase (once-per-phase tasks)
-            if task_name in self.state.phase_tasks_completed[phase_key]:
-                logger.debug(f"Skipping {task_name}, already completed this phase")
+            # Check if this is a once-per-phase task that already ran
+            is_once_per_phase = task_name in self.ONCE_PER_PHASE_TASKS
+            if is_once_per_phase and task_name in self.state.phase_tasks_completed[phase_key]:
+                logger.debug(f"Skipping {task_name}, already completed this phase (once-per-phase)")
                 results[task_name] = True
                 continue
 
             # Check if task was already run recently (within check interval)
+            # This applies to recurring tasks like monitor_positions
             last_run = self.state.last_task_run.get(task_name)
             if last_run:
                 seconds_since = (datetime.now(self.tz) - last_run).total_seconds()
@@ -3526,8 +4163,8 @@ class DailyOrchestrator:
             result = self.run_task(task_name)
             results[task_name] = result
 
-            # Mark task as completed for this phase if successful
-            if result:
+            # Only mark once-per-phase tasks as completed
+            if result and is_once_per_phase:
                 self.state.phase_tasks_completed[phase_key].add(task_name)
 
         return results
@@ -3561,6 +4198,9 @@ class DailyOrchestrator:
                 logger.error(f"Hardware startup failed: {e}")
                 import traceback
                 logger.debug(traceback.format_exc())
+
+        # Run startup recovery sequence (cleanup orphans, validate state)
+        self._startup_recovery()
 
         try:
             while not self.shutdown_event.is_set():
@@ -3756,23 +4396,35 @@ class DailyOrchestrator:
                 if now - self._vix_cache_time < self._vix_cache_ttl and self._vix_cache > 0:
                     vix = self._vix_cache
                 else:
-                    # Fetch fresh VIX from yfinance (intraday if market open)
+                    # Fetch fresh VIX from yfinance with timeout (prevents hanging)
                     try:
-                        import yfinance as yf
-                        vix_ticker = yf.Ticker('^VIX')
-                        # Try intraday first (1-minute data)
-                        vix_hist = vix_ticker.history(period='1d', interval='1m')
-                        if not vix_hist.empty:
-                            vix = float(vix_hist['Close'].iloc[-1])
-                        else:
+                        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+                        def fetch_vix_from_yfinance():
+                            import yfinance as yf
+                            vix_ticker = yf.Ticker('^VIX')
+                            # Try intraday first (1-minute data)
+                            vix_hist = vix_ticker.history(period='1d', interval='1m')
+                            if not vix_hist.empty:
+                                return float(vix_hist['Close'].iloc[-1])
                             # Fallback to daily
                             vix_hist = vix_ticker.history(period='5d')
                             if not vix_hist.empty:
-                                vix = float(vix_hist['Close'].iloc[-1])
+                                return float(vix_hist['Close'].iloc[-1])
+                            return 0
+
+                        # Use thread pool with 10 second timeout
+                        with ThreadPoolExecutor(max_workers=1) as executor:
+                            future = executor.submit(fetch_vix_from_yfinance)
+                            vix = future.result(timeout=10.0)
+
                         # Update cache
                         if vix > 0:
                             self._vix_cache = vix
                             self._vix_cache_time = now
+                    except FuturesTimeout:
+                        logger.debug("VIX fetch timed out after 10s, using cached value")
+                        vix = self._vix_cache if self._vix_cache > 0 else 0
                     except Exception:
                         # Fallback to cached data manager
                         vix_data = self.data_manager.get_vix()
