@@ -85,10 +85,10 @@ class EvolutionConfig:
         """Validate configuration, return list of errors."""
         errors = []
 
-        # Check mutation probabilities sum to 1
+        # Check mutation probabilities sum to 1 (tight tolerance to catch config errors)
         mut_sum = (self.subtree_mutation_prob + self.point_mutation_prob +
                    self.hoist_mutation_prob + self.shrink_mutation_prob)
-        if abs(mut_sum - 1.0) > 0.01:
+        if abs(mut_sum - 1.0) > 0.001:
             errors.append(f"Mutation probabilities must sum to 1.0, got {mut_sum}")
 
         # Check constraints

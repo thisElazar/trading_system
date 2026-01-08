@@ -108,13 +108,29 @@ class SharedDataManager:
         # Create shared memory block (cleanup any leftover from previous run)
         block_name = self._generate_block_name(key)
         try:
-            # Try to unlink any existing block with same name
+            # Try to unlink any existing orphaned block with same name
             existing = shared_memory.SharedMemory(name=block_name)
             existing.close()
             existing.unlink()
+            logger.info(f"Cleaned up orphaned shared memory block: {block_name}")
         except FileNotFoundError:
             pass  # Block doesn't exist, which is expected
-        shm = shared_memory.SharedMemory(create=True, size=arr.nbytes, name=block_name)
+        except Exception as e:
+            # Permission error, resource busy, etc. - log and continue
+            logger.warning(f"Could not clean up shared memory block {block_name}: {e}")
+
+        try:
+            shm = shared_memory.SharedMemory(create=True, size=arr.nbytes, name=block_name)
+        except FileExistsError:
+            # Block still exists after cleanup attempt - force unlink and retry
+            logger.warning(f"Shared memory block {block_name} still exists, forcing cleanup")
+            try:
+                existing = shared_memory.SharedMemory(name=block_name)
+                existing.close()
+                existing.unlink()
+            except Exception:
+                pass
+            shm = shared_memory.SharedMemory(create=True, size=arr.nbytes, name=block_name)
 
         # Copy data to shared memory
         shared_arr = np.ndarray(arr.shape, dtype=np.float64, buffer=shm.buf)
@@ -150,16 +166,26 @@ class SharedDataManager:
 
     def cleanup(self):
         """Clean up shared memory blocks."""
+        cleaned = 0
+        failed = 0
         for key, shm in list(self._shared_blocks.items()):
             try:
                 shm.close()
                 if self._is_owner:
                     shm.unlink()
+                cleaned += 1
+            except FileNotFoundError:
+                # Already cleaned up (possibly by another process)
+                cleaned += 1
             except Exception as e:
                 logger.warning(f"Error cleaning up shared memory {key}: {e}")
+                failed += 1
         self._shared_blocks.clear()
         self._metadata.clear()
-        logger.info("Shared memory cleaned up")
+        if failed > 0:
+            logger.warning(f"Shared memory cleanup: {cleaned} cleaned, {failed} failed")
+        else:
+            logger.info(f"Shared memory cleaned up: {cleaned} blocks")
 
     def __del__(self):
         """Cleanup on deletion."""

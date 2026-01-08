@@ -688,7 +688,7 @@ def evaluate_tree(tree: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped,
         else:
             return func
     except Exception as e:
-        logger.debug(f"Tree evaluation failed: {e}")
+        logger.warning(f"Tree evaluation failed: {e} | tree={str(tree)[:100]}")
         return None
     finally:
         clear_eval_data()

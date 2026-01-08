@@ -885,35 +885,39 @@ class EvolutionEngine:
         if self._data is None:
             raise ValueError("No data loaded. Call load_data() first.")
 
-        # Main evolution loop
-        for gen in range(generations):
-            if self.shutdown_requested:
-                logger.warning("Shutdown requested, saving state...")
-                break
+        try:
+            # Main evolution loop
+            for gen in range(generations):
+                if self.shutdown_requested:
+                    logger.warning("Shutdown requested, saving state...")
+                    break
 
-            if end_time and datetime.now() >= end_time:
-                logger.info("Time limit reached")
-                break
+                if end_time and datetime.now() >= end_time:
+                    logger.info("Time limit reached")
+                    break
 
-            # Evolve and check for memory abort
-            should_continue = self.evolve_generation()
-            if not should_continue:
-                logger.warning("Evolution stopped due to memory constraints")
-                break
+                # Evolve and check for memory abort
+                should_continue = self.evolve_generation()
+                if not should_continue:
+                    logger.warning("Evolution stopped due to memory constraints")
+                    break
 
-            # Checkpoint periodically
-            if self.current_generation % self.config.checkpoint_frequency == 0:
-                self.save_checkpoint()
+                # Checkpoint periodically
+                if self.current_generation % self.config.checkpoint_frequency == 0:
+                    self.save_checkpoint()
 
-        # Final checkpoint
-        self.save_checkpoint()
+            # Final checkpoint
+            self.save_checkpoint()
 
-        # Promote promising strategies
-        self._promote_strategies()
+            # Promote promising strategies
+            self._promote_strategies()
 
-        logger.info(f"Evolution complete: {self.current_generation} generations, "
-                    f"{self.total_strategies_evaluated} strategies evaluated, "
-                    f"{self.strategies_promoted} promoted")
+            logger.info(f"Evolution complete: {self.current_generation} generations, "
+                        f"{self.total_strategies_evaluated} strategies evaluated, "
+                        f"{self.strategies_promoted} promoted")
+        finally:
+            # Always clean up parallel resources (shared memory, worker pool)
+            self.cleanup_parallel()
 
     def save_checkpoint(self):
         """Save current state to database."""

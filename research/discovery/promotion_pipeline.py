@@ -30,7 +30,7 @@ import sqlite3
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Callable, Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
@@ -193,8 +193,8 @@ class PromotionPipeline:
         self,
         criteria: PromotionCriteria = None,
         db_path: Optional[Path] = None,
-        on_promotion: Optional[callable] = None,
-        on_retirement: Optional[callable] = None
+        on_promotion: Optional[Callable[[str], None]] = None,
+        on_retirement: Optional[Callable[[str], None]] = None
     ):
         """
         Initialize promotion pipeline.
@@ -306,8 +306,8 @@ class PromotionPipeline:
 
     def set_callbacks(
         self,
-        on_promotion: Optional[callable] = None,
-        on_retirement: Optional[callable] = None
+        on_promotion: Optional[Callable[[str], None]] = None,
+        on_retirement: Optional[Callable[[str], None]] = None
     ) -> None:
         """
         Set callbacks for lifecycle events.
@@ -1027,9 +1027,11 @@ class PromotionPipeline:
             Dict with keys:
             - 'promoted': Number of strategies promoted to next stage
             - 'retired': Number of strategies retired
+            - 'failed': Number of strategies that failed processing
         """
         promoted_count = 0
         retired_count = 0
+        failed_count = 0
 
         # Stage 1: Check LIVE strategies for retirement
         live_strategies = self.get_strategies_by_status(StrategyStatus.LIVE)
@@ -1049,7 +1051,8 @@ class PromotionPipeline:
                     if result.success:
                         retired_count += 1
             except Exception as e:
-                pass  # Continue processing other strategies
+                logger.error(f"Failed to process LIVE strategy {strategy_id}: {e}", exc_info=True)
+                failed_count += 1
 
         # Stage 2: Check PAPER strategies for promotion to LIVE or retirement
         paper_strategies = self.get_strategies_by_status(StrategyStatus.PAPER)
@@ -1078,7 +1081,8 @@ class PromotionPipeline:
                     if result.success:
                         promoted_count += 1
             except Exception as e:
-                pass  # Continue processing other strategies
+                logger.error(f"Failed to process PAPER strategy {strategy_id}: {e}", exc_info=True)
+                failed_count += 1
 
         # Stage 3: Check VALIDATED strategies for promotion to PAPER
         validated_strategies = self.get_strategies_by_status(StrategyStatus.VALIDATED)
@@ -1090,7 +1094,8 @@ class PromotionPipeline:
                     if result.success:
                         promoted_count += 1
             except Exception as e:
-                pass  # Continue processing other strategies
+                logger.error(f"Failed to process VALIDATED strategy {strategy_id}: {e}", exc_info=True)
+                failed_count += 1
 
         # Stage 4: Check CANDIDATE strategies for promotion to VALIDATED
         # Note: This requires validation metrics to be already populated
@@ -1111,11 +1116,16 @@ class PromotionPipeline:
                         if result.success:
                             promoted_count += 1
             except Exception as e:
-                pass  # Continue processing other strategies
+                logger.error(f"Failed to process CANDIDATE strategy {strategy_id}: {e}", exc_info=True)
+                failed_count += 1
+
+        if failed_count > 0:
+            logger.warning(f"Promotion pipeline completed with {failed_count} failures")
 
         return {
             'promoted': promoted_count,
-            'retired': retired_count
+            'retired': retired_count,
+            'failed': failed_count
         }
 
 
