@@ -135,6 +135,17 @@ CIRCUIT_BREAKER = {
     "strategy_pause_hrs": 24,         # Hours to pause underperforming strategy
 }
 
+# Intraday Exit Monitoring
+# Automatically closes positions when they hit take-profit or stop-loss thresholds
+INTRADAY_EXIT_CONFIG = {
+    "enabled": True,
+    "take_profit_pct": 0.10,          # 10% gain triggers take-profit exit
+    "stop_loss_pct": 0.08,            # 8% loss triggers stop-loss exit
+    "check_interval_seconds": 30,      # How often to check (aligned with MARKET_OPEN phase)
+    "use_market_orders": True,         # Use market orders for exits (faster fills)
+    "log_checks": False,               # Log every check (noisy, for debugging)
+}
+
 # Price filters
 MIN_STOCK_PRICE = 10
 MAX_STOCK_PRICE = 500

@@ -161,38 +161,54 @@ def get_account_data() -> Dict[str, Any]:
 
 
 def get_positions_data() -> List[Dict[str, Any]]:
-    """Fetch current positions from broker."""
+    """Fetch current positions from broker with TP/SL from database."""
     try:
         broker = get_broker()
         positions = broker.get_positions()
 
-        # Get strategy info from local database
-        strategy_map = {}
+        # Get strategy, TP, and SL info from local database
+        position_info = {}
         try:
             trades_db = PROJECT_ROOT / "db" / "trades.db"
             if trades_db.exists():
                 conn = sqlite3.connect(trades_db)
                 cursor = conn.cursor()
-                cursor.execute("SELECT symbol, strategy_name FROM positions WHERE status='open'")
-                strategy_map = {row[0]: row[1] for row in cursor.fetchall()}
+                cursor.execute("""
+                    SELECT symbol, strategy_name, take_profit, stop_loss
+                    FROM positions WHERE status='open'
+                """)
+                for row in cursor.fetchall():
+                    position_info[row[0]] = {
+                        'strategy': row[1],
+                        'take_profit': row[2],
+                        'stop_loss': row[3]
+                    }
                 conn.close()
         except:
             pass
 
-        return [
-            {
+        result = []
+        for p in positions:
+            info = position_info.get(p.symbol, {})
+            entry = float(p.avg_entry_price)
+            current = float(p.current_price)
+            tp = info.get('take_profit')
+            sl = info.get('stop_loss')
+
+            result.append({
                 "symbol": p.symbol,
-                "strategy": strategy_map.get(p.symbol, "-"),
+                "strategy": info.get('strategy', '-'),
                 "qty": p.qty,
                 "side": p.side,
-                "entry_price": p.avg_entry_price,
-                "current_price": p.current_price,
+                "entry_price": entry,
+                "current_price": current,
+                "target": f"${tp:.2f}" if tp else "-",
+                "stop_loss": f"${sl:.2f}" if sl else "-",
                 "market_value": p.market_value,
                 "unrealized_pnl": p.unrealized_pnl,
                 "pnl_pct": p.unrealized_pnl_pct if p.unrealized_pnl_pct else 0,
-            }
-            for p in positions
-        ]
+            })
+        return result
     except Exception as e:
         logger.error(f"Error fetching positions: {e}")
     return []
@@ -487,12 +503,16 @@ def get_strategy_stats() -> List[Dict[str, Any]]:
         )
         conn.close()
 
-        # Format wins as "wins/total" for display
+        # Format wins as "wins/total" for display and calculate P&L %
         if not df.empty:
             df['wins_display'] = df.apply(
                 lambda r: f"{int(r['winning_trades'])}/{int(r['total_trades'])}"
                 if r['total_trades'] > 0 else "-", axis=1
             )
+            # Calculate P&L % relative to estimated capital per strategy (~$10k per strategy)
+            # This gives a rough idea of return on allocated capital
+            estimated_capital_per_strategy = 10000
+            df['pnl_pct'] = df['total_pnl'] / estimated_capital_per_strategy
 
         return df.to_dict('records') if not df.empty else []
     except Exception as e:
@@ -1059,44 +1079,8 @@ def get_best_params_comparison() -> List[Dict[str, Any]]:
 
 
 def get_trade_history(limit: int = 20) -> List[Dict[str, Any]]:
-    """Fetch recent trade history from Alpaca orders."""
-    try:
-        from alpaca.trading.requests import GetOrdersRequest
-        from alpaca.trading.enums import QueryOrderStatus
-
-        broker = get_broker()
-        if not broker:
-            return []
-
-        # Get recent orders from Alpaca (filled orders are actual trades)
-        orders = broker.trading_client.get_orders(
-            GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit)
-        )
-
-        results = []
-        for o in orders:
-            time_str = o.submitted_at.strftime('%m-%d %H:%M') if o.submitted_at else ""
-            side_str = o.side.value.upper() if hasattr(o.side, 'value') else str(o.side)
-            status_str = o.status.value if hasattr(o.status, 'value') else str(o.status)
-            fill_price = float(o.filled_avg_price) if o.filled_avg_price else 0
-
-            results.append({
-                "time": time_str,
-                "symbol": o.symbol,
-                "side": side_str,
-                "qty": float(o.filled_qty or o.qty),
-                "entry": fill_price,
-                "exit": "-",  # Exit shown when position closes
-                "pnl": 0,  # P&L calculated on close
-                "status": status_str,
-            })
-
-        return results
-
-    except Exception as e:
-        logger.error(f"Error fetching trade history from Alpaca: {e}")
-
-    # Fallback to database if Alpaca fails
+    """Fetch recent trade history from database (primary) with P&L data."""
+    # Use database as primary source - it has actual P&L and exit data
     try:
         db_path = PROJECT_ROOT / "db" / "trades.db"
         if not db_path.exists():
@@ -1118,19 +1102,68 @@ def get_trade_history(limit: int = 20) -> List[Dict[str, Any]]:
 
         results = []
         for _, row in df.iterrows():
+            # Format timestamp nicely
+            time_str = row['timestamp'][:16].replace('T', ' ') if row['timestamp'] else ""
+            exit_price = row['exit_price']
+            pnl_val = row['pnl']
+
             results.append({
-                "time": row['timestamp'][:16] if row['timestamp'] else "",
+                "time": time_str,
                 "symbol": row['symbol'],
+                "strategy": row['strategy'] if row['strategy'] else "-",
                 "side": row['side'],
                 "qty": row['quantity'],
-                "entry": row['entry_price'],
-                "exit": row['exit_price'] if row['exit_price'] else "-",
-                "pnl": row['pnl'] if row['pnl'] else 0,
+                "entry": f"${row['entry_price']:.2f}" if row['entry_price'] else "-",
+                "exit": f"${exit_price:.2f}" if exit_price else "-",
+                "pnl": f"${pnl_val:+.2f}" if pnl_val else "$0.00",
+                "pnl_pct": f"{row['pnl_percent']:+.1f}%" if row['pnl_percent'] else "-",
                 "status": row['status'],
+                "exit_reason": row['exit_reason'] if row['exit_reason'] else "-",
             })
         return results
+
     except Exception as e:
         logger.error(f"Error fetching trade history from DB: {e}")
+
+    # Fallback to Alpaca orders if database fails
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        broker = get_broker()
+        if not broker:
+            return []
+
+        orders = broker.trading_client.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit)
+        )
+
+        results = []
+        for o in orders:
+            time_str = o.submitted_at.strftime('%m-%d %H:%M') if o.submitted_at else ""
+            side_str = o.side.value.upper() if hasattr(o.side, 'value') else str(o.side)
+            status_str = o.status.value if hasattr(o.status, 'value') else str(o.status)
+            fill_price = float(o.filled_avg_price) if o.filled_avg_price else 0
+
+            results.append({
+                "time": time_str,
+                "symbol": o.symbol,
+                "strategy": "-",
+                "side": side_str,
+                "qty": float(o.filled_qty or o.qty),
+                "entry": f"${fill_price:.2f}" if fill_price else "-",
+                "exit": "-",
+                "pnl": "$0.00",
+                "pnl_pct": "-",
+                "status": status_str,
+                "exit_reason": "-",
+            })
+
+        return results
+
+    except Exception as e:
+        logger.error(f"Error fetching trade history from Alpaca: {e}")
+
     return []
 
 
@@ -2180,7 +2213,7 @@ def create_account_card():
 
 
 def create_positions_table():
-    """Create positions data table."""
+    """Create positions data table with TP/SL targets."""
     return dbc.Card([
         dbc.CardHeader(html.H5("Open Positions", className="mb-0")),
         dbc.CardBody([
@@ -2194,20 +2227,27 @@ def create_positions_table():
                      "format": {"specifier": ",.2f"}},
                     {"name": "Current", "id": "current_price", "type": "numeric",
                      "format": {"specifier": ",.2f"}},
-                    {"name": "Value", "id": "market_value", "type": "numeric",
-                     "format": {"specifier": ",.0f"}},
+                    {"name": "Target", "id": "target"},
+                    {"name": "Stop", "id": "stop_loss"},
                     {"name": "P&L", "id": "unrealized_pnl", "type": "numeric",
                      "format": {"specifier": "+,.2f"}},
                     {"name": "P&L %", "id": "pnl_pct", "type": "numeric",
-                     "format": {"specifier": "+.2f"}},
+                     "format": {"specifier": "+.1f"}},
                 ],
                 style_table={'overflowX': 'auto', 'maxHeight': '400px', 'overflowY': 'auto'},
                 style_cell={
                     'backgroundColor': '#303030',
                     'color': 'white',
                     'textAlign': 'right',
-                    'padding': '8px',
+                    'padding': '6px',
+                    'fontSize': '12px',
                 },
+                style_cell_conditional=[
+                    {'if': {'column_id': 'symbol'}, 'textAlign': 'left', 'fontWeight': 'bold'},
+                    {'if': {'column_id': 'strategy'}, 'textAlign': 'left'},
+                    {'if': {'column_id': 'target'}, 'color': '#00bc8c'},
+                    {'if': {'column_id': 'stop_loss'}, 'color': '#e74c3c'},
+                ],
                 style_header={
                     'backgroundColor': '#444',
                     'fontWeight': 'bold',
@@ -2216,14 +2256,23 @@ def create_positions_table():
                 style_data_conditional=[
                     {
                         'if': {'filter_query': '{unrealized_pnl} > 0'},
-                        'color': '#00bc8c',
+                        'backgroundColor': 'rgba(0, 188, 140, 0.15)',
                     },
                     {
                         'if': {'filter_query': '{unrealized_pnl} < 0'},
-                        'color': '#e74c3c',
+                        'backgroundColor': 'rgba(231, 76, 60, 0.15)',
+                    },
+                    {
+                        'if': {'filter_query': '{pnl_pct} > 5'},
+                        'color': '#00ff88',
+                        'fontWeight': 'bold',
+                    },
+                    {
+                        'if': {'filter_query': '{pnl_pct} < -5'},
+                        'color': '#ff6b6b',
+                        'fontWeight': 'bold',
                     },
                 ],
-                # Show all positions without pagination
                 page_size=50,
             )
         ])
@@ -2254,10 +2303,10 @@ def create_strategy_table():
                      "format": {"specifier": ".0%"}},
                     {"name": "P&L", "id": "total_pnl", "type": "numeric",
                      "format": {"specifier": "$,.2f"}},
+                    {"name": "P&L %", "id": "pnl_pct", "type": "numeric",
+                     "format": {"specifier": "+.1%"}},
                     {"name": "Avg P&L", "id": "avg_pnl", "type": "numeric",
                      "format": {"specifier": "$,.2f"}},
-                    {"name": "Sharpe", "id": "sharpe_ratio", "type": "numeric",
-                     "format": {"specifier": ".2f"}},
                     {"name": "Enabled", "id": "is_enabled"},
                 ],
                 style_table={'overflowX': 'auto'},
@@ -2318,6 +2367,24 @@ def create_strategy_table():
                             'column_id': 'win_rate'
                         },
                         'color': '#e74c3c',
+                    },
+                    # Green for positive P&L %
+                    {
+                        'if': {
+                            'filter_query': '{pnl_pct} > 0',
+                            'column_id': 'pnl_pct'
+                        },
+                        'color': '#00bc8c',
+                        'fontWeight': 'bold'
+                    },
+                    # Red for negative P&L %
+                    {
+                        'if': {
+                            'filter_query': '{pnl_pct} < 0',
+                            'column_id': 'pnl_pct'
+                        },
+                        'color': '#e74c3c',
+                        'fontWeight': 'bold'
                     },
                 ],
                 page_size=10,
@@ -2682,14 +2749,13 @@ def create_trade_history_table():
                 columns=[
                     {"name": "Time", "id": "time"},
                     {"name": "Symbol", "id": "symbol"},
+                    {"name": "Strategy", "id": "strategy"},
                     {"name": "Side", "id": "side"},
                     {"name": "Qty", "id": "qty", "type": "numeric"},
-                    {"name": "Entry", "id": "entry", "type": "numeric",
-                     "format": {"specifier": ",.2f"}},
+                    {"name": "Entry", "id": "entry"},
                     {"name": "Exit", "id": "exit"},
-                    {"name": "P&L", "id": "pnl", "type": "numeric",
-                     "format": {"specifier": "+,.2f"}},
-                    {"name": "Status", "id": "status"},
+                    {"name": "P&L", "id": "pnl"},
+                    {"name": "Reason", "id": "exit_reason"},
                 ],
                 style_table={'overflowX': 'auto'},
                 style_cell={
@@ -2705,12 +2771,34 @@ def create_trade_history_table():
                     'textAlign': 'center',
                 },
                 style_data_conditional=[
-                    {'if': {'filter_query': '{pnl} > 0'}, 'color': '#00bc8c'},
-                    {'if': {'filter_query': '{pnl} < 0'}, 'color': '#e74c3c'},
-                    {'if': {'filter_query': '{side} = "BUY"'}, 'backgroundColor': 'rgba(0,188,140,0.1)'},
-                    {'if': {'filter_query': '{side} = "SELL"'}, 'backgroundColor': 'rgba(231,76,60,0.1)'},
+                    # Winning trades - green background
+                    {
+                        'if': {'filter_query': '{pnl} contains "+"'},
+                        'backgroundColor': 'rgba(0, 188, 140, 0.3)',
+                        'color': '#00ff88',
+                        'fontWeight': 'bold',
+                    },
+                    # Losing trades - red background
+                    {
+                        'if': {'filter_query': '{pnl} contains "-"'},
+                        'backgroundColor': 'rgba(231, 76, 60, 0.3)',
+                        'color': '#ff6b6b',
+                        'fontWeight': 'bold',
+                    },
+                    # Purchases (BUY) - blue background
+                    {
+                        'if': {'filter_query': '{side} = "BUY"'},
+                        'backgroundColor': 'rgba(52, 152, 219, 0.3)',
+                        'color': '#5dade2',
+                    },
+                    # Rebalance/trim trades - gray background (overrides others)
+                    {
+                        'if': {'filter_query': '{exit_reason} contains "trim" || {exit_reason} contains "rebalance"'},
+                        'backgroundColor': 'rgba(128, 128, 128, 0.3)',
+                        'color': '#aaaaaa',
+                    },
                 ],
-                page_size=8,
+                page_size=10,
             )
         ])
     ], className="mb-3")
