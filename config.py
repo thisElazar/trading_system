@@ -229,6 +229,31 @@ VIX_REGIMES = {
 }
 
 # ============================================================================
+# HMM REGIME DETECTION (GP-010)
+# ============================================================================
+
+# HMM-based regime detector learns transitions from historical data
+# instead of using hardcoded VIX thresholds. Provides probabilistic
+# regime assignment and N-day transition forecasts.
+HMM_REGIME_CONFIG = {
+    "enabled": True,                    # Enable HMM regime detection
+    "n_states": 3,                      # Number of hidden states (regimes)
+    "state_names": ["bull", "transition", "crisis"],
+    "covariance_type": "full",          # Covariance type: full, diag, spherical
+    "lookback_days": 756,               # Training window (3 years)
+    "retrain_frequency": "monthly",     # How often to retrain model
+    "model_path": str(DIRS["research"] / "models" / "hmm_regime.pkl"),
+
+    # Fallback behavior when HMM unavailable
+    "fallback_to_vix": True,           # Use VIX thresholds if HMM fails
+
+    # Integration settings
+    "confidence_threshold": 0.7,        # Min confidence to use HMM regime
+    "blend_with_vix": True,            # Combine HMM + VIX for robust detection
+    "blend_hmm_weight": 0.6,           # Weight for HMM in blended detection
+}
+
+# ============================================================================
 # STRATEGY CONFIGURATION
 # ============================================================================
 
@@ -291,11 +316,19 @@ STRATEGIES = {
         "rebalance_frequency": "daily",  # 1-day hold
     },
     "sector_rotation": {
-        "enabled": False,  # Sharpe -0.38 (Dec 2025 backtest) - disabled to make room for quality_smallcap_value
-        "tier": 2,
+        # BUG-003: Re-enabled with GA-optimized params (Sharpe -0.38 -> 1.08)
+        "enabled": True,
+        "tier": 1,  # Upgraded from tier 2
         "allocation_pct": 0.10,
-        "max_positions": 10,
-        "rebalance_frequency": "monthly",
+        "max_positions": 2,  # GA optimal: concentrate in top 2 sectors only
+        "rebalance_frequency": "monthly",  # GA optimal: 28-day rebalance
+        "notes": "GA-optimized: 105-day momentum, top 2 sectors, monthly rebalance (Sharpe 1.08)",
+        # GA parameters (passed to strategy constructor)
+        "params": {
+            "momentum_period": 105,
+            "top_n_sectors": 2,
+            "rebalance_days": 28,
+        },
     },
     "quality_smallcap_value": {
         "enabled": True,   # Fama-French + AQR Quality-Minus-Junk research (16.38% small-cap value premium)

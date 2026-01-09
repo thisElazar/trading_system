@@ -191,7 +191,8 @@ class RegimeMatchingEngine:
     def __init__(
         self,
         period_library: MarketPeriodLibrary = None,
-        data_manager: Any = None
+        data_manager: Any = None,
+        hmm_detector: Any = None
     ):
         """
         Initialize the regime matching engine.
@@ -199,9 +200,14 @@ class RegimeMatchingEngine:
         Args:
             period_library: MarketPeriodLibrary instance
             data_manager: CachedDataManager for market data
+            hmm_detector: Optional HMMRegimeDetector for learned transitions (GP-010)
         """
         self.library = period_library or MarketPeriodLibrary()
         self.data_manager = data_manager
+
+        # GP-010: HMM regime detector for learned transitions
+        self.hmm_detector = hmm_detector
+        self._hmm_available = hmm_detector is not None and getattr(hmm_detector, 'is_trained', False)
 
         # Cache
         self._current_fingerprint: Optional[RegimeFingerprint] = None
@@ -211,7 +217,56 @@ class RegimeMatchingEngine:
         # Historical VIX for percentile calculation
         self._vix_history: Optional[pd.Series] = None
 
-        logger.info("RegimeMatchingEngine initialized")
+        # GP-015: Regime change lag to reduce whipsaws
+        # Track recent regime readings to require 2-day confirmation
+        self._regime_history: List[Tuple[datetime, str]] = []
+        self._regime_lag_days: int = 2  # Days of consistency before regime change
+        self._confirmed_regime: str = "transition"  # Last confirmed regime
+
+        if self._hmm_available:
+            logger.info("RegimeMatchingEngine initialized with HMM detector (GP-010)")
+        else:
+            logger.info("RegimeMatchingEngine initialized (HMM not available, using hardcoded transitions)")
+
+    def get_confirmed_regime(self, current_regime: str = None) -> str:
+        """
+        GP-015: Get regime with 2-day lag to reduce whipsaws.
+
+        Only changes the confirmed regime when the new regime has been
+        consistently detected for _regime_lag_days consecutive days.
+
+        Args:
+            current_regime: Current detected regime (if None, uses fingerprint)
+
+        Returns:
+            Confirmed regime (may lag behind current detection)
+        """
+        if current_regime is None:
+            fingerprint = self.get_current_fingerprint()
+            current_regime = fingerprint.overall_regime
+
+        now = datetime.now()
+
+        # Add current reading to history
+        self._regime_history.append((now, current_regime))
+
+        # Keep only last 7 days of history
+        cutoff = now - timedelta(days=7)
+        self._regime_history = [(t, r) for t, r in self._regime_history if t > cutoff]
+
+        # Check if current regime has been consistent for lag period
+        lag_cutoff = now - timedelta(days=self._regime_lag_days)
+        recent_readings = [r for t, r in self._regime_history if t > lag_cutoff]
+
+        if len(recent_readings) >= 2:  # Need at least 2 readings
+            # Check if all recent readings agree
+            if all(r == current_regime for r in recent_readings):
+                if current_regime != self._confirmed_regime:
+                    logger.info(f"GP-015: Regime change confirmed after {self._regime_lag_days}d lag: "
+                               f"{self._confirmed_regime} -> {current_regime}")
+                    self._confirmed_regime = current_regime
+
+        return self._confirmed_regime
 
     def _ensure_data_manager(self):
         """Lazy load data manager."""
@@ -667,12 +722,18 @@ class RegimeMatchingEngine:
 
     def get_regime_transition_probability(
         self,
-        fingerprint: RegimeFingerprint = None
+        fingerprint: RegimeFingerprint = None,
+        horizon_days: int = 5
     ) -> Dict[str, float]:
         """
         Estimate probability of transitioning to different regimes.
 
-        Based on current conditions and historical patterns.
+        GP-010: Uses HMM-learned transitions when available, otherwise
+        falls back to hardcoded matrix based on historical patterns.
+
+        Args:
+            fingerprint: Current fingerprint (calculates if None)
+            horizon_days: Days ahead to forecast (only used with HMM)
 
         Returns:
             Dict mapping regime names to transition probabilities
@@ -683,7 +744,51 @@ class RegimeMatchingEngine:
         # Base probabilities from current regime
         current = fingerprint.overall_regime
 
-        # Historical transition matrix (approximate)
+        # GP-010: Try HMM-learned transitions first
+        if self._hmm_available and self.hmm_detector is not None:
+            try:
+                # Map our regime names to HMM state names
+                hmm_regime_map = {
+                    'risk_on': 'bull',
+                    'transition': 'transition',
+                    'risk_off': 'transition',  # HMM doesn't distinguish risk_off
+                    'crisis': 'crisis'
+                }
+                reverse_map = {
+                    'bull': 'risk_on',
+                    'transition': 'transition',
+                    'crisis': 'crisis'
+                }
+
+                hmm_current = hmm_regime_map.get(current, 'transition')
+                hmm_probs = self.hmm_detector.predict_next_regime(hmm_current, horizon_days)
+
+                # Convert HMM probs back to our regime names
+                probs = {}
+                for hmm_regime, prob in hmm_probs.items():
+                    our_regime = reverse_map.get(hmm_regime, 'transition')
+                    if our_regime in probs:
+                        probs[our_regime] += prob
+                    else:
+                        probs[our_regime] = prob
+
+                # Split transition into risk_off portion based on VIX trend
+                if 'transition' in probs and fingerprint.vix_trend > 10:
+                    risk_off_portion = probs['transition'] * 0.4
+                    probs['risk_off'] = probs.get('risk_off', 0) + risk_off_portion
+                    probs['transition'] -= risk_off_portion
+
+                # Normalize
+                total = sum(probs.values())
+                probs = {k: v / total for k, v in probs.items()}
+
+                logger.debug(f"GP-010: Using HMM-learned transitions: {probs}")
+                return probs
+
+            except Exception as e:
+                logger.warning(f"HMM transition failed, falling back to hardcoded: {e}")
+
+        # Fallback: Historical transition matrix (approximate)
         # Rows: current state, Cols: next state
         transition_base = {
             'risk_on': {'risk_on': 0.75, 'transition': 0.15, 'risk_off': 0.08, 'crisis': 0.02},

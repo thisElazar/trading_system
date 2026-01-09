@@ -86,8 +86,10 @@ class PromotionCriteria:
     min_validation_periods: int = 3
 
     # Paper → Live
-    min_paper_days: int = 14
-    min_paper_trades: int = 10
+    # GP-007: Extended duration for statistical significance (was 14d/10 trades)
+    # Research recommends 90+ days and 60+ trades to distinguish skill from luck
+    min_paper_days: int = 90
+    min_paper_trades: int = 60
     max_paper_drawdown: float = -20.0   # Percentage
     min_paper_sharpe: float = 0.3
     min_paper_win_rate: float = 0.40
@@ -123,6 +125,11 @@ class StrategyRecord:
     walk_forward_efficiency: float = 0.0
     monte_carlo_confidence: float = 0.0
     validation_periods_passed: int = 0
+
+    # CPCV validation metrics (GP-008)
+    cpcv_pbo: Optional[float] = None           # Probability of Backtest Overfitting
+    cpcv_mean_oos_sharpe: Optional[float] = None
+    cpcv_timestamp: Optional[datetime] = None
 
     # Paper trading metrics
     paper_start_date: Optional[datetime] = None
@@ -304,6 +311,14 @@ class PromotionPipeline:
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE strategy_lifecycle ADD COLUMN run_time TEXT DEFAULT '10:00'")
 
+            # Migration: Add CPCV columns if they don't exist (GP-008)
+            try:
+                conn.execute("SELECT cpcv_pbo FROM strategy_lifecycle LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE strategy_lifecycle ADD COLUMN cpcv_pbo REAL")
+                conn.execute("ALTER TABLE strategy_lifecycle ADD COLUMN cpcv_mean_oos_sharpe REAL")
+                conn.execute("ALTER TABLE strategy_lifecycle ADD COLUMN cpcv_timestamp TEXT")
+
     def set_callbacks(
         self,
         on_promotion: Optional[Callable[[str], None]] = None,
@@ -446,13 +461,22 @@ class PromotionPipeline:
 
         return True, "Ready for validation", metrics
 
-    def check_validated_for_paper(self, strategy_id: str) -> Tuple[bool, str, Dict]:
+    def check_validated_for_paper(
+        self,
+        strategy_id: str,
+        require_cpcv: bool = True
+    ) -> Tuple[bool, str, Dict]:
         """
         Check if a validated strategy is ready for paper trading.
 
         Criteria:
         - Walk-forward efficiency >= 0.50
         - Monte Carlo confidence >= 0.90
+        - CPCV PBO <= 0.05 (GP-008, optional but recommended)
+
+        Args:
+            strategy_id: Strategy identifier
+            require_cpcv: If True, require CPCV validation to pass (default True)
 
         Returns:
             Tuple of (ready, message, metrics)
@@ -467,7 +491,9 @@ class PromotionPipeline:
         metrics = {
             'walk_forward_efficiency': record.walk_forward_efficiency,
             'monte_carlo_confidence': record.monte_carlo_confidence,
-            'validation_periods': record.validation_periods_passed
+            'validation_periods': record.validation_periods_passed,
+            'cpcv_pbo': record.cpcv_pbo,
+            'cpcv_mean_oos_sharpe': record.cpcv_mean_oos_sharpe
         }
 
         failures = []
@@ -477,6 +503,13 @@ class PromotionPipeline:
 
         if record.monte_carlo_confidence < self.criteria.min_monte_carlo_confidence:
             failures.append(f"MC confidence {record.monte_carlo_confidence:.2f} < {self.criteria.min_monte_carlo_confidence}")
+
+        # GP-008: CPCV validation (optional but recommended)
+        if require_cpcv:
+            if record.cpcv_pbo is None:
+                failures.append("CPCV validation not yet run")
+            elif record.cpcv_pbo > 0.05:
+                failures.append(f"CPCV PBO {record.cpcv_pbo:.1%} > 5% (likely overfit)")
 
         if failures:
             return False, "; ".join(failures), metrics
@@ -876,7 +909,7 @@ class PromotionPipeline:
 
                 # Convert datetime strings
                 for field in ['created_at', 'updated_at', 'paper_start_date',
-                              'live_start_date', 'retired_at']:
+                              'live_start_date', 'retired_at', 'cpcv_timestamp']:
                     if data.get(field):
                         data[field] = datetime.fromisoformat(data[field])
 
@@ -1008,6 +1041,97 @@ class PromotionPipeline:
                 datetime.now().isoformat(), strategy_id
             ))
 
+    def validate_with_cpcv(
+        self,
+        strategy_id: str,
+        returns: pd.Series,
+        strategy_signals: pd.Series,
+        pbo_threshold: float = 0.05
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Run CPCV validation on a strategy (GP-008).
+
+        CPCV (Combinatorial Purged Cross-Validation) tests strategies across
+        1000+ train/test combinations to detect overfitting via PBO
+        (Probability of Backtest Overfitting).
+
+        Args:
+            strategy_id: Strategy identifier
+            returns: Daily returns series for the strategy universe
+            strategy_signals: Strategy signal series (1=long, 0=flat, -1=short)
+            pbo_threshold: Reject if PBO > threshold (default 5%)
+
+        Returns:
+            Tuple of (passed, result_dict)
+        """
+        try:
+            from research.validation.cpcv import CPCVConfig, run_cpcv_validation
+        except ImportError as e:
+            logger.warning(f"CPCV module not available: {e}")
+            return True, {'error': 'CPCV module not available', 'pbo': None}
+
+        record = self.get_strategy_record(strategy_id)
+        if record is None:
+            return False, {'error': 'Strategy not found'}
+
+        # Run CPCV validation
+        config = CPCVConfig(
+            n_subsets=16,
+            purge_days=5,
+            embargo_pct=0.01,
+            max_combinations=1000,
+            pbo_reject_threshold=pbo_threshold,
+            n_workers=2
+        )
+
+        try:
+            logger.info(f"Running CPCV validation for {strategy_id}...")
+            result = run_cpcv_validation(
+                returns=returns,
+                strategy_signals=strategy_signals,
+                config=config
+            )
+
+            # Store results
+            now = datetime.now()
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    UPDATE strategy_lifecycle
+                    SET cpcv_pbo = ?,
+                        cpcv_mean_oos_sharpe = ?,
+                        cpcv_timestamp = ?,
+                        updated_at = ?
+                    WHERE strategy_id = ?
+                """, (
+                    result.pbo, result.mean_oos_sharpe,
+                    now.isoformat(), now.isoformat(),
+                    strategy_id
+                ))
+
+            passed = result.pbo <= pbo_threshold
+
+            result_dict = {
+                'pbo': result.pbo,
+                'pbo_ci_95': result.pbo_ci_95,
+                'mean_is_sharpe': result.mean_is_sharpe,
+                'mean_oos_sharpe': result.mean_oos_sharpe,
+                'sharpe_degradation': result.mean_sharpe_degradation,
+                'n_splits': result.n_splits_completed,
+                'n_overfit': result.n_splits_overfit,
+                'passed': passed,
+                'threshold': pbo_threshold
+            }
+
+            if passed:
+                logger.info(f"CPCV PASSED for {strategy_id}: PBO={result.pbo:.1%} <= {pbo_threshold:.1%}")
+            else:
+                logger.warning(f"CPCV FAILED for {strategy_id}: PBO={result.pbo:.1%} > {pbo_threshold:.1%}")
+
+            return passed, result_dict
+
+        except Exception as e:
+            logger.error(f"CPCV validation failed for {strategy_id}: {e}", exc_info=True)
+            return False, {'error': str(e), 'pbo': None}
 
     def process_all_promotions(self) -> Dict[str, int]:
         """

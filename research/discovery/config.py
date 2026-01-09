@@ -36,6 +36,11 @@ class EvolutionConfig:
     novelty_archive_size: int = 500
     novelty_weight: float = 0.3  # Weight of novelty vs fitness in selection
 
+    # GP-012: Novelty pulsation (adaptive novelty during plateaus)
+    novelty_weight_plateau: float = 0.7   # Elevated weight during fitness plateaus
+    plateau_detection_window: int = 10    # Generations to check for plateau
+    plateau_improvement_threshold: float = 0.01  # Min improvement to avoid plateau
+
     # Fitness constraints (hard constraints - strategies failing these are rejected)
     # Relaxed for initial discovery - tighten after strategies are found
     min_trades: int = 30              # Was 50 - allows faster iteration
@@ -80,6 +85,14 @@ class EvolutionConfig:
     # Relaxed promotion thresholds for initial discovery
     promotion_threshold_sortino: float = 0.6   # Was 0.8 - allow more through initially
     promotion_threshold_dsr: float = 0.75      # Was 0.85 - can tighten after seeing results
+
+    # CPCV validation (GP-008: Combinatorial Purged Cross-Validation)
+    cpcv_n_subsets: int = 16          # Number of data subsets (S parameter)
+    cpcv_purge_days: int = 5          # Gap between train/test for leakage prevention
+    cpcv_embargo_pct: float = 0.01    # Skip 1% of data after train end
+    cpcv_max_combinations: int = 1000 # Sample for Pi efficiency (full=12870 for S=16)
+    cpcv_pbo_threshold: float = 0.05  # Reject if PBO > 5%
+    cpcv_n_workers: int = 2           # Parallel workers for CPCV (memory-safe)
 
     def validate(self) -> List[str]:
         """Validate configuration, return list of errors."""
@@ -172,8 +185,10 @@ class IslandConfig:
     population_per_island: int = 20         # Individuals per island
 
     # Migration settings
-    migration_interval: int = 5             # Generations between migrations
-    migration_rate: float = 0.15            # Fraction of population to migrate
+    # GP-011: Reduced migration to preserve island specialization
+    # Research: 2-5% every 50 gens for regime-specialist islands
+    migration_interval: int = 50            # Generations between migrations (was 5)
+    migration_rate: float = 0.03            # Fraction of population to migrate (was 0.15)
     topology: str = "ring"                  # ring, random, or full
 
     # Island diversity settings
