@@ -420,13 +420,20 @@ class RapidBacktester:
     # Original Methods (unchanged)
     # =========================================================================
 
-    def cache_data(self, data: Dict[str, pd.DataFrame]):
+    def cache_data(self, data: Dict[str, pd.DataFrame], force: bool = False):
         """
         Cache market data for rapid access.
 
         Args:
             data: Dict mapping symbol to OHLCV DataFrames
+            force: Force re-cache even if data appears unchanged
         """
+        # Skip if data already cached with same symbols (avoids redundant copies)
+        if not force and self._data_cache and len(self._data_cache) == len(data):
+            # Quick check: same symbols means likely same data
+            if set(self._data_cache.keys()) == set(data.keys()):
+                return  # Already cached
+
         self._data_cache = data.copy()
         logger.info(f"Cached data for {len(data)} symbols")
 

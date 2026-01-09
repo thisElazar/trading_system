@@ -68,6 +68,9 @@ class Individual:
     # Performance by period type
     period_scores: Dict[str, float] = field(default_factory=dict)
 
+    # Evaluation tracking - prevents re-evaluation when fitness happens to be 0
+    evaluated: bool = False
+
     # Metadata
     created_at: datetime = field(default_factory=datetime.now)
     parent_ids: List[str] = field(default_factory=list)
@@ -489,10 +492,11 @@ class AdaptiveGAOptimizer:
         data: Dict[str, Any],
         vix_data: Any = None,
         period_names: List[str] = None,
-        detailed: bool = False
+        detailed: bool = False,
+        timeout_seconds: int = 60
     ) -> Individual:
         """
-        Evaluate an individual's fitness.
+        Evaluate an individual's fitness with timeout protection.
 
         Args:
             individual: Individual to evaluate
@@ -501,12 +505,15 @@ class AdaptiveGAOptimizer:
             vix_data: VIX data
             period_names: Specific periods to test on
             detailed: Calculate detailed metrics
+            timeout_seconds: Max time for evaluation (default 60s)
 
         Returns:
             Individual with fitness scores populated
         """
-        try:
+        def _do_evaluation():
+            """Inner evaluation function that can be timed out."""
             # Get test periods
+            nonlocal period_names
             if period_names is None:
                 test_periods = self.regime_engine.get_ga_test_periods()
                 period_names = []
@@ -530,6 +537,19 @@ class AdaptiveGAOptimizer:
                     data=data,
                     vix_data=vix_data
                 )
+            return result
+
+        try:
+            # Run evaluation with timeout to prevent hangs
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_do_evaluation)
+                try:
+                    result = future.result(timeout=timeout_seconds)
+                except TimeoutError:
+                    logger.warning(f"Evaluation timed out after {timeout_seconds}s for individual {individual.id}")
+                    individual.fitness = 0.0
+                    individual.evaluated = True
+                    return individual
 
             # Extract period-specific scores
             individual.period_scores = {}
@@ -560,10 +580,12 @@ class AdaptiveGAOptimizer:
             )
 
             self.total_evaluations += 1
+            individual.evaluated = True
 
         except Exception as e:
             logger.warning(f"Evaluation failed: {e}")
             individual.fitness = 0.0
+            individual.evaluated = True
 
         return individual
 
@@ -581,7 +603,7 @@ class AdaptiveGAOptimizer:
         for gen in range(generations):
             # Evaluate population
             for ind in island.population:
-                if ind.fitness == 0:  # Only evaluate unevaluated individuals
+                if not ind.evaluated:  # Only evaluate unevaluated individuals
                     self.evaluate_individual(
                         ind,
                         strategy_factory,

@@ -237,13 +237,14 @@ except ImportError as e:
     InterventionManager = None
     InterventionMode = None
 
-# Hardware LED integration (optional)
+# Hardware LED integration (optional) - uses client to request LED states
+# The main orchestrator process is the LED authority; we just send requests
 LED_AVAILABLE = True
 try:
-    from hardware.leds import get_led_controller
+    from hardware.led_authority import LEDClient
 except ImportError:
     LED_AVAILABLE = False
-    get_led_controller = None
+    LEDClient = None
 
 # Setup logging
 LOG_DIR = DIRS.get('logs', Path('./logs'))
@@ -1092,6 +1093,7 @@ def run_strategy_discovery(data: dict, vix_data=None, config: dict = None,
         # Import discovery engine
         from research.discovery import EvolutionEngine, EvolutionConfig
         from research.discovery.db_schema import migrate_discovery_tables, check_tables_exist
+        from research.discovery.promotion_pipeline import PromotionPipeline
 
         # Ensure database tables exist
         if not check_tables_exist():
@@ -1110,8 +1112,15 @@ def run_strategy_discovery(data: dict, vix_data=None, config: dict = None,
         # Create backtester with conservative costs
         backtester = Backtester(initial_capital=100000, cost_model='conservative')
 
+        # Create promotion pipeline for strategy lifecycle tracking
+        promotion_pipeline = PromotionPipeline()
+
         # Create evolution engine
-        engine = EvolutionEngine(config=evo_config, backtester=backtester)
+        engine = EvolutionEngine(
+            config=evo_config,
+            backtester=backtester,
+            promotion_pipeline=promotion_pipeline
+        )
 
         # Load data
         engine.load_data(data=data, vix_data=vix_data)
@@ -1492,13 +1501,13 @@ class NightlyResearchEngine:
             logger.info(f"  Adaptive: pop={self.adaptive_config['total_population']}, "
                        f"islands={self.adaptive_config['n_islands']}, rapid_first={rapid_first}")
 
-        # LED controller for hardware feedback
+        # LED client for hardware feedback (sends requests to orchestrator)
         self._leds = None
-        if LED_AVAILABLE:
+        if LED_AVAILABLE and LEDClient is not None:
             try:
-                self._leds = get_led_controller()
+                self._leds = LEDClient()
             except Exception as e:
-                logger.debug(f"LED controller not available: {e}")
+                logger.debug(f"LED client not available: {e}")
 
         # State
         self.data = None
@@ -1957,6 +1966,9 @@ class NightlyResearchEngine:
                     # Mark discovered strategies as needing review
 
             # Clear memory between phases to prevent OOM during long research runs
+            # Aggressively clear caches to reclaim memory before Phase 3
+            if hasattr(self, 'data_manager') and hasattr(self.data_manager, 'clear_cache'):
+                self.data_manager.clear_cache()
             gc.collect()
             logger.info("Memory cleared after Phase 2")
 
