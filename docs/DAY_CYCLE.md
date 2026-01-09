@@ -266,6 +266,68 @@ override_conviction_threshold = 0.85  # For smart override
 
 ---
 
+## System Watchdog
+
+The system includes an automatic recovery watchdog that monitors health and reboots the Pi if the system becomes unresponsive.
+
+### Two-Layer Protection
+
+| Layer | What It Catches | Timeout | Action |
+|-------|-----------------|---------|--------|
+| **Software Watchdog** | Memory exhaustion, disk I/O failure, hung processes | 5 minutes | Graceful restart, then reboot |
+| **Hardware Watchdog** | Kernel panic, complete system freeze | ~15 seconds | Hard reboot |
+
+### Health Checks (every 30 seconds)
+
+| Check | Threshold | Notes |
+|-------|-----------|-------|
+| Memory | < 95% used | Prevents OOM during research |
+| Disk I/O | Can write/read | Catches NVMe issues |
+| Load Average | < 8.0 | Pi 5 has 4 cores |
+| Orchestrator | Process exists, not in D state | Ensures trading system responsive |
+
+### Behavior
+
+1. **System goes unhealthy** → Watchdog starts counting, logs warnings
+2. **Unhealthy for 5 continuous minutes** → Triggers restart sequence
+3. **Restart sequence:**
+   - Stop `trading-orchestrator` service gracefully (30s timeout)
+   - Execute `sudo reboot`
+4. **Restart history** saved to `logs/watchdog_restarts.log`
+
+### Service Management
+
+```bash
+# Check watchdog status
+sudo systemctl status system-watchdog
+
+# View live health checks
+sudo journalctl -u system-watchdog -f
+
+# Temporarily disable (for maintenance)
+sudo systemctl stop system-watchdog
+
+# Re-enable
+sudo systemctl start system-watchdog
+```
+
+### Log Files
+
+- `logs/watchdog.log` - Health check history
+- `logs/watchdog_restarts.log` - Reboot events (survives restart)
+
+### Configuration
+
+Edit `scripts/system_watchdog.py` to adjust:
+```python
+CHECK_INTERVAL = 30          # Seconds between checks
+UNHEALTHY_THRESHOLD = 300    # Seconds (5 min) before restart
+MAX_MEMORY_PCT = 95          # Memory threshold
+MAX_LOAD_AVG = 8.0           # Load average threshold
+```
+
+---
+
 ## Related Documentation
 
 - [AUTONOMOUS_RESEARCH_ENGINE.md](AUTONOMOUS_RESEARCH_ENGINE.md) - Research system details
