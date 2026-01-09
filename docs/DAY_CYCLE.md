@@ -2,7 +2,7 @@
 
 Complete reference for the daily operational cycle of the autonomous trading system.
 
-**Last Updated:** 2026-01-07
+**Last Updated:** 2026-01-09
 
 ---
 
@@ -28,7 +28,8 @@ Prepares the system for the trading day.
 
 | Task | Description |
 |------|-------------|
-| `refresh_premarket_data` | Fetch pre-market quotes and overnight moves |
+| `refresh_premarket_data` | Fetch daily bars for ~110 priority symbols (positions + core ETFs) |
+| `refresh_intraday_data` | Download 5 days of minute bars for 42-symbol intraday universe |
 | `refresh_data` | Update historical data cache |
 | `system_check` | Verify broker connectivity, API keys, disk space |
 | `sync_positions_from_broker` | Reconcile local DB with Alpaca positions |
@@ -198,6 +199,42 @@ During operation, the system updates hardware status:
 - POSITIONS - List of open positions
 - SYSTEM - RAM, CPU, uptime
 - RESEARCH - Generation progress, best Sharpe
+
+---
+
+## Data Architecture
+
+The system maintains two data universes refreshed on different schedules:
+
+### Daily Bars (Full Universe)
+**2,562 symbols | 627 MB | 10+ years history**
+
+| Source | Symbols | Purpose |
+|--------|---------|---------|
+| Alpaca | 805 | Recent high-fidelity data |
+| Yahoo | 2,556 | Extended historical depth |
+
+**Refresh Schedule:**
+- PRE_MARKET (8am): ~110 priority symbols (positions + core ETFs + sample)
+- EVENING (5pm): Full universe EOD refresh
+
+### Intraday/Minute Bars (Trading Universe)
+**42 symbols | 5 MB | 30-day retention**
+
+| Category | Symbols |
+|----------|---------|
+| Broad Market | SPY, QQQ, IWM, DIA |
+| Sectors | XLF, XLE, XLK, XLV, XLI, XLP, XLU, XLY, XLC, XLB, XLRE |
+| Mega-caps | AAPL, MSFT, GOOGL, AMZN, NVDA, META, TSLA, JPM, V, UNH |
+| Volatility | VXX, UVXY, VIXY |
+| Commodities | GLD, SLV, USO, UNG |
+| Bonds | TLT, HYG, LQD |
+| International | EEM, EFA, FXI |
+| Thematic | ARKK, XBI, SMH, KWEB |
+
+**Refresh Schedule:**
+- PRE_MARKET (8am): Download last 5 trading days (~75 seconds)
+- Configured in `config.py:INTRADAY_UNIVERSE`
 
 ---
 

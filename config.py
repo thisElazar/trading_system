@@ -146,6 +146,54 @@ INTRADAY_EXIT_CONFIG = {
     "log_checks": False,               # Log every check (noisy, for debugging)
 }
 
+# ============================================================================
+# INTRADAY DATA UNIVERSE
+# ============================================================================
+# Symbols for which we download minute-bar data. Used by:
+# - Gap-fill strategy (intraday mean reversion)
+# - VWAP reversion strategy
+# - Opening Range Breakout (ORB) strategy
+# - Intraday research and pattern discovery
+
+INTRADAY_UNIVERSE = {
+    # Broad market ETFs - highest liquidity, tightest spreads
+    "broad_market": ["SPY", "QQQ", "IWM", "DIA"],
+
+    # Sector ETFs - sector-specific gaps and rotations
+    "sectors": ["XLF", "XLE", "XLK", "XLV", "XLI", "XLP", "XLU", "XLY", "XLC", "XLB", "XLRE"],
+
+    # Mega-cap stocks - extremely liquid, individual catalysts
+    "mega_caps": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "UNH"],
+
+    # Volatility products - for regime detection and hedging research
+    "volatility": ["VXX", "UVXY", "VIXY"],
+
+    # Commodities ETFs - macro exposure
+    "commodities": ["GLD", "SLV", "USO", "UNG"],
+
+    # Fixed income ETFs - rate sensitivity, risk-off signals
+    "bonds": ["TLT", "HYG", "LQD"],
+
+    # International ETFs - global market correlation
+    "international": ["EEM", "EFA", "FXI"],
+
+    # Thematic ETFs - high-beta, momentum plays
+    "thematic": ["ARKK", "XBI", "SMH", "KWEB"],
+}
+
+# Flatten to single list for easy iteration
+INTRADAY_SYMBOLS = []
+for category in INTRADAY_UNIVERSE.values():
+    INTRADAY_SYMBOLS.extend(category)
+
+# Configuration for intraday data management
+INTRADAY_DATA_CONFIG = {
+    "retention_days": 30,              # Keep 30 days of minute bars
+    "refresh_days": 5,                 # Download last 5 days on refresh
+    "rate_limit_seconds": 0.25,        # Delay between API calls
+    "max_parallel_downloads": 1,       # Sequential for now (rate limits)
+}
+
 # Price filters
 MIN_STOCK_PRICE = 10
 MAX_STOCK_PRICE = 500

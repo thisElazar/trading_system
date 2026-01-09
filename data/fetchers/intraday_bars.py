@@ -24,7 +24,8 @@ from alpaca.data.timeframe import TimeFrame
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from config import (
-    ALPACA_API_KEY, ALPACA_SECRET_KEY, DIRS, INTRADAY_DAYS
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, DIRS, INTRADAY_DAYS,
+    INTRADAY_SYMBOLS, INTRADAY_DATA_CONFIG, INTRADAY_UNIVERSE
 )
 
 logger = logging.getLogger(__name__)
@@ -33,21 +34,41 @@ logger = logging.getLogger(__name__)
 class IntradayDataManager:
     """
     Manages minute-bar data for intraday strategies.
-    
+
     Storage format: data/historical/intraday/{symbol}/{date}.parquet
     Each file contains one day of 1-minute bars (390 bars for full day).
+
+    Universe is configured in config.py:INTRADAY_UNIVERSE (42 symbols across
+    8 categories: broad market, sectors, mega-caps, volatility, commodities,
+    bonds, international, thematic).
     """
-    
-    # Symbols to track for gap-fill (highly liquid)
-    GAP_FILL_UNIVERSE = ['SPY', 'QQQ', 'IWM', 'DIA']
-    
-    def __init__(self):
+
+    # Default universe from config (can be overridden per-call)
+    DEFAULT_UNIVERSE = INTRADAY_SYMBOLS
+
+    # Legacy alias for backwards compatibility
+    GAP_FILL_UNIVERSE = INTRADAY_UNIVERSE.get("broad_market", ["SPY", "QQQ", "IWM", "DIA"])
+
+    def __init__(self, symbols: List[str] = None):
+        """
+        Initialize the intraday data manager.
+
+        Args:
+            symbols: List of symbols to manage. Defaults to full INTRADAY_SYMBOLS
+                     from config.py (42 symbols across all categories).
+        """
+        self.symbols = symbols or self.DEFAULT_UNIVERSE
         self.data_client = StockHistoricalDataClient(
-            ALPACA_API_KEY, 
+            ALPACA_API_KEY,
             ALPACA_SECRET_KEY
         )
         self.intraday_dir = DIRS["intraday"]
         self.intraday_dir.mkdir(parents=True, exist_ok=True)
+
+        # Config-driven settings
+        self.retention_days = INTRADAY_DATA_CONFIG.get("retention_days", 30)
+        self.refresh_days = INTRADAY_DATA_CONFIG.get("refresh_days", 5)
+        self.rate_limit = INTRADAY_DATA_CONFIG.get("rate_limit_seconds", 0.25)
         
     def _get_symbol_dir(self, symbol: str) -> Path:
         """Get directory for a symbol's intraday data."""
@@ -115,22 +136,22 @@ class IntradayDataManager:
             return None
     
     def download_recent(
-        self, 
-        symbols: List[str] = None, 
+        self,
+        symbols: List[str] = None,
         days: int = None
     ) -> Dict[str, int]:
         """
         Download recent minute bars for specified symbols.
-        
+
         Args:
-            symbols: List of symbols (defaults to GAP_FILL_UNIVERSE)
-            days: Number of days to fetch (defaults to INTRADAY_DAYS from config)
-            
+            symbols: List of symbols (defaults to self.symbols, i.e., full universe)
+            days: Number of days to fetch (defaults to self.refresh_days from config)
+
         Returns:
             Dict of {symbol: days_downloaded}
         """
-        symbols = symbols or self.GAP_FILL_UNIVERSE
-        days = days or INTRADAY_DAYS
+        symbols = symbols or self.symbols
+        days = days or self.refresh_days
         
         results = {}
         end_date = datetime.now()
@@ -162,7 +183,7 @@ class IntradayDataManager:
                         logger.error(f"Failed to save intraday data {symbol} {date.date()}: {e}")
                 
                 # Rate limiting
-                time.sleep(0.25)
+                time.sleep(self.rate_limit)
             
             results[symbol] = downloaded
             logger.info(f"{symbol}: {downloaded} days available")
@@ -399,16 +420,20 @@ class IntradayDataManager:
             'volume': latest['volume']
         }
 
-    def get_data_status(self) -> Dict[str, dict]:
+    def get_data_status(self, symbols: List[str] = None) -> Dict[str, dict]:
         """
-        Get status of intraday data for all tracked symbols.
-        
+        Get status of intraday data for tracked symbols.
+
+        Args:
+            symbols: List of symbols to check (defaults to self.symbols)
+
         Returns:
             Dict of {symbol: {days_available, oldest, newest}}
         """
+        symbols = symbols or self.symbols
         status = {}
-        
-        for symbol in self.GAP_FILL_UNIVERSE:
+
+        for symbol in symbols:
             sym_dir = self._get_symbol_dir(symbol)
             files = list(sym_dir.glob("*.parquet"))
             
@@ -425,19 +450,21 @@ class IntradayDataManager:
         
         return status
     
-    def cleanup_old_data(self, keep_days: int = None):
+    def cleanup_old_data(self, keep_days: int = None, symbols: List[str] = None):
         """
         Remove intraday data older than specified days.
-        
+
         Args:
-            keep_days: Days to keep (defaults to INTRADAY_DAYS)
+            keep_days: Days to keep (defaults to self.retention_days from config)
+            symbols: Symbols to clean (defaults to self.symbols)
         """
-        keep_days = keep_days or INTRADAY_DAYS
+        keep_days = keep_days or self.retention_days
+        symbols = symbols or self.symbols
         cutoff = datetime.now() - timedelta(days=keep_days)
         cutoff_str = cutoff.strftime("%Y%m%d")
-        
+
         removed = 0
-        for symbol in self.GAP_FILL_UNIVERSE:
+        for symbol in symbols:
             sym_dir = self._get_symbol_dir(symbol)
             for file in sym_dir.glob("*.parquet"):
                 if file.stem < cutoff_str:
@@ -448,28 +475,37 @@ class IntradayDataManager:
         return removed
 
 
-def download_gap_fill_data():
-    """Convenience function to download data for gap-fill strategy."""
+def download_intraday_data():
+    """Convenience function to download intraday data for full universe."""
     manager = IntradayDataManager()
-    
-    print("Downloading intraday data for gap-fill strategy...")
-    print(f"Symbols: {manager.GAP_FILL_UNIVERSE}")
-    print(f"Days: {INTRADAY_DAYS}")
+
+    print("Downloading intraday data for full universe...")
+    print(f"Symbols: {len(manager.symbols)} total")
+    print(f"Categories: {list(INTRADAY_UNIVERSE.keys())}")
+    print(f"Days: {manager.refresh_days}")
     print()
     
     results = manager.download_recent()
-    
-    print("\nResults:")
-    for symbol, days in results.items():
-        print(f"  {symbol}: {days} days")
-    
-    print("\nData status:")
+
+    # Summary by category
+    print("\nResults by category:")
+    for category, symbols in INTRADAY_UNIVERSE.items():
+        cat_days = sum(results.get(s, 0) for s in symbols)
+        print(f"  {category}: {cat_days} days across {len(symbols)} symbols")
+
+    print(f"\nTotal: {sum(results.values())} symbol-days downloaded")
+
+    # Show any symbols with no data
     status = manager.get_data_status()
-    for symbol, info in status.items():
-        print(f"  {symbol}: {info['days_available']} days "
-              f"({info['oldest']} to {info['newest']})")
+    missing = [s for s, info in status.items() if info['days_available'] == 0]
+    if missing:
+        print(f"\nWarning: {len(missing)} symbols with no data: {missing}")
+
+
+# Legacy alias for backwards compatibility
+download_gap_fill_data = download_intraday_data
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    download_gap_fill_data()
+    download_intraday_data()

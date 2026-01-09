@@ -241,7 +241,7 @@ class DailyOrchestrator:
         MarketPhase.PRE_MARKET: PhaseConfig(
             start_hour=8, start_minute=0,
             end_hour=9, end_minute=30,
-            tasks=["refresh_premarket_data", "refresh_data", "system_check", "sync_positions_from_broker", "review_positions", "cancel_stale_orders", "update_regime_detection", "calculate_position_scalars", "load_live_strategies"],
+            tasks=["refresh_premarket_data", "refresh_intraday_data", "refresh_data", "system_check", "sync_positions_from_broker", "review_positions", "cancel_stale_orders", "update_regime_detection", "calculate_position_scalars", "load_live_strategies"],
             check_interval_seconds=60
         ),
         MarketPhase.INTRADAY_OPEN: PhaseConfig(
@@ -347,6 +347,7 @@ class DailyOrchestrator:
             "sync_positions_from_broker": self._task_sync_positions_from_broker,
             "review_positions": self._task_review_positions,
             "cancel_stale_orders": self._task_cancel_stale_orders,
+            "refresh_intraday_data": self._task_refresh_intraday_data,
 
             # Market hours tasks
             "run_scheduler": self._task_run_scheduler,
@@ -753,6 +754,47 @@ class DailyOrchestrator:
             logger.error(f"Pre-market data refresh failed: {e}")
             return False
 
+    def _task_refresh_intraday_data(self) -> bool:
+        """Refresh intraday (minute bar) data for gap-fill strategy.
+
+        Downloads recent intraday bars from Alpaca for the gap-fill universe
+        (SPY, QQQ, IWM, DIA) to ensure the gap detection has fresh data.
+        """
+        logger.info("Refreshing intraday data for gap-fill strategy...")
+        try:
+            from data.fetchers.intraday_bars import IntradayDataManager
+
+            start = time.time()
+            manager = IntradayDataManager()
+
+            # Download last 5 trading days of minute bars
+            # This ensures we have yesterday's data for gap calculation
+            results = manager.download_recent(days=5)
+
+            # Log results
+            total_days = sum(results.values())
+            logger.info(f"Intraday data refresh: {total_days} days across {len(results)} symbols")
+            for symbol, days in results.items():
+                logger.debug(f"  {symbol}: {days} days")
+
+            # Log data status
+            status = manager.get_data_status()
+            for symbol, info in status.items():
+                if info['newest']:
+                    logger.info(f"  {symbol}: {info['days_available']} days ({info['oldest']} to {info['newest']})")
+                else:
+                    logger.warning(f"  {symbol}: No intraday data available")
+
+            elapsed = time.time() - start
+            logger.info(f"Intraday data refresh completed in {elapsed:.1f}s")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Intraday data refresh failed: {e}")
+            logger.debug(traceback.format_exc())
+            return False
+
     def _task_refresh_eod_data(self) -> bool:
         """Fetch end-of-day data for the full universe after market close.
 
@@ -962,8 +1004,8 @@ class DailyOrchestrator:
                 logger.error(f"CRITICAL: Broker validation failed: {e}")
                 recovery_success = False
 
-            # 3. Compare local positions vs broker positions
-            logger.info("Step 3: Reconciling positions with broker...")
+            # 3. Sync local positions with broker positions
+            logger.info("Step 3: Syncing positions with broker...")
             try:
                 local_positions = self.execution_tracker.db.get_open_positions()
                 broker_positions = self.broker.get_positions()
@@ -975,20 +1017,24 @@ class DailyOrchestrator:
                 in_local_not_broker = local_symbols - broker_symbols
                 in_broker_not_local = broker_symbols - local_symbols
 
-                if in_local_not_broker:
-                    logger.warning(f"Positions in DB but not broker: {in_local_not_broker}")
-                    logger.warning("These may have been closed externally - will sync")
+                if in_local_not_broker or in_broker_not_local:
+                    if in_local_not_broker:
+                        logger.warning(f"Positions in DB but not broker: {in_local_not_broker}")
+                    if in_broker_not_local:
+                        logger.warning(f"Positions in broker but not DB: {in_broker_not_local}")
 
-                if in_broker_not_local:
-                    logger.warning(f"Positions in broker but not DB: {in_broker_not_local}")
-                    logger.warning("These may have been opened externally - will sync")
-
-                if not in_local_not_broker and not in_broker_not_local:
+                    # Actually perform the sync now (don't wait for pre-market)
+                    logger.info("Performing immediate position sync...")
+                    new_count, updated_count, closed_count = self.broker.sync_positions(
+                        self.execution_tracker.db
+                    )
+                    logger.info(f"Position sync complete: {new_count} added, {updated_count} updated, {closed_count} closed")
+                else:
                     logger.info(f"Position reconciliation OK - {len(broker_symbols)} positions match")
 
             except Exception as e:
-                logger.error(f"Position reconciliation failed: {e}")
-                # Don't fail recovery for this - sync task will handle it
+                logger.error(f"Position sync failed: {e}")
+                # Don't fail recovery for this - pre-market sync task is backup
 
             # 4. Check for market holiday
             logger.info("Step 4: Checking market calendar...")
@@ -2203,7 +2249,7 @@ class DailyOrchestrator:
             if HAS_GAP_FILL:
                 try:
                     gap_config = GapFillConfig()
-                    gap_strategy = GapFillStrategy(config=gap_config, broker=self.broker)
+                    gap_strategy = GapFillStrategy(config=gap_config)
                     self._intraday_strategies.append(gap_strategy)
                     logger.info("GapFillStrategy initialized")
                 except Exception as e:
@@ -3248,13 +3294,13 @@ class DailyOrchestrator:
         try:
             logger.info("Calculating position scalars...")
 
-            # Get active strategies from scheduler
-            strategies = self.scheduler.get_active_strategies() if self._scheduler else []
+            # Get active strategy names from scheduler
+            strategy_names = [name for name, info in self.scheduler.strategies.items() if info.get('enabled')] if self._scheduler else []
 
-            for strategy in strategies:
+            for strategy_name in strategy_names:
                 try:
                     # Get strategy returns
-                    returns = self._get_strategy_returns(strategy.name)
+                    returns = self._get_strategy_returns(strategy_name)
                     if returns is None or len(returns) < 20:
                         continue
 
@@ -3270,12 +3316,12 @@ class DailyOrchestrator:
                     # Store for use by execution
                     if 'position_scalars' not in self.state.daily_stats:
                         self.state.daily_stats['position_scalars'] = {}
-                    self.state.daily_stats['position_scalars'][strategy.name] = scalar
+                    self.state.daily_stats['position_scalars'][strategy_name] = scalar
 
-                    logger.debug(f"Position scalar for {strategy.name}: {scalar:.2f}")
+                    logger.debug(f"Position scalar for {strategy_name}: {scalar:.2f}")
 
                 except Exception as e:
-                    logger.warning(f"Failed to calculate scalar for {strategy.name}: {e}")
+                    logger.warning(f"Failed to calculate scalar for {strategy_name}: {e}")
 
             return True
 
@@ -3294,7 +3340,7 @@ class DailyOrchestrator:
                 "performance",
                 """
                 SELECT date, daily_pnl_pct FROM strategy_daily
-                WHERE strategy_name = ?
+                WHERE strategy = ?
                 ORDER BY date DESC
                 LIMIT 60
                 """,
@@ -3581,12 +3627,12 @@ class DailyOrchestrator:
             strategy_perf = db.fetchall(
                 "performance",
                 """
-                SELECT strategy_name, SUM(daily_pnl) as total_pnl,
+                SELECT strategy, SUM(net_pnl) as total_pnl,
                        COUNT(*) as trading_days,
                        AVG(daily_pnl_pct) as avg_daily_pct
                 FROM strategy_daily
                 WHERE date >= ?
-                GROUP BY strategy_name
+                GROUP BY strategy
                 """,
                 (week_ago,)
             )
@@ -3606,7 +3652,7 @@ class DailyOrchestrator:
             if strategy_perf:
                 for perf in strategy_perf:
                     report_lines.append(
-                        f"  {perf['strategy_name']}: ${perf['total_pnl']:.2f} "
+                        f"  {perf['strategy']}: ${perf['total_pnl']:.2f} "
                         f"({perf['avg_daily_pct']*100:.2f}% avg daily)"
                     )
             else:
@@ -4591,6 +4637,23 @@ class DailyOrchestrator:
             self.state.scheduler_thread.join(timeout=30)  # Increased from 5s
             if self.state.scheduler_thread.is_alive():
                 logger.warning("Scheduler thread did not stop cleanly within timeout")
+
+        # Cancel any open orders to prevent unexpected fills after restart
+        if self.broker:
+            try:
+                open_orders = self.broker.get_open_orders()
+                if open_orders:
+                    logger.info(f"Cancelling {len(open_orders)} open orders on shutdown...")
+                    cancelled = 0
+                    for order in open_orders:
+                        try:
+                            self.broker.cancel_order(order.id)
+                            cancelled += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to cancel order {order.id}: {e}")
+                    logger.info(f"Cancelled {cancelled}/{len(open_orders)} open orders")
+            except Exception as e:
+                logger.warning(f"Failed to check/cancel open orders on shutdown: {e}")
 
         # Generate final report if we have data
         if self.state.daily_stats:

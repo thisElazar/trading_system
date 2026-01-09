@@ -14,7 +14,7 @@ from typing import List, Optional
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from config import TOTAL_CAPITAL
+from config import TOTAL_CAPITAL, INTRADAY_UNIVERSE, INTRADAY_SYMBOLS
 
 
 @dataclass
@@ -51,8 +51,9 @@ class GapFillConfig:
         - Success rate decreases after 2 hours
     """
 
-    # Universe
-    symbols: List[str] = field(default_factory=lambda: ['SPY', 'QQQ'])
+    # Universe - defaults to broad market ETFs from config
+    # Can be expanded to full INTRADAY_SYMBOLS for more signals
+    symbols: List[str] = field(default_factory=lambda: INTRADAY_UNIVERSE.get("broad_market", ["SPY", "QQQ", "IWM", "DIA"]))
 
     # Gap detection parameters
     min_gap_pct: float = 0.15  # Minimum gap to trade (filter noise)
