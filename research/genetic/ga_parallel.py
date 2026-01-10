@@ -27,6 +27,15 @@ _ga_worker_data: Dict[str, pd.DataFrame] = {}
 _ga_worker_vix: Optional[pd.DataFrame] = None
 
 
+def _ga_warmup_task(worker_idx: int) -> bool:
+    """
+    Dummy task to trigger worker initialization.
+
+    Must be module-level (not local) to be picklable for multiprocessing.
+    """
+    return True
+
+
 def _ga_pool_initializer(shared_metadata: Dict[str, Any]):
     """
     Initialize GA worker process with shared memory access.
@@ -316,14 +325,10 @@ class GAWorkerPool:
 
         # Stagger worker initialization by sending warmup tasks one at a time
         # Each worker runs its initializer on first task, causing heavy imports
-        def _warmup_task(_):
-            """Dummy task to trigger worker initialization."""
-            return True
-
         logger.info("Warming up workers with staggered initialization...")
         for i in range(self.n_workers):
             # Send one task to one worker and wait for it to complete
-            result = self._pool.apply(_warmup_task, args=(i,))
+            result = self._pool.apply(_ga_warmup_task, args=(i,))
             logger.debug(f"Worker {i+1}/{self.n_workers} initialized")
             if i < self.n_workers - 1:  # Don't sleep after the last worker
                 time.sleep(stagger_delay)
