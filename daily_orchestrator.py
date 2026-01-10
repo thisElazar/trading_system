@@ -4435,8 +4435,8 @@ class DailyOrchestrator:
                         sleep_seconds = min(time_to_next.total_seconds(), 3600)
                         self._interruptible_sleep(sleep_seconds)
                     else:
-                        # Sleep between weekend task checks (30 min)
-                        self._interruptible_sleep(1800)
+                        # Sleep between weekend task checks (5 min)
+                        self._interruptible_sleep(300)
                     continue
 
                 # Check memory before running tasks
