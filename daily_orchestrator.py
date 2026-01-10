@@ -1048,6 +1048,17 @@ class DailyOrchestrator:
             except Exception as e:
                 logger.warning(f"Could not check market calendar: {e}")
 
+            # 5. Load persisted state (for weekend/overnight recovery)
+            logger.info("Step 5: Loading persisted state...")
+            try:
+                self._load_weekend_state()
+                if self.state.weekend_tasks_completed:
+                    logger.info(f"Loaded {len(self.state.weekend_tasks_completed)} completed tasks from state log")
+                else:
+                    logger.info("No persisted state to restore (clean start)")
+            except Exception as e:
+                logger.warning(f"Could not load persisted state: {e}")
+
             logger.info("=" * 60)
             if recovery_success:
                 logger.info("STARTUP RECOVERY COMPLETE - System ready")
@@ -1062,6 +1073,122 @@ class DailyOrchestrator:
             import traceback
             logger.error(traceback.format_exc())
             return False
+
+    # =========================================================================
+    # State Persistence (Orchestrator State Log)
+    # =========================================================================
+
+    def _get_run_date_key(self) -> str:
+        """
+        Get the run date key for state logging.
+
+        For weekends, uses 'weekend_YYYY-MM-DD' (Friday's date).
+        For regular days, uses 'YYYY-MM-DD'.
+        """
+        now = datetime.now(self.tz)
+        weekday = now.weekday()
+
+        if weekday >= 5 or (weekday == 4 and now.hour >= 17):
+            # Weekend period - use Friday's date as the key
+            if weekday == 5:  # Saturday
+                friday = now - timedelta(days=1)
+            elif weekday == 6:  # Sunday
+                friday = now - timedelta(days=2)
+            else:  # Friday evening
+                friday = now
+            return f"weekend_{friday.strftime('%Y-%m-%d')}"
+        else:
+            return now.strftime('%Y-%m-%d')
+
+    def _log_state_event(self, event_type: str, task_name: str = None,
+                         success: bool = None, details: str = None) -> None:
+        """
+        Log an orchestrator state event to the database.
+
+        Args:
+            event_type: 'task_complete', 'phase_enter', 'subphase_enter', 'error'
+            task_name: Name of completed task (for task_complete events)
+            success: Whether the task succeeded
+            details: Optional JSON string with context
+        """
+        try:
+            from data.storage.db_manager import get_db
+            db = get_db()
+
+            run_date = self._get_run_date_key()
+            phase = self.state.current_phase.value if self.state.current_phase else None
+            sub_phase = self.state.weekend_sub_phase.value if self.state.weekend_sub_phase else None
+
+            db.log_state_event(
+                run_date=run_date,
+                event_type=event_type,
+                phase=phase,
+                sub_phase=sub_phase,
+                task_name=task_name,
+                success=success,
+                details=details
+            )
+        except Exception as e:
+            # Don't let logging failures break the orchestrator
+            logger.debug(f"State logging failed (non-critical): {e}")
+
+    def _load_weekend_state(self) -> None:
+        """
+        Load weekend state from the database on startup.
+
+        Restores:
+        - Weekend sub-phase
+        - Completed weekend tasks
+        """
+        try:
+            from data.storage.db_manager import get_db
+            db = get_db()
+
+            run_date = self._get_run_date_key()
+
+            # Only load if we're in weekend period
+            if not run_date.startswith('weekend_'):
+                return
+
+            # Get completed tasks for this weekend
+            completed_tasks = db.get_completed_tasks(run_date, phase='weekend')
+
+            if completed_tasks:
+                self.state.weekend_tasks_completed = list(completed_tasks)
+                logger.info(f"Restored {len(completed_tasks)} completed weekend tasks from state log")
+
+                # Determine sub-phase based on completed tasks
+                cleanup_tasks = {'generate_weekly_report', 'backup_databases', 'vacuum_databases'}
+                research_tasks = {'run_weekend_research'}
+                refresh_tasks = {'refresh_index_constituents', 'refresh_fundamentals'}
+                prep_tasks = {'train_ml_regime_model', 'validate_strategies', 'verify_system_readiness'}
+
+                completed_set = set(completed_tasks)
+
+                if prep_tasks.issubset(completed_set):
+                    self.state.weekend_sub_phase = WeekendSubPhase.COMPLETE
+                    logger.info("Restored weekend state: COMPLETE")
+                elif refresh_tasks.issubset(completed_set):
+                    self.state.weekend_sub_phase = WeekendSubPhase.PREWEEK_PREP
+                    logger.info("Restored weekend state: PREWEEK_PREP")
+                elif research_tasks.issubset(completed_set):
+                    self.state.weekend_sub_phase = WeekendSubPhase.DATA_REFRESH
+                    logger.info("Restored weekend state: DATA_REFRESH")
+                elif cleanup_tasks.issubset(completed_set):
+                    self.state.weekend_sub_phase = WeekendSubPhase.RESEARCH
+                    logger.info("Restored weekend state: RESEARCH")
+                else:
+                    self.state.weekend_sub_phase = WeekendSubPhase.FRIDAY_CLEANUP
+                    logger.info("Restored weekend state: FRIDAY_CLEANUP (partial)")
+
+            # Get last phase state for additional context
+            last_state = db.get_last_phase_state(run_date)
+            if last_state:
+                logger.debug(f"Last recorded state: phase={last_state['phase']}, "
+                           f"sub_phase={last_state['sub_phase']} at {last_state['timestamp']}")
+
+        except Exception as e:
+            logger.warning(f"Could not load weekend state (will start fresh): {e}")
 
     def _is_market_holiday(self) -> bool:
         """
@@ -3494,6 +3621,12 @@ class DailyOrchestrator:
             self.state.weekend_sub_phase = current_sub_phase
             logger.info(f"Weekend sub-phase transition: {old_phase.value} -> {current_sub_phase.value}")
 
+            # Log sub-phase transition to persistent state log
+            self._log_state_event(
+                event_type='subphase_enter',
+                details=json.dumps({'previous_sub_phase': old_phase.value})
+            )
+
         # Run tasks for current sub-phase
         return self._run_weekend_sub_phase_tasks(current_sub_phase)
 
@@ -4237,8 +4370,23 @@ class DailyOrchestrator:
                 if task_name not in self.state.tasks_completed_today:
                     self.state.tasks_completed_today.append(task_name)
                 self.state.last_task_run[task_name] = datetime.now(self.tz)
+
+                # Log to persistent state (for restart recovery)
+                self._log_state_event(
+                    event_type='task_complete',
+                    task_name=task_name,
+                    success=True,
+                    details=json.dumps({'elapsed_seconds': round(elapsed, 1)})
+                )
             else:
                 logger.warning(f"Task {task_name} returned False after {elapsed:.1f}s")
+                # Log failure for audit trail
+                self._log_state_event(
+                    event_type='task_complete',
+                    task_name=task_name,
+                    success=False,
+                    details=json.dumps({'elapsed_seconds': round(elapsed, 1), 'result': 'returned_false'})
+                )
 
             return result
 
@@ -4252,6 +4400,14 @@ class DailyOrchestrator:
                 'error': str(e),
                 'timestamp': datetime.now(self.tz).isoformat()
             })
+
+            # Log exception for audit trail
+            self._log_state_event(
+                event_type='task_complete',
+                task_name=task_name,
+                success=False,
+                details=json.dumps({'elapsed_seconds': round(elapsed, 1), 'error': str(e)[:200]})
+            )
 
             return False
 
@@ -4382,6 +4538,12 @@ class DailyOrchestrator:
 
                     self.state.current_phase = current_phase
                     self.state.phase_started_at = datetime.now(self.tz)
+
+                    # Log phase transition to persistent state log
+                    self._log_state_event(
+                        event_type='phase_enter',
+                        details=json.dumps({'previous_phase': previous_phase.value})
+                    )
 
                     # Update hardware LEDs for new phase
                     if self._hardware:

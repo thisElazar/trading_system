@@ -316,6 +316,10 @@ class GAWorkerPool:
 
         logger.info(f"Starting GA worker pool with {self.n_workers} workers (staggered {stagger_delay}s)...")
 
+        # CRITICAL: Close database connections before fork to prevent SQLite deadlock
+        from data.storage.db_manager import get_db
+        get_db().close_thread_connections()
+
         # Create pool - this spawns all worker processes
         self._pool = Pool(
             processes=self.n_workers,

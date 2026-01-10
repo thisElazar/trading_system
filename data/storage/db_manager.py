@@ -55,6 +55,28 @@ class DatabaseManager:
             self._local.connections = {}
         return self._local.connections
 
+    def close_thread_connections(self) -> None:
+        """
+        Close all database connections for the current thread.
+
+        IMPORTANT: Call this before any multiprocessing fork() to prevent
+        SQLite deadlocks. Forked processes inherit file descriptors, and
+        SQLite connections become corrupted when children exit.
+
+        Connections will be automatically recreated on next database access.
+        """
+        connections = self._get_thread_connections()
+        closed = []
+        for name, conn in list(connections.items()):
+            try:
+                conn.close()
+                closed.append(name)
+            except Exception as e:
+                logger.warning(f"Error closing connection {name}: {e}")
+        connections.clear()
+        if closed:
+            logger.debug(f"Closed DB connections before fork: {closed}")
+
     def _get_connection(self, db_name: str) -> sqlite3.Connection:
         """Get or create a connection to a database for the current thread."""
         connections = self._get_thread_connections()
@@ -72,6 +94,8 @@ class DatabaseManager:
                 # Enable WAL mode for better concurrent read performance
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
+                # Set busy timeout to 30s (prevents indefinite hangs on lock contention)
+                conn.execute("PRAGMA busy_timeout=30000")
 
                 connections[db_name] = conn
 
@@ -98,6 +122,7 @@ class DatabaseManager:
                 ('performance', self._init_performance_db),
                 ('research', self._init_research_db),
                 ('pairs', self._init_pairs_db),
+                ('performance', self._init_orchestrator_state_log),  # Add state log to performance DB
             ]:
                 try:
                     init_func()
@@ -598,6 +623,52 @@ class DatabaseManager:
             raise
 
     # ========================================================================
+    # ORCHESTRATOR STATE LOG
+    # ========================================================================
+
+    def _init_orchestrator_state_log(self):
+        """Initialize orchestrator state log in performance.db.
+
+        This append-only log tracks:
+        - Phase transitions (PRE_MARKET, TRADING, etc.)
+        - Sub-phase transitions (weekend: FRIDAY_CLEANUP, RESEARCH, etc.)
+        - Task completions (with success/failure status)
+
+        Benefits:
+        - State persistence across restarts (avoids redundant task execution)
+        - Audit trail for debugging and timing analysis
+        - Lightweight (just inserts, no complex queries during normal operation)
+        """
+        try:
+            conn = self._get_connection("performance")
+            cursor = conn.cursor()
+
+            # Orchestrator state log - append-only for persistence + audit
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS orchestrator_state_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT DEFAULT (datetime('now')),
+                    run_date TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    phase TEXT,
+                    sub_phase TEXT,
+                    task_name TEXT,
+                    success INTEGER,
+                    details TEXT
+                )
+            """)
+
+            # Indices for efficient queries
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_state_log_run_date ON orchestrator_state_log(run_date)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_state_log_event_type ON orchestrator_state_log(event_type)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_state_log_task ON orchestrator_state_log(task_name)")
+
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Failed to initialize orchestrator state log: {e}")
+            raise
+
+    # ========================================================================
     # COMMON OPERATIONS
     # ========================================================================
 
@@ -1045,12 +1116,141 @@ class DatabaseManager:
         return self.fetchall(
             "research",
             """
-            SELECT * FROM ga_runs 
-            ORDER BY created_at DESC 
+            SELECT * FROM ga_runs
+            ORDER BY created_at DESC
             LIMIT ?
             """,
             (limit,)
         )
+
+    # ========================================================================
+    # ORCHESTRATOR STATE LOG OPERATIONS
+    # ========================================================================
+
+    def log_state_event(self, run_date: str, event_type: str,
+                        phase: str = None, sub_phase: str = None,
+                        task_name: str = None, success: bool = None,
+                        details: str = None) -> int:
+        """
+        Log an orchestrator state event.
+
+        Args:
+            run_date: Grouping key (e.g., 'weekend_2026-01-10', '2026-01-10')
+            event_type: 'task_complete', 'phase_enter', 'phase_exit', 'error'
+            phase: Market phase (e.g., 'weekend', 'overnight')
+            sub_phase: Weekend sub-phase (e.g., 'friday_cleanup', 'research')
+            task_name: Name of completed task (if event_type='task_complete')
+            success: True if task succeeded
+            details: Optional JSON string with additional context
+
+        Returns:
+            Row ID of inserted event
+        """
+        cursor = self.execute(
+            "performance",
+            """
+            INSERT INTO orchestrator_state_log
+            (run_date, event_type, phase, sub_phase, task_name, success, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (run_date, event_type, phase, sub_phase, task_name,
+             1 if success else (0 if success is False else None), details)
+        )
+        return cursor.lastrowid
+
+    def get_completed_tasks(self, run_date: str, phase: str = None,
+                            sub_phase: str = None) -> List[str]:
+        """
+        Get list of successfully completed tasks for a run date.
+
+        Args:
+            run_date: The run date key to query
+            phase: Optional filter by phase
+            sub_phase: Optional filter by sub-phase
+
+        Returns:
+            List of task names that completed successfully
+        """
+        query = """
+            SELECT DISTINCT task_name FROM orchestrator_state_log
+            WHERE run_date = ?
+              AND event_type = 'task_complete'
+              AND success = 1
+              AND task_name IS NOT NULL
+        """
+        params = [run_date]
+
+        if phase:
+            query += " AND phase = ?"
+            params.append(phase)
+
+        if sub_phase:
+            query += " AND sub_phase = ?"
+            params.append(sub_phase)
+
+        rows = self.fetchall("performance", query, tuple(params))
+        return [row['task_name'] for row in rows]
+
+    def get_state_log_events(self, run_date: str, event_type: str = None,
+                             limit: int = 100) -> List[sqlite3.Row]:
+        """
+        Get state log events for a run date.
+
+        Args:
+            run_date: The run date key to query
+            event_type: Optional filter by event type
+            limit: Max events to return
+
+        Returns:
+            List of event rows
+        """
+        if event_type:
+            return self.fetchall(
+                "performance",
+                """
+                SELECT * FROM orchestrator_state_log
+                WHERE run_date = ? AND event_type = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (run_date, event_type, limit)
+            )
+        else:
+            return self.fetchall(
+                "performance",
+                """
+                SELECT * FROM orchestrator_state_log
+                WHERE run_date = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (run_date, limit)
+            )
+
+    def get_last_phase_state(self, run_date: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the most recent phase/sub_phase state for a run date.
+
+        Returns:
+            Dict with 'phase', 'sub_phase', 'timestamp' or None
+        """
+        row = self.fetchone(
+            "performance",
+            """
+            SELECT phase, sub_phase, timestamp FROM orchestrator_state_log
+            WHERE run_date = ? AND event_type IN ('phase_enter', 'subphase_enter')
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (run_date,)
+        )
+        if row:
+            return {
+                'phase': row['phase'],
+                'sub_phase': row['sub_phase'],
+                'timestamp': row['timestamp']
+            }
+        return None
 
 
 # Singleton instance

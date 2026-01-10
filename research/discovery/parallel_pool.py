@@ -188,6 +188,10 @@ class PersistentWorkerPool:
 
         logger.info(f"Starting persistent worker pool with {self.n_workers} workers (staggered {stagger_delay}s)...")
 
+        # CRITICAL: Close database connections before fork to prevent SQLite deadlock
+        from data.storage.db_manager import get_db
+        get_db().close_thread_connections()
+
         # Create pool with initializer
         self._pool = Pool(
             processes=self.n_workers,

@@ -206,6 +206,12 @@ class GeneticOptimizer:
             # Import the module-level parallel evaluation function and worker initializer
             from run_nightly_research import evaluate_genes_parallel, _init_parallel_worker
 
+            # CRITICAL: Close database connections before fork to prevent SQLite deadlock
+            # Fork inherits file descriptors; if children exit while parent has active
+            # connection, the connection becomes corrupted and hangs indefinitely
+            from data.storage.db_manager import get_db
+            get_db().close_thread_connections()
+
             # Use multiprocessing Pool with fork context (Linux) for shared globals
             import multiprocessing as mp
             ctx = mp.get_context('fork')
