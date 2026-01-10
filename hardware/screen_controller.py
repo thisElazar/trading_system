@@ -15,14 +15,18 @@ Data Persistence:
 """
 
 import json
+import os
 import random
+import sqlite3
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from enum import Enum, auto
+
+import psutil
 
 from .display import LCDDisplay, get_display_manager
 from .gpio_config import LCD_ADDR, GPIO_CHIP, ENCODER_PINS
@@ -79,7 +83,7 @@ class ScreenController:
         self._display_manager = get_display_manager()
 
         # Encoder pins
-        enc_cfg = ENCODER_PINS.get('trading', {})
+        enc_cfg = ENCODER_PINS.get('main', {})
         self._clk_pin = enc_cfg.get('clk', 22)
         self._dt_pin = enc_cfg.get('dt', 17)
         self._sw_pin = enc_cfg.get('sw', 27)
@@ -153,6 +157,42 @@ class ScreenController:
         self._running = False
         self._encoder_thread: Optional[threading.Thread] = None
         self._display_thread: Optional[threading.Thread] = None
+
+        # System stats - fetched locally by screen controller (independent of orchestrator)
+        self._system_stats: Dict[str, Any] = {
+            'memory_pct': 0,
+            'zram_pct': 0,
+            'cpu_pct': 0,
+            'cpu_temp': 0,
+            'load_avg': 0,
+        }
+        self._last_system_stats_fetch: float = 0
+        self._system_stats_interval: float = 5.0  # Fetch every 5 seconds
+
+        # Research stats - fetched locally from research.db (independent of orchestrator)
+        self._research_stats: Dict[str, Any] = {
+            'status': 'IDLE',           # IDLE, EVOLVING, STALLED, DONE
+            'strategy': '',             # Current strategy being evolved
+            'generation': 0,            # Current generation for that strategy
+            'best_sharpe': 0.0,         # Best sharpe for that strategy
+            'last_update': None,        # Timestamp of last ga_history write
+            # Summary stats for page 2
+            'total_generations': 0,     # Sum of max generations across all strategies
+            'best_strategy': '',        # Strategy with highest sharpe
+            'best_strategy_gen': 0,     # Generation count for best strategy
+            'best_strategy_sharpe': 0.0,# Sharpe for best strategy
+            'strategy_count': 0,        # Number of strategies being evolved
+        }
+        self._last_research_stats_fetch: float = 0
+        self._research_stats_interval_active: float = 5.0   # Fetch every 5s when research running
+        self._research_stats_interval_idle: float = 60.0    # Fetch every 60s when idle
+        self._research_stale_threshold: float = 300.0       # 5 minutes without writes = stalled
+        self._research_db_path: Path = Path(__file__).parent.parent / "db" / "research.db"
+        self._research_page_idx: int = 0                    # 0 = live progress, 1 = summary
+
+        # Trading data freshness tracking
+        self._trading_data_updated_at: float = 0  # time.time() when orchestrator last pushed
+        self._orchestrator_start_time: float = time.time()  # Track controller start for uptime
 
         # Get the primary display
         self._screen = self._display_manager.trading
@@ -337,13 +377,16 @@ class ScreenController:
             print("[ScreenController] Screen reset failed")
 
     def _on_click(self) -> None:
-        """Handle encoder click - scroll positions or reset screensaver."""
+        """Handle encoder click - scroll positions, toggle research pages, or reset screensaver."""
         with self._lock:
             if self._current_page == DisplayPage.POSITIONS:
                 # Scroll through positions
                 positions = self._data.get('positions', [])
                 if positions:
                     self._position_scroll_idx = (self._position_scroll_idx + 1) % max(1, len(positions) - 2)
+            elif self._current_page == DisplayPage.RESEARCH:
+                # Toggle between live progress (0) and summary (1)
+                self._research_page_idx = (self._research_page_idx + 1) % 2
             elif self._current_page == DisplayPage.SCREENSAVER:
                 # Reset Game of Life with new random pattern
                 self._gol_grid = []
@@ -357,11 +400,17 @@ class ScreenController:
 
         Call this periodically with fresh data.
         Saves to disk cache for persistence across restarts.
+
+        Note: System stats (memory_pct, cpu_pct, etc.) are now fetched
+        independently by the screen controller. The orchestrator can still
+        push them, but they will be overwritten by fresh local values.
         """
         with self._lock:
             self._data.update(data)
             # Clear stale flag now that we have fresh data
             self._data_is_stale = False
+            # Track when trading data was last received
+            self._trading_data_updated_at = time.time()
 
         # Save to disk cache (throttled - only every few updates)
         # We do this outside the lock to avoid blocking
@@ -400,8 +449,14 @@ class ScreenController:
         pnl_sign = '+' if pnl >= 0 else ''
         pct_sign = '+' if pnl_pct >= 0 else ''
 
-        # Show "*" indicator if data is stale (from cache)
-        header = "[TRADING]*" if self._data_is_stale else "[TRADING]"
+        # Show data age if stale (from cache or orchestrator not updating)
+        data_age = self._get_trading_data_age_str()
+        if data_age == "live":
+            header = "[TRADING]"
+        elif data_age == "no data":
+            header = "[TRADING] waiting..."
+        else:
+            header = f"[TRADING] {data_age}"
 
         lines = [
             header,
@@ -458,7 +513,13 @@ class ScreenController:
             self._prev_vix = vix
 
         # Header shows phase and time remaining
-        header = f"{phase_short} ({time_remaining})"
+        # Add staleness indicator if data is old
+        data_age = self._get_trading_data_age_str()
+        if data_age in ("live", "no data"):
+            header = f"{phase_short} ({time_remaining})"
+        else:
+            # Show staleness in header for market data
+            header = f"{phase_short} [{data_age}]"
 
         lines = [
             header.center(20),
@@ -473,7 +534,14 @@ class ScreenController:
         positions = data.get('positions', [])
         scroll_idx = self._position_scroll_idx
 
-        header = "[POSITIONS]*" if self._data_is_stale else "[POSITIONS]"
+        # Show data age if stale
+        data_age = self._get_trading_data_age_str()
+        if data_age == "live":
+            header = "[POSITIONS]"
+        elif data_age == "no data":
+            header = "[POSITIONS] waiting..."
+        else:
+            header = f"[POSITIONS] {data_age}"
         lines = [header]
 
         if not positions:
@@ -500,18 +568,26 @@ class ScreenController:
         self._screen.write_all(lines)
 
     def _render_system(self, data: Dict[str, Any]) -> None:
-        """Render system status page."""
-        mem_pct = data.get('memory_pct', 0)
-        zram_pct = data.get('zram_pct', 0)
-        cpu_pct = data.get('cpu_pct', 0)
-        uptime = data.get('uptime', '--')
-        cpu_temp = data.get('cpu_temp', 0)
-        load_avg = data.get('load_avg', 0)
+        """Render system status page.
 
-        header = "[SYSTEM]*" if self._data_is_stale else "[SYSTEM]"
+        Uses locally-fetched system stats (always fresh) rather than
+        orchestrator-pushed data. This ensures the SYSTEM page updates
+        every 5 seconds regardless of orchestrator check interval.
+        """
+        # Use fresh local stats (fetched by _fetch_system_stats)
+        with self._lock:
+            stats = self._system_stats.copy()
 
+        mem_pct = stats.get('memory_pct', 0)
+        zram_pct = stats.get('zram_pct', 0)
+        cpu_pct = stats.get('cpu_pct', 0)
+        uptime = stats.get('uptime', '--')
+        cpu_temp = stats.get('cpu_temp', 0)
+        load_avg = stats.get('load_avg', 0)
+
+        # System page is always fresh (locally fetched), no stale indicator needed
         lines = [
-            header,
+            "[SYSTEM]",
             f"RAM:{mem_pct:.0f}%  ZRAM:{zram_pct:.0f}%",
             f"CPU: {cpu_pct:.0f}%  Up: {uptime}",
             f"Temp:{cpu_temp:.0f}C  Load:{load_avg:.1f}"
@@ -519,34 +595,111 @@ class ScreenController:
         self._screen.write_all(lines)
 
     def _render_research(self, data: Dict[str, Any]) -> None:
-        """Render research status page."""
-        status = data.get('research_status', 'IDLE')
-        gen = data.get('research_generation', 0)
-        sharpe = data.get('research_best_sharpe', 0)
-        phase = data.get('phase', 'unknown')
+        """Render research status page.
+
+        Two pages (click to toggle):
+        - Page 0: Live progress (current strategy being evolved)
+        - Page 1: Summary (total gens, best strategy overall)
+
+        Uses locally-fetched research stats from research.db (always fresh).
+        """
+        # Use fresh local stats (fetched by _fetch_research_stats)
+        with self._lock:
+            stats = self._research_stats.copy()
+            page_idx = self._research_page_idx
+
+        if page_idx == 1:
+            # Page 2: Summary stats
+            self._render_research_summary(stats)
+        else:
+            # Page 1: Live progress (default)
+            self._render_research_live(stats)
+
+    def _render_research_live(self, stats: Dict[str, Any]) -> None:
+        """Render research live progress page (page 1)."""
+        status = stats.get('status', 'IDLE')
+        strategy = stats.get('strategy', '')
+        gen = stats.get('generation', 0)
+        sharpe = stats.get('best_sharpe', 0.0)
 
         # Determine display based on status
         if status == 'IDLE':
             lines = [
-                "[RESEARCH]",
+                "[RESEARCH 1/2]",
                 "Status: IDLE",
                 "",
-                "Next: Overnight phase"
+                "Click for summary"
+            ]
+        elif status == 'STARTING':
+            lines = [
+                "[RESEARCH 1/2]",
+                "Status: STARTING",
+                "",
+                "Initializing..."
+            ]
+        elif status == 'STALLED':
+            lines = [
+                "[RESEARCH 1/2]",
+                "Status: STALLED",
+                "Process not responding",
+                "Click for summary"
             ]
         elif status == 'DONE':
+            # Show best result from completed run
+            if strategy:
+                lines = [
+                    "[RESEARCH 1/2]",
+                    "COMPLETE",
+                    f"Best: {strategy}",
+                    f"Gen:{gen} Sharpe:{sharpe:.2f}"
+                ]
+            else:
+                lines = [
+                    "[RESEARCH 1/2]",
+                    "Status: COMPLETE",
+                    f"Generations: {gen}",
+                    f"Best Sharpe: {sharpe:.2f}"
+                ]
+        else:
+            # EVOLVING - show live progress (updates every 5 seconds)
+            if strategy:
+                lines = [
+                    "[RESEARCH 1/2]",
+                    f"NOW: {strategy}",
+                    f"Generation: {gen}",
+                    f"Sharpe: {sharpe:.2f}"
+                ]
+            else:
+                lines = [
+                    "[RESEARCH 1/2]",
+                    "EVOLVING...",
+                    f"Generation: {gen}",
+                    f"Sharpe: {sharpe:.2f}"
+                ]
+
+        self._screen.write_all(lines)
+
+    def _render_research_summary(self, stats: Dict[str, Any]) -> None:
+        """Render research summary page (page 2)."""
+        total_gens = stats.get('total_generations', 0)
+        strategy_count = stats.get('strategy_count', 0)
+        best_strategy = stats.get('best_strategy', '')
+        best_gen = stats.get('best_strategy_gen', 0)
+        best_sharpe = stats.get('best_strategy_sharpe', 0.0)
+
+        if strategy_count == 0:
             lines = [
-                "[RESEARCH]",
-                "Status: COMPLETE",
-                f"Generations: {gen}",
-                f"Best Sharpe: {sharpe:.2f}"
+                "[RESEARCH 2/2]",
+                "No research data",
+                "",
+                "Click for live view"
             ]
         else:
-            # EVOLVING - show live progress
             lines = [
-                "[RESEARCH]",
-                f"EVOLVING...",
-                f"Generations: {gen}",
-                f"Best Sharpe: {sharpe:.2f}"
+                "[RESEARCH 2/2]",
+                f"Total: {total_gens} gens/{strategy_count} strats",
+                f"Best: {best_strategy}",
+                f"Gen:{best_gen} Sharpe:{best_sharpe:.2f}"
             ]
 
         self._screen.write_all(lines)
@@ -639,10 +792,322 @@ class ScreenController:
 
         return new_grid
 
+    def _fetch_system_stats(self) -> None:
+        """
+        Fetch system stats locally (independent of orchestrator).
+
+        This runs every 5 seconds regardless of orchestrator state,
+        ensuring the SYSTEM page always shows fresh data.
+        """
+        now = time.time()
+        if now - self._last_system_stats_fetch < self._system_stats_interval:
+            return
+
+        self._last_system_stats_fetch = now
+
+        try:
+            # Memory usage
+            mem = psutil.virtual_memory()
+            memory_pct = mem.percent
+
+            # ZRAM/swap usage
+            zram_pct = 0
+            try:
+                swap = psutil.swap_memory()
+                if swap.total > 0:
+                    zram_pct = swap.percent
+            except Exception:
+                pass
+
+            # CPU usage (non-blocking, uses delta since last call)
+            cpu_pct = psutil.cpu_percent(interval=None)
+
+            # Load average (1-minute)
+            load_avg = os.getloadavg()[0]
+
+            # CPU temperature (Pi-specific)
+            cpu_temp = 0
+            try:
+                with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                    cpu_temp = int(f.read().strip()) / 1000.0
+            except Exception:
+                pass
+
+            # Calculate uptime from controller start
+            uptime_secs = now - self._orchestrator_start_time
+            if uptime_secs >= 86400:  # Days
+                uptime_str = f"{int(uptime_secs // 86400)}d {int((uptime_secs % 86400) // 3600)}h"
+            elif uptime_secs >= 3600:  # Hours
+                uptime_str = f"{int(uptime_secs // 3600)}h {int((uptime_secs % 3600) // 60)}m"
+            else:
+                uptime_str = f"{int(uptime_secs // 60)}m"
+
+            # Update stats (thread-safe)
+            with self._lock:
+                self._system_stats.update({
+                    'memory_pct': memory_pct,
+                    'zram_pct': zram_pct,
+                    'cpu_pct': cpu_pct,
+                    'cpu_temp': cpu_temp,
+                    'load_avg': load_avg,
+                    'uptime': uptime_str,
+                })
+
+        except Exception:
+            pass  # Silently fail - don't crash the display loop
+
+    def _fetch_research_stats(self) -> None:
+        """
+        Fetch research progress from research.db (independent of orchestrator).
+
+        Uses adaptive interval:
+        - Every 5 seconds when research is actively running
+        - Every 60 seconds when idle (just checking for status changes)
+
+        Detects stalled research:
+        - If status='running' but no ga_history writes in 5 minutes, shows STALLED
+
+        Shows current activity:
+        - Which strategy is currently being evolved
+        - What generation it's on
+        - Its current best Sharpe
+        """
+        now = time.time()
+
+        # Adaptive interval based on current status
+        current_status = self._research_stats.get('status', 'IDLE')
+        interval = (self._research_stats_interval_active
+                   if current_status == 'EVOLVING'
+                   else self._research_stats_interval_idle)
+
+        if now - self._last_research_stats_fetch < interval:
+            return
+
+        self._last_research_stats_fetch = now
+
+        try:
+            if not self._research_db_path.exists():
+                return
+
+            conn = sqlite3.connect(str(self._research_db_path), timeout=1.0)
+            conn.row_factory = sqlite3.Row
+
+            try:
+                # Check for actively running research first
+                cursor = conn.execute("""
+                    SELECT run_id, status, planned_generations, total_generations
+                    FROM ga_runs
+                    WHERE status = 'running'
+                    ORDER BY start_time DESC
+                    LIMIT 1
+                """)
+                run_row = cursor.fetchone()
+
+                if run_row:
+                    # Database says research is running - verify with recent activity
+                    today = date.today().isoformat()
+
+                    # Get the MOST RECENT ga_history entry (current strategy being evolved)
+                    cursor = conn.execute("""
+                        SELECT strategy, generation, best_fitness, created_at
+                        FROM ga_history
+                        WHERE run_date = ?
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    """, (today,))
+                    latest = cursor.fetchone()
+
+                    if latest and latest['created_at']:
+                        # Parse timestamp and check staleness
+                        # Database stores UTC timestamps, so compare with UTC now
+                        try:
+                            last_write = datetime.fromisoformat(latest['created_at'])
+                            age_seconds = (datetime.utcnow() - last_write).total_seconds()
+                        except (ValueError, TypeError):
+                            age_seconds = 9999  # Treat parse errors as stale
+
+                        if age_seconds < self._research_stale_threshold:
+                            # Actively evolving - show current strategy progress
+                            # Shorten strategy name for display
+                            strategy_name = latest['strategy'] or 'unknown'
+                            short_name = self._shorten_strategy_name(strategy_name)
+
+                            with self._lock:
+                                self._research_stats.update({
+                                    'status': 'EVOLVING',
+                                    'strategy': short_name,
+                                    'generation': latest['generation'] or 0,
+                                    'best_sharpe': round(latest['best_fitness'] or 0, 2),
+                                    'last_update': latest['created_at'],
+                                })
+                        else:
+                            # Database says running but no recent writes - stalled/orphaned
+                            with self._lock:
+                                self._research_stats.update({
+                                    'status': 'STALLED',
+                                    'strategy': '',
+                                    'generation': 0,
+                                    'best_sharpe': 0.0,
+                                    'last_update': latest['created_at'],
+                                })
+                    else:
+                        # No ga_history entries yet - research just started
+                        with self._lock:
+                            self._research_stats.update({
+                                'status': 'STARTING',
+                                'strategy': '',
+                                'generation': 0,
+                                'best_sharpe': 0.0,
+                                'last_update': None,
+                            })
+                else:
+                    # No running research - check for most recent completed
+                    cursor = conn.execute("""
+                        SELECT run_id, status, planned_generations, total_generations
+                        FROM ga_runs
+                        ORDER BY start_time DESC
+                        LIMIT 1
+                    """)
+                    run_row = cursor.fetchone()
+
+                    if run_row and run_row['status'] == 'completed':
+                        # Get best result from today's runs
+                        today = date.today().isoformat()
+                        cursor = conn.execute("""
+                            SELECT strategy, generation, best_fitness
+                            FROM ga_history
+                            WHERE run_date = ?
+                            ORDER BY best_fitness DESC
+                            LIMIT 1
+                        """, (today,))
+                        best_row = cursor.fetchone()
+
+                        if best_row:
+                            short_name = self._shorten_strategy_name(best_row['strategy'] or '')
+                            with self._lock:
+                                self._research_stats.update({
+                                    'status': 'DONE',
+                                    'strategy': short_name,
+                                    'generation': best_row['generation'] or 0,
+                                    'best_sharpe': round(best_row['best_fitness'] or 0, 2),
+                                    'last_update': None,
+                                })
+                        else:
+                            with self._lock:
+                                self._research_stats.update({
+                                    'status': 'DONE',
+                                    'strategy': '',
+                                    'generation': run_row['total_generations'] or 0,
+                                    'best_sharpe': 0.0,
+                                    'last_update': None,
+                                })
+                    else:
+                        # No research data or failed/interrupted
+                        with self._lock:
+                            self._research_stats.update({
+                                'status': 'IDLE',
+                                'strategy': '',
+                                'generation': 0,
+                                'best_sharpe': 0.0,
+                                'last_update': None,
+                            })
+
+                # Always fetch summary stats for page 2 (regardless of status)
+                today = date.today().isoformat()
+                cursor = conn.execute("""
+                    SELECT strategy,
+                           MAX(generation) as max_gen,
+                           MAX(best_fitness) as best_sharpe
+                    FROM ga_history
+                    WHERE run_date = ?
+                    GROUP BY strategy
+                    ORDER BY best_sharpe DESC
+                """, (today,))
+                rows = cursor.fetchall()
+
+                if rows:
+                    # Calculate totals
+                    total_gens = sum(r['max_gen'] or 0 for r in rows)
+                    strategy_count = len(rows)
+
+                    # Best strategy is first row (ordered by sharpe DESC)
+                    best = rows[0]
+                    best_name = self._shorten_strategy_name(best['strategy'] or '')
+
+                    with self._lock:
+                        self._research_stats.update({
+                            'total_generations': total_gens,
+                            'strategy_count': strategy_count,
+                            'best_strategy': best_name,
+                            'best_strategy_gen': best['max_gen'] or 0,
+                            'best_strategy_sharpe': round(best['best_sharpe'] or 0, 2),
+                        })
+                else:
+                    with self._lock:
+                        self._research_stats.update({
+                            'total_generations': 0,
+                            'strategy_count': 0,
+                            'best_strategy': '',
+                            'best_strategy_gen': 0,
+                            'best_strategy_sharpe': 0.0,
+                        })
+
+            finally:
+                conn.close()
+
+        except Exception:
+            pass  # Silently fail - don't crash the display loop
+
+    def _shorten_strategy_name(self, name: str) -> str:
+        """Shorten strategy name for LCD display (max ~12 chars)."""
+        # Common abbreviations
+        abbreviations = {
+            'relative_volume_breakout': 'rel_vol_brk',
+            'factor_momentum': 'factor_mom',
+            'sector_rotation': 'sector_rot',
+            'quality_smallcap_value': 'qual_smcap',
+            'mean_reversion': 'mean_rev',
+            'vol_managed_momentum': 'vol_mgd_mom',
+            'vix_regime_rotation': 'vix_regime',
+            'pairs_trading': 'pairs',
+            'gap_fill': 'gap_fill',
+        }
+        return abbreviations.get(name, name[:12])
+
+    def _get_trading_data_age_str(self) -> str:
+        """Get human-readable age of trading data from orchestrator."""
+        if self._trading_data_updated_at == 0:
+            return "no data"
+
+        age_secs = time.time() - self._trading_data_updated_at
+        if age_secs < 60:
+            return "live"
+        elif age_secs < 3600:
+            return f"{int(age_secs // 60)}m ago"
+        elif age_secs < 86400:
+            return f"{int(age_secs // 3600)}h ago"
+        else:
+            return f"{int(age_secs // 86400)}d ago"
+
     def _display_update_loop(self) -> None:
-        """Background display update loop."""
+        """Background display update loop.
+
+        Fetches local data independently of orchestrator:
+        - System stats: every 5 seconds (always fresh)
+        - Research stats: every 5 seconds when active, 60 seconds when idle
+
+        Renders the current page every 1 second.
+        """
         while self._running:
+            # Fetch fresh system stats (self-throttled to every 5 seconds)
+            self._fetch_system_stats()
+
+            # Fetch research stats (adaptive: 5s when active, 60s when idle)
+            self._fetch_research_stats()
+
+            # Render current page
             self._render_current_page()
+
             time.sleep(1.0)  # Update display every second
 
     def start(self) -> None:
