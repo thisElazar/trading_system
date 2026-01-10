@@ -8,12 +8,14 @@ All GPIO numbers are BCM numbering.
 # GPIO Chip for Pi 5
 GPIO_CHIP = '/dev/gpiochip0'
 
-# I2C Configuration (Screens)
+# I2C Configuration (Screen)
 I2C_BUS = 1
-LCD_TRADING_ADDR = 0x27    # Screen 1 - Trading display
-LCD_RESEARCH_ADDR = 0x25   # Screen 2 - Research display (A0 bridged)
+LCD_ADDR = 0x27    # 20x4 I2C LCD display
 LCD_COLS = 20
 LCD_ROWS = 4
+
+# LCD Orientation (set True if display is mounted upside down)
+LCD_FLIPPED = False
 
 # LED Configuration (Common Anode - LOW = ON, HIGH = OFF)
 # LED 1: System Health

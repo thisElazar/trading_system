@@ -1,10 +1,7 @@
 """
 LCD Display Controller for Trading System
 
-Controls 20x4 I2C character LCD displays:
-- Screen 1 (0x27): Trading information
-- Screen 2 (0x25): Research/evolution status
-
+Controls 20x4 I2C character LCD display at 0x27.
 Uses RPLCD library for LCD control.
 """
 
@@ -24,7 +21,7 @@ except ImportError:
     CharLCD = None
 
 from .gpio_config import (
-    I2C_BUS, LCD_TRADING_ADDR, LCD_RESEARCH_ADDR, LCD_COLS, LCD_ROWS
+    I2C_BUS, LCD_ADDR, LCD_COLS, LCD_ROWS, LCD_FLIPPED
 )
 
 
@@ -39,11 +36,12 @@ class DisplayContent:
 class LCDDisplay:
     """Controller for a single 20x4 I2C LCD."""
 
-    def __init__(self, address: int, name: str = "LCD"):
+    def __init__(self, address: int, name: str = "LCD", flipped: bool = False):
         self.address = address
         self.name = name
         self.cols = LCD_COLS
         self.rows = LCD_ROWS
+        self.flipped = flipped  # 180° rotation (for upside-down mounting)
         self._lcd: Optional[CharLCD] = None
         self._lock = threading.Lock()
         self._scroll_thread: Optional[threading.Thread] = None
@@ -149,6 +147,11 @@ class LCDDisplay:
         else:
             text = text.ljust(self.cols)
 
+        # Apply 180° rotation if display is mounted upside down
+        if self.flipped:
+            line = (self.rows - 1) - line  # Flip line order (0↔3, 1↔2)
+            text = text[::-1]              # Reverse characters
+
         with self._lock:
             try:
                 self._lcd.cursor_pos = (line, 0)
@@ -233,11 +236,10 @@ class LCDDisplay:
 
 
 class DisplayManager:
-    """Manages both LCD displays."""
+    """Manages the LCD display."""
 
     def __init__(self):
-        self.trading = LCDDisplay(LCD_TRADING_ADDR, "Trading")
-        self.research = LCDDisplay(LCD_RESEARCH_ADDR, "Research")
+        self.trading = LCDDisplay(LCD_ADDR, "Trading", flipped=LCD_FLIPPED)
         self._update_thread: Optional[threading.Thread] = None
         self._update_stop = threading.Event()
 
@@ -245,25 +247,12 @@ class DisplayManager:
     def trading_available(self) -> bool:
         return self.trading.available
 
-    @property
-    def research_available(self) -> bool:
-        return self.research.available
-
     def show_startup(self) -> None:
-        """Show startup message on available displays."""
+        """Show startup message on display."""
         if self.trading.available:
             self.trading.clear()
             self.trading.write_all([
                 "=== TRADING SYS ===",
-                "",
-                "   Initializing...",
-                ""
-            ])
-
-        if self.research.available:
-            self.research.clear()
-            self.research.write_all([
-                "=== RESEARCH ENG ===",
                 "",
                 "   Initializing...",
                 ""
@@ -303,51 +292,12 @@ class DisplayManager:
         ]
         self.trading.write_all(lines)
 
-    def update_research(self, data: Dict[str, Any]) -> None:
-        """
-        Update research display with current data.
-
-        Expected data keys:
-            - status: str ('EVOLVING', 'IDLE', 'COMPLETE')
-            - generation: int
-            - max_generation: int
-            - best_sharpe: float
-            - best_drawdown: float
-            - eta_minutes: int
-            - population: int
-        """
-        if not self.research.available:
-            return
-
-        status = data.get('status', 'IDLE')
-        gen = data.get('generation', 0)
-        max_gen = data.get('max_generation', 100)
-        sharpe = data.get('best_sharpe', 0)
-        dd = data.get('best_drawdown', 0)
-        eta = data.get('eta_minutes', 0)
-        pop = data.get('population', 0)
-
-        # Progress bar
-        progress = int((gen / max_gen) * 16) if max_gen > 0 else 0
-        bar = '#' * progress + '.' * (16 - progress)
-
-        eta_str = f"{eta // 60}h{eta % 60:02d}m" if eta >= 60 else f"{eta}m"
-
-        lines = [
-            f"{status} Gen {gen}/{max_gen}",
-            f"[{bar}]",
-            f"SR:{sharpe:.2f} DD:{dd:.0f}%",
-            f"ETA:{eta_str}  Pop:{pop}"
-        ]
-        self.research.write_all(lines)
-
     def shutdown(self) -> None:
-        """Clean shutdown of all displays."""
+        """Clean shutdown of display."""
         self._update_stop.set()
         if self._update_thread:
             self._update_thread.join(timeout=2)
         self.trading.shutdown()
-        self.research.shutdown()
 
 
 # Singleton instance

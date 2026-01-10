@@ -164,13 +164,20 @@ class PersistentWorkerPool:
         self._pool: Optional[Pool] = None
         self._started = False
 
-    def start(self):
-        """Start the worker pool."""
+    def start(self, stagger_delay: float = 3.0):
+        """
+        Start the worker pool with staggered initialization.
+
+        Args:
+            stagger_delay: Seconds to wait between starting each worker (default 3s).
+                          This prevents memory stampede from all workers importing
+                          heavy libraries (numpy, pandas, sklearn) simultaneously.
+        """
         if self._started:
             logger.warning("Pool already started")
             return
 
-        logger.info(f"Starting persistent worker pool with {self.n_workers} workers...")
+        logger.info(f"Starting persistent worker pool with {self.n_workers} workers (staggered {stagger_delay}s)...")
 
         # Create pool with initializer
         self._pool = Pool(
@@ -179,8 +186,22 @@ class PersistentWorkerPool:
             initargs=(self.shared_metadata,)
         )
 
+        # Stagger worker initialization by sending warmup tasks one at a time
+        # Each worker runs its initializer on first task, causing heavy imports
+        def _warmup_task(_):
+            """Dummy task to trigger worker initialization."""
+            return True
+
+        logger.info("Warming up workers with staggered initialization...")
+        for i in range(self.n_workers):
+            # Send one task to one worker and wait for it to complete
+            result = self._pool.apply(_warmup_task, args=(i,))
+            logger.debug(f"Worker {i+1}/{self.n_workers} initialized")
+            if i < self.n_workers - 1:  # Don't sleep after the last worker
+                time.sleep(stagger_delay)
+
         self._started = True
-        logger.info("Worker pool started and initialized")
+        logger.info("Worker pool started and initialized (all workers warmed up)")
 
     def evaluate_batch(
         self,

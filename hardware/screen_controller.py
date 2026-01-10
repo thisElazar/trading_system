@@ -25,17 +25,17 @@ from typing import Optional, Dict, Any, List
 from enum import Enum, auto
 
 from .display import LCDDisplay, get_display_manager
-from .gpio_config import LCD_TRADING_ADDR, GPIO_CHIP, ENCODER_PINS
+from .gpio_config import LCD_ADDR, GPIO_CHIP, ENCODER_PINS
 
 # Cache file location
 SCREEN_CACHE_FILE = Path(__file__).parent.parent / "db" / "screen_cache.json"
 
-# Import LED controller for feedback
+# Import LED interface for feedback (uses orchestrator if authority, else client)
 try:
-    from .leds import get_led_controller
+    from .led_authority import get_led_interface
     HAS_LEDS = True
 except ImportError:
-    get_led_controller = None
+    get_led_interface = None
     HAS_LEDS = False
 
 
@@ -99,11 +99,11 @@ class ScreenController:
         self._reset_feedback_given: bool = False  # LED blink given at 5s threshold
         self._reset_hold_threshold: float = 5.0  # Seconds to hold for reset
 
-        # LED controller for feedback
+        # LED interface for feedback (orchestrator if authority, else client)
         self._leds = None
         if HAS_LEDS:
             try:
-                self._leds = get_led_controller()
+                self._leds = get_led_interface()
             except Exception:
                 pass
 
@@ -505,7 +505,8 @@ class ScreenController:
         zram_pct = data.get('zram_pct', 0)
         cpu_pct = data.get('cpu_pct', 0)
         uptime = data.get('uptime', '--')
-        phase = data.get('phase', 'unknown')
+        cpu_temp = data.get('cpu_temp', 0)
+        load_avg = data.get('load_avg', 0)
 
         header = "[SYSTEM]*" if self._data_is_stale else "[SYSTEM]"
 
@@ -513,7 +514,7 @@ class ScreenController:
             header,
             f"RAM:{mem_pct:.0f}%  ZRAM:{zram_pct:.0f}%",
             f"CPU: {cpu_pct:.0f}%  Up: {uptime}",
-            f"Phase: {phase[:12]}"
+            f"Temp:{cpu_temp:.0f}C  Load:{load_avg:.1f}"
         ]
         self._screen.write_all(lines)
 

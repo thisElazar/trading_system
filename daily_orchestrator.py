@@ -227,6 +227,7 @@ class OrchestratorState:
     weekend_started_at: Optional[datetime] = None
     weekend_config: Dict[str, Any] = field(default_factory=dict)  # Runtime config from dashboard
     weekend_research_progress: Dict[str, Any] = field(default_factory=dict)  # Generation, strategy, etc.
+    last_phase_transition: Optional[datetime] = None  # For settle period tracking
 
 
 class DailyOrchestrator:
@@ -2116,18 +2117,8 @@ class DailyOrchestrator:
                 logger.warning("Nightly research script not found")
                 return False
 
-            # Wait for memory to be available before launching research (prevents OOM)
-            # Throttle instead of skip - wait up to 5 minutes for memory to clear
-            for attempt in range(10):
-                mem_status = self._check_memory_status()
-                if mem_status['available_mb'] >= 1500:  # Need 1.5GB minimum for research
-                    break
-                logger.info(f"Waiting for memory ({mem_status['available_mb']:.0f}MB available, need 1500MB)...")
-                gc.collect()  # Force garbage collection
-                time.sleep(30)  # Wait 30 seconds between checks
-            else:
-                logger.warning("Memory still low after 5 min wait, proceeding anyway with swap")
-            # Always proceed - swap file will catch overflow
+            # Pre-flight system check - wait for memory and load to be reasonable
+            self._preflight_system_check(min_memory_mb=1500, max_load=3.0)
 
             # Start research LED breathing and update display with full data
             if self._hardware:
@@ -3466,22 +3457,86 @@ class DailyOrchestrator:
             self.state.weekend_sub_phase = WeekendSubPhase.FRIDAY_CLEANUP
             self.state.weekend_started_at = now
             self.state.weekend_tasks_completed = []
+            self.state.last_phase_transition = None  # Track for settle period
             # Use default config or override from dashboard
             if not self.state.weekend_config:
                 self.state.weekend_config = WEEKEND_CONFIG.copy()
             logger.info("Weekend phase started - beginning with Friday cleanup")
 
         # Determine which sub-phase we should be in based on time
-        current_sub_phase = self._get_weekend_sub_phase(now)
+        time_based_sub_phase = self._get_weekend_sub_phase(now)
+
+        # Get actual sub-phase considering task completion requirements
+        current_sub_phase = self._get_safe_weekend_sub_phase(time_based_sub_phase)
 
         # Check if we need to transition sub-phases
         if current_sub_phase != self.state.weekend_sub_phase:
             old_phase = self.state.weekend_sub_phase
+
+            # Apply settle period between cleanup and research phases
+            if (old_phase == WeekendSubPhase.FRIDAY_CLEANUP and
+                    current_sub_phase == WeekendSubPhase.RESEARCH):
+                last_transition = getattr(self.state, 'last_phase_transition', None)
+                if last_transition is None:
+                    # First transition attempt - mark time and wait
+                    self.state.last_phase_transition = now
+                    logger.info("Cleanup complete, starting 30s settle period before research...")
+                    return True  # Stay in cleanup for now
+                elif (now - last_transition).total_seconds() < 30:
+                    # Still in settle period
+                    settle_remaining = 30 - (now - last_transition).total_seconds()
+                    logger.debug(f"Settle period: {settle_remaining:.0f}s remaining")
+                    return True
+                else:
+                    # Settle period complete, clear the marker
+                    self.state.last_phase_transition = None
+
             self.state.weekend_sub_phase = current_sub_phase
             logger.info(f"Weekend sub-phase transition: {old_phase.value} -> {current_sub_phase.value}")
 
         # Run tasks for current sub-phase
         return self._run_weekend_sub_phase_tasks(current_sub_phase)
+
+    def _get_safe_weekend_sub_phase(self, time_based_phase: WeekendSubPhase) -> WeekendSubPhase:
+        """
+        Determine safe sub-phase considering both time AND task completion.
+
+        Don't transition to a new phase until tasks in the current phase are complete.
+        This prevents starting heavy research while cleanup is still running.
+        """
+        current_phase = self.state.weekend_sub_phase
+
+        # Define required tasks for each phase to be considered "complete"
+        phase_requirements = {
+            WeekendSubPhase.FRIDAY_CLEANUP: [
+                "generate_weekly_report",
+                "backup_databases",
+                "vacuum_databases",
+            ],
+            WeekendSubPhase.RESEARCH: [],  # No completion requirement (runs in background)
+            WeekendSubPhase.DATA_REFRESH: [
+                "refresh_index_constituents",
+                "refresh_fundamentals",
+            ],
+            WeekendSubPhase.PREWEEK_PREP: [
+                "train_ml_regime_model",
+                "validate_strategies",
+                "verify_system_readiness",
+            ],
+        }
+
+        # If time says we should move to a later phase, check if current phase is complete
+        if time_based_phase != current_phase:
+            required_tasks = phase_requirements.get(current_phase, [])
+            completed_tasks = self.state.weekend_tasks_completed
+
+            # Check if all required tasks for current phase are done
+            incomplete = [t for t in required_tasks if t not in completed_tasks]
+            if incomplete:
+                logger.debug(f"Cannot transition from {current_phase.value}: incomplete tasks: {incomplete}")
+                return current_phase  # Stay in current phase
+
+        return time_based_phase
 
     def _get_weekend_sub_phase(self, now: datetime) -> WeekendSubPhase:
         """Determine the current weekend sub-phase based on time."""
@@ -3704,10 +3759,58 @@ class DailyOrchestrator:
             logger.error(f"Database vacuum failed: {e}")
             return False
 
+    def _preflight_system_check(self, min_memory_mb: int = 1500, max_load: float = 3.0) -> bool:
+        """
+        Perform pre-flight system check before launching heavy tasks.
+
+        Checks memory availability and system load, waits if needed.
+
+        Args:
+            min_memory_mb: Minimum available memory required (default 1.5GB)
+            max_load: Maximum 1-minute load average allowed (default 3.0)
+
+        Returns:
+            True if system is ready, False if still not ready after waiting
+        """
+        import os
+
+        logger.info("Running pre-flight system check...")
+
+        # Check system load first - wait for it to settle
+        for attempt in range(6):  # Up to 3 minutes waiting for load
+            load_1min = os.getloadavg()[0]
+            if load_1min <= max_load:
+                break
+            logger.info(f"Waiting for load to settle ({load_1min:.1f} > {max_load})")
+            time.sleep(30)
+        else:
+            logger.warning(f"Load still high ({load_1min:.1f}) after 3 min, proceeding anyway")
+
+        # Check memory availability
+        for attempt in range(10):  # Up to 5 minutes waiting for memory
+            mem_status = self._check_memory_status()
+            if mem_status['available_mb'] >= min_memory_mb:
+                break
+            logger.info(f"Waiting for memory ({mem_status['available_mb']:.0f}MB available, need {min_memory_mb}MB)...")
+            gc.collect()  # Force garbage collection
+            time.sleep(30)
+        else:
+            logger.warning(f"Memory still low ({mem_status['available_mb']:.0f}MB) after 5 min, proceeding anyway with swap")
+
+        # Log final status
+        mem_status = self._check_memory_status()
+        load_1min = os.getloadavg()[0]
+        logger.info(f"Pre-flight check complete: Memory={mem_status['available_mb']:.0f}MB, Load={load_1min:.1f}")
+
+        return True  # Always proceed - swap will catch overflow
+
     def _task_run_weekend_research(self) -> bool:
         """Run extended weekend research with configurable parameters."""
         try:
             logger.info("Starting weekend research...")
+
+            # Pre-flight system check - wait for memory and load to be reasonable
+            self._preflight_system_check(min_memory_mb=1500, max_load=3.0)
 
             # Get config (from dashboard or defaults)
             config = self.state.weekend_config.get('research', WEEKEND_CONFIG['research'])
@@ -4482,6 +4585,15 @@ class DailyOrchestrator:
             # Get system metrics
             memory_pct = psutil.virtual_memory().percent
             cpu_pct = psutil.cpu_percent(interval=None)
+            load_avg = os.getloadavg()[0]  # 1-minute load average
+
+            # Get CPU temperature (Pi-specific)
+            cpu_temp = 0
+            try:
+                with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                    cpu_temp = int(f.read().strip()) / 1000.0
+            except Exception:
+                pass
 
             # Get ZRAM usage
             zram_pct = 0
@@ -4525,6 +4637,8 @@ class DailyOrchestrator:
                 'memory_pct': memory_pct,
                 'zram_pct': zram_pct,
                 'cpu_pct': cpu_pct,
+                'cpu_temp': cpu_temp,
+                'load_avg': load_avg,
                 'uptime': uptime_str,
                 'phase_time_remaining': phase_time_str,
             }

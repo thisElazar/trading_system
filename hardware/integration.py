@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Try to import hardware components
 try:
-    from .leds import get_led_controller, LEDController
+    from .led_authority import init_as_authority, cleanup_request_files, LEDOrchestrator
     from .display import LCDDisplay
     from .screen_controller import get_screen_controller, ScreenController
     from .gpio_config import LCD_TRADING_ADDR
@@ -36,7 +36,7 @@ try:
 except Exception as e:
     logger.warning(f"Hardware module not available: {e}")
     HARDWARE_AVAILABLE = False
-    LEDController = None
+    LEDOrchestrator = None
     LCDDisplay = None
     ScreenController = None
 
@@ -61,7 +61,7 @@ class HardwareStatus:
     }
 
     def __init__(self):
-        self._leds: Optional[LEDController] = None
+        self._leds: Optional[LEDOrchestrator] = None
         self._screen_controller: Optional[ScreenController] = None
         self._research_active = False
         self._current_phase = None
@@ -69,10 +69,13 @@ class HardwareStatus:
 
         if HARDWARE_AVAILABLE:
             try:
-                self._leds = get_led_controller()
-                logger.info("LED controller initialized")
+                # Clean up any stale request files from previous runs
+                cleanup_request_files()
+                # Initialize as the LED authority - this process owns the hardware
+                self._leds = init_as_authority(poll_interval=0.1)
+                logger.info("LED orchestrator initialized as authority")
             except Exception as e:
-                logger.warning(f"Failed to initialize LEDs: {e}")
+                logger.warning(f"Failed to initialize LED orchestrator: {e}")
 
             try:
                 self._screen_controller = get_screen_controller()

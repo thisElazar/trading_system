@@ -291,21 +291,45 @@ class GAWorkerPool:
         self._pool: Optional[Pool] = None
         self._started = False
 
-    def start(self):
-        """Start the worker pool."""
+    def start(self, stagger_delay: float = 3.0):
+        """
+        Start the worker pool with staggered initialization.
+
+        Args:
+            stagger_delay: Seconds to wait between starting each worker (default 3s).
+                          This prevents memory stampede from all workers importing
+                          heavy libraries (numpy, pandas, sklearn) simultaneously.
+        """
+        import time
+
         if self._started:
             return
 
-        logger.info(f"Starting GA worker pool with {self.n_workers} workers...")
+        logger.info(f"Starting GA worker pool with {self.n_workers} workers (staggered {stagger_delay}s)...")
 
+        # Create pool - this spawns all worker processes
         self._pool = Pool(
             processes=self.n_workers,
             initializer=_ga_pool_initializer,
             initargs=(self.shared_metadata,)
         )
 
+        # Stagger worker initialization by sending warmup tasks one at a time
+        # Each worker runs its initializer on first task, causing heavy imports
+        def _warmup_task(_):
+            """Dummy task to trigger worker initialization."""
+            return True
+
+        logger.info("Warming up workers with staggered initialization...")
+        for i in range(self.n_workers):
+            # Send one task to one worker and wait for it to complete
+            result = self._pool.apply(_warmup_task, args=(i,))
+            logger.debug(f"Worker {i+1}/{self.n_workers} initialized")
+            if i < self.n_workers - 1:  # Don't sleep after the last worker
+                time.sleep(stagger_delay)
+
         self._started = True
-        logger.info("GA worker pool started")
+        logger.info("GA worker pool started (all workers warmed up)")
 
     def evaluate_fitness_batch(
         self,

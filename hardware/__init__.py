@@ -2,9 +2,9 @@
 Trading System Hardware Interface Module
 
 Provides control for physical hardware components:
-- 2x 20x4 I2C LCD displays (trading & research status)
+- 20x4 I2C LCD display (trading status)
 - 3x RGB LEDs (system health, trading status, research status)
-- 2x Rotary encoders with push buttons (UI navigation)
+- Rotary encoder with push button (UI navigation)
 
 Usage:
     from hardware import HardwareManager
@@ -13,7 +13,7 @@ Usage:
     hw = HardwareManager()
     hw.startup()
 
-    # Update displays
+    # Update display
     hw.displays.update_trading({
         'portfolio_value': 100000,
         'daily_pnl': 500,
@@ -38,15 +38,15 @@ Usage:
 from .gpio_config import (
     GPIO_CHIP,
     I2C_BUS,
-    LCD_TRADING_ADDR,
-    LCD_RESEARCH_ADDR,
+    LCD_ADDR,
     LED_PINS,
     ENCODER_PINS,
     COLORS,
     STATUS_COLORS,
 )
 
-from .leds import LEDController, get_led_controller
+from .leds import LEDController
+from .led_authority import LEDClient, LEDOrchestrator, get_led_interface, init_as_authority
 from .display import DisplayManager, LCDDisplay, get_display_manager
 from .encoders import EncoderHandler, EncoderEvent, get_encoder_handler
 
@@ -56,6 +56,9 @@ class HardwareManager:
     Unified manager for all hardware components.
 
     Provides a single interface to control LEDs, displays, and encoders.
+
+    NOTE: This class is deprecated. Use HardwareStatus from integration.py instead.
+    The LED authority pattern ensures only one process controls LEDs.
     """
 
     def __init__(self, auto_start: bool = False):
@@ -65,7 +68,8 @@ class HardwareManager:
         Args:
             auto_start: If True, automatically start encoder polling
         """
-        self.leds = get_led_controller()
+        # Use LED interface (orchestrator if authority, client otherwise)
+        self.leds = get_led_interface()
         self.displays = get_display_manager()
         self.encoders = get_encoder_handler()
 
@@ -77,11 +81,6 @@ class HardwareManager:
     def trading_display(self) -> LCDDisplay:
         """Get the trading display."""
         return self.displays.trading
-
-    @property
-    def research_display(self) -> LCDDisplay:
-        """Get the research display."""
-        return self.displays.research
 
     def startup(self) -> None:
         """
@@ -135,10 +134,6 @@ class HardwareManager:
         """Update trading display with portfolio data."""
         self.displays.update_trading(data)
 
-    def update_research_display(self, data: dict) -> None:
-        """Update research display with evolution data."""
-        self.displays.update_research(data)
-
     def __enter__(self):
         self.startup()
         return self
@@ -160,7 +155,10 @@ __all__ = [
 
     # Individual components
     'LEDController',
-    'get_led_controller',
+    'LEDClient',
+    'LEDOrchestrator',
+    'get_led_interface',
+    'init_as_authority',
     'DisplayManager',
     'LCDDisplay',
     'get_display_manager',
