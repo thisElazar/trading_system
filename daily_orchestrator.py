@@ -4424,6 +4424,10 @@ class DailyOrchestrator:
                     # Run weekend schedule (handles sub-phases internally)
                     self._task_run_weekend_schedule()
 
+                    # Update hardware display after weekend tasks
+                    if self._hardware:
+                        self._update_hardware_display(current_phase)
+
                     # If weekend is complete, sleep until Monday
                     if self.state.weekend_sub_phase == WeekendSubPhase.COMPLETE:
                         time_to_next = self.time_until_next_phase()

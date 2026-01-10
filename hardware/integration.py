@@ -31,7 +31,7 @@ try:
     from .led_authority import init_as_authority, cleanup_request_files, LEDOrchestrator
     from .display import LCDDisplay
     from .screen_controller import get_screen_controller, ScreenController
-    from .gpio_config import LCD_TRADING_ADDR
+    from .gpio_config import LCD_ADDR
     HARDWARE_AVAILABLE = True
 except Exception as e:
     logger.warning(f"Hardware module not available: {e}")
