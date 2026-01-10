@@ -4647,8 +4647,8 @@ class DailyOrchestrator:
                 'phase_time_remaining': phase_time_str,
             }
 
-            # Add research data during overnight phase
-            if current_phase == MarketPhase.OVERNIGHT:
+            # Add research data during overnight and weekend phases
+            if current_phase in (MarketPhase.OVERNIGHT, MarketPhase.WEEKEND):
                 research_data = self._get_research_progress()
                 display_data.update(research_data)
 
