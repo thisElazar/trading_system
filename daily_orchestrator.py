@@ -4697,6 +4697,20 @@ class DailyOrchestrator:
                 row = cursor.fetchone()
                 if row and row['status'] == 'completed':
                     result['research_status'] = 'DONE'
+                    result['research_generation'] = row['total_generations'] or 0
+                    result['research_max_gen'] = row['planned_generations'] or row['total_generations'] or 0
+
+                    # Get best fitness from ga_history for today's runs
+                    from datetime import date
+                    today = date.today().isoformat()
+                    cursor = conn.execute("""
+                        SELECT MAX(best_fitness) as best_fitness
+                        FROM ga_history
+                        WHERE run_date = ?
+                    """, (today,))
+                    fitness_row = cursor.fetchone()
+                    if fitness_row and fitness_row['best_fitness']:
+                        result['research_best_sharpe'] = round(fitness_row['best_fitness'], 2)
                 conn.close()
                 return result
 
