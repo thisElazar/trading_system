@@ -1728,50 +1728,52 @@ class NightlyResearchEngine:
         try:
             # Create fitness function
             fitness_fn = create_fitness_function(
-                strategy_name, 
+                strategy_name,
                 self.backtester,
                 self.data,
                 self.vix_data,
                 population_size=self.ga_config.population_size,
                 walk_forward=PERF.get("walk_forward", True)
             )
-            
-            # Create persistent optimizer
-            optimizer = PersistentGAOptimizer(
+
+            # Use context manager for automatic pool lifecycle management
+            # Pool is created in __enter__, reused across all generations, shutdown in __exit__
+            with PersistentGAOptimizer(
                 strategy_name,
                 fitness_fn,
                 config=self.ga_config
-            )
-            
-            # Load existing population first to get accurate starting fitness
-            optimizer.load_population()
-            start_best = optimizer.best_ever_fitness
-            
-            # Evolve
-            best = optimizer.evolve_incremental(generations=generations)
-            
-            # Calculate improvement (handle -inf start for new strategies)
-            if start_best == float('-inf'):
-                improvement = 0.0  # First run, no prior to compare
-            else:
-                improvement = optimizer.best_ever_fitness - start_best
-            improved = improvement > 0.01  # Meaningful improvement threshold
-            
-            result = {
-                'strategy': strategy_name,
-                'generation': optimizer.current_generation,
-                'best_fitness': optimizer.best_ever_fitness,
-                'best_genes': optimizer.best_ever_genes,
-                'improvement': improvement,
-                'improved': improved,
-                'generations_run': generations
-            }
-            
+            ) as optimizer:
+                # Load existing population first to get accurate starting fitness
+                optimizer.load_population()
+                start_best = optimizer.best_ever_fitness
+
+                # Evolve (uses persistent pool internally)
+                best = optimizer.evolve_incremental(generations=generations)
+
+                # Calculate improvement (handle -inf start for new strategies)
+                if start_best == float('-inf'):
+                    improvement = 0.0  # First run, no prior to compare
+                else:
+                    improvement = optimizer.best_ever_fitness - start_best
+                improved = improvement > 0.01  # Meaningful improvement threshold
+
+                result = {
+                    'strategy': strategy_name,
+                    'generation': optimizer.current_generation,
+                    'best_fitness': optimizer.best_ever_fitness,
+                    'best_genes': optimizer.best_ever_genes,
+                    'improvement': improvement,
+                    'improved': improved,
+                    'generations_run': generations
+                }
+
+            # Pool automatically cleaned up here
+
             if improved:
-                logger.info(f"✅ {strategy_name}: Improved by {improvement:.4f}")
+                logger.info(f"[OK] {strategy_name}: Improved by {improvement:.4f}")
             else:
-                logger.info(f"➖ {strategy_name}: No significant improvement")
-            
+                logger.info(f"[-] {strategy_name}: No significant improvement")
+
             return result
             
         except Exception as e:

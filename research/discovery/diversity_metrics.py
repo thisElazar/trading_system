@@ -320,6 +320,10 @@ class DiversityMonitor:
         self.mutation_boost_remaining: int = 0
         self.total_interventions: int = 0
 
+        # GP-012: Plateau detection for novelty pulsation
+        self.fitness_history: List[float] = []
+        self.plateau_active: bool = False
+
     def update(self,
                generation: int,
                genomes: List['StrategyGenome'],
@@ -348,6 +352,18 @@ class DiversityMonitor:
             self.generations_since_improvement = 0
         else:
             self.generations_since_improvement += 1
+
+        # GP-012: Detect plateau for novelty pulsation
+        was_plateau = self.plateau_active
+        is_plateau = self._detect_plateau(
+            best_fitness=best_fitness,
+            window=self.thresholds.stagnation_generations,
+            threshold=self.thresholds.stagnation_improvement_threshold
+        )
+        if is_plateau and not was_plateau:
+            logger.info(f"GP-012: Plateau detected at gen {generation}, elevating novelty weight")
+        elif was_plateau and not is_plateau:
+            logger.info(f"GP-012: Plateau ended at gen {generation}, restoring normal novelty weight")
 
         # Check intervention triggers
         should_intervene = False
@@ -418,6 +434,63 @@ class DiversityMonitor:
         if self.mutation_boost_active:
             return self.thresholds.mutation_rate_boost
         return 1.0
+
+    def _detect_plateau(self, best_fitness: float, window: int = 10,
+                        threshold: float = 0.01) -> bool:
+        """
+        GP-012: Detect if evolution is on a fitness plateau.
+
+        A plateau is detected when the best fitness improvement over the
+        last N generations is below the threshold.
+
+        Args:
+            best_fitness: Current generation's best fitness
+            window: Number of generations to analyze
+            threshold: Minimum improvement required to not be a plateau
+
+        Returns:
+            True if plateau detected
+        """
+        self.fitness_history.append(best_fitness)
+
+        # Keep history bounded
+        if len(self.fitness_history) > 100:
+            self.fitness_history = self.fitness_history[-50:]
+
+        # Need enough history
+        if len(self.fitness_history) < window:
+            return False
+
+        # Check improvement over window
+        recent_history = self.fitness_history[-window:]
+        start_fitness = recent_history[0]
+        end_fitness = recent_history[-1]
+        improvement = end_fitness - start_fitness
+
+        # Plateau if improvement is below threshold
+        is_plateau = improvement < threshold
+        self.plateau_active = is_plateau
+
+        return is_plateau
+
+    def get_effective_novelty_weight(self, base_weight: float = 0.3,
+                                     plateau_weight: float = 0.7) -> float:
+        """
+        GP-012: Get effective novelty weight, elevated during plateaus.
+
+        When fitness stagnates, increase novelty weight to encourage
+        exploration of diverse strategies that might escape local optima.
+
+        Args:
+            base_weight: Normal novelty weight (from config)
+            plateau_weight: Elevated weight during plateaus
+
+        Returns:
+            Current effective novelty weight
+        """
+        if self.plateau_active:
+            return plateau_weight
+        return base_weight
 
     def get_injection_ratio(self) -> float:
         """Get ratio of population to replace during intervention."""

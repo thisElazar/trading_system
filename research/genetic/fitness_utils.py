@@ -96,7 +96,7 @@ def calculate_composite_fitness(result: Any, verbose: bool = False) -> float:
 
 def calculate_fitness_with_penalties(
     result: Any,
-    min_trades: int = 10,
+    min_trades: int = 30,  # Raised from 10 for statistical validity
     max_drawdown_threshold: float = -40,
     extreme_drawdown_threshold: float = -60,
     verbose: bool = False
@@ -105,12 +105,15 @@ def calculate_fitness_with_penalties(
     Calculate composite fitness with additional penalties for edge cases.
 
     This version adds penalties for:
-    - Too few trades (potential overfitting)
+    - Too few trades (potential overfitting) - uses continuous penalty, not cliff
     - Excessive drawdowns (risk management)
+
+    Uses Deb's feasibility rules: instead of a cliff at min_trades,
+    applies a continuous penalty proportional to trade count shortfall.
 
     Args:
         result: BacktestResult object with performance metrics
-        min_trades: Minimum trades for full fitness (below gets 50% penalty)
+        min_trades: Minimum trades for full fitness (below gets proportional penalty)
         max_drawdown_threshold: Drawdown level for 20% penalty
         extreme_drawdown_threshold: Drawdown level for 50% penalty
         verbose: If True, log component breakdown
@@ -118,17 +121,28 @@ def calculate_fitness_with_penalties(
     Returns:
         Penalized composite fitness score
     """
+    import math
+
     # Calculate base composite fitness
     fitness = calculate_composite_fitness(result, verbose=False)
 
     original_fitness = fitness
     penalties_applied = []
 
-    # Penalty for insufficient trades (likely overfitting)
+    # Penalty for insufficient trades using Deb's feasibility rules
+    # Instead of cliff (0.5x below threshold), use continuous scaling
     total_trades = getattr(result, 'total_trades', 0) or 0
     if total_trades < min_trades:
-        fitness *= 0.5
-        penalties_applied.append(f"low_trades({total_trades}<{min_trades})")
+        # Linear scale: 0 trades = 0.1x, min_trades-1 = ~1.0x
+        trade_factor = 0.1 + 0.9 * (total_trades / min_trades)
+        fitness *= trade_factor
+        penalties_applied.append(f"low_trades({total_trades}<{min_trades}, factor={trade_factor:.2f})")
+    else:
+        # Exponential soft penalty for feasible solutions (reward more trades)
+        trade_factor = 1 - math.exp(-total_trades / min_trades)
+        fitness *= trade_factor
+        if trade_factor < 0.95:
+            penalties_applied.append(f"trade_bonus(factor={trade_factor:.2f})")
 
     # Penalty for extreme drawdowns
     max_dd = getattr(result, 'max_drawdown_pct', 0) or 0

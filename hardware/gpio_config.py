@@ -46,23 +46,16 @@ ALL_LED_PINS = [
     LED3_RED, LED3_GREEN, LED3_BLUE,
 ]
 
-# Encoder Configuration
-# Encoder 1: Trading Screen Control
-ENC1_CLK = 22    # Physical pin 15 (S1)
-ENC1_DT = 17     # Physical pin 11 (S2)
-ENC1_SW = 27     # Physical pin 13 (Key/button)
-
-# Encoder 2: Research Screen Control
-ENC2_CLK = 6     # Physical pin 31 (was labeled DT)
-ENC2_DT = 13     # Physical pin 33 (was labeled SW)
-ENC2_SW = 5      # Physical pin 29 (was labeled CLK)
+# Encoder Configuration (single encoder for screen navigation)
+ENC_CLK = 22    # Physical pin 15 (S1)
+ENC_DT = 17     # Physical pin 11 (S2)
+ENC_SW = 27     # Physical pin 13 (Key/button)
 
 ENCODER_PINS = {
-    'trading': {'clk': ENC1_CLK, 'dt': ENC1_DT, 'sw': ENC1_SW},
-    'research': {'clk': ENC2_CLK, 'dt': ENC2_DT, 'sw': ENC2_SW},
+    'main': {'clk': ENC_CLK, 'dt': ENC_DT, 'sw': ENC_SW},
 }
 
-ALL_ENCODER_PINS = [ENC1_CLK, ENC1_DT, ENC1_SW, ENC2_CLK, ENC2_DT, ENC2_SW]
+ALL_ENCODER_PINS = [ENC_CLK, ENC_DT, ENC_SW]
 
 # Color Definitions (which pins to turn ON for each color)
 # For common anode LEDs, pins in list are set LOW (on), others HIGH (off)

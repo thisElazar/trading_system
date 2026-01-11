@@ -45,7 +45,18 @@ env/
 
 # Logs (keep structure, ignore contents)
 logs/*.log
+logs/*.log.*
 *.log
+
+# Trained models (binary, regenerated)
+models/*.pkl
+models/*.joblib
+
+# Backups
+backups/
+
+# Claude Code local settings
+.claude/
 
 # Large data files (keep structure, ignore contents)
 data/historical/
@@ -53,10 +64,15 @@ data/fundamentals/
 data/backups/
 *.parquet
 
-# Databases
+# Databases and SQLite WAL files
 db/*.db
+db/*.db-shm
+db/*.db-wal
+db/screen_cache.json
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 
 # Research checkpoints and logs
 research/discovery/checkpoints/

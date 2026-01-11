@@ -1,0 +1,201 @@
+{
+  "timestamp": "2026-01-09T16:59:29.960609-05:00",
+  "positions": [
+    {
+      "symbol": "AAP",
+      "qty": 35.0,
+      "market_value": 1531.25,
+      "current_price": 43.75,
+      "unrealized_pnl": 87.85
+    },
+    {
+      "symbol": "ADPT",
+      "qty": 121.0,
+      "market_value": 1906.96,
+      "current_price": 15.76,
+      "unrealized_pnl": -131.89
+    },
+    {
+      "symbol": "ALB",
+      "qty": 12.0,
+      "market_value": 1932.3252,
+      "current_price": 161.0271,
+      "unrealized_pnl": 62.1252
+    },
+    {
+      "symbol": "ASML",
+      "qty": 2.0,
+      "market_value": 2543.9,
+      "current_price": 1271.95,
+      "unrealized_pnl": 89.55
+    },
+    {
+      "symbol": "ATRO",
+      "qty": 30.0,
+      "market_value": 2004.6,
+      "current_price": 66.82,
+      "unrealized_pnl": -1.8
+    },
+    {
+      "symbol": "COGT",
+      "qty": 57.0,
+      "market_value": 2014.95,
+      "current_price": 35.35,
+      "unrealized_pnl": -2.85
+    },
+    {
+      "symbol": "COMM",
+      "qty": 112.0,
+      "market_value": 2089.0688,
+      "current_price": 18.6524,
+      "unrealized_pnl": 88.7488
+    },
+    {
+      "symbol": "COST",
+      "qty": 2.0,
+      "market_value": 1848.0,
+      "current_price": 924.0,
+      "unrealized_pnl": -6.0
+    },
+    {
+      "symbol": "CSGS",
+      "qty": 25.0,
+      "market_value": 1987.75,
+      "current_price": 79.51,
+      "unrealized_pnl": 1.0
+    },
+    {
+      "symbol": "HII",
+      "qty": 5.0,
+      "market_value": 1934.95,
+      "current_price": 386.99,
+      "unrealized_pnl": -15.0
+    },
+    {
+      "symbol": "LHX",
+      "qty": 6.0,
+      "market_value": 2014.62,
+      "current_price": 335.77,
+      "unrealized_pnl": 13.5
+    },
+    {
+      "symbol": "LW",
+      "qty": 49.0,
+      "market_value": 2021.4656,
+      "current_price": 41.2544,
+      "unrealized_pnl": 40.8856
+    },
+    {
+      "symbol": "MCHP",
+      "qty": 27.0,
+      "market_value": 2029.59,
+      "current_price": 75.17,
+      "unrealized_pnl": 59.94
+    },
+    {
+      "symbol": "OCUL",
+      "qty": 176.0,
+      "market_value": 2002.88,
+      "current_price": 11.38,
+      "unrealized_pnl": -7.04
+    },
+    {
+      "symbol": "OKLO",
+      "qty": 20.0,
+      "market_value": 2108.8,
+      "current_price": 105.44,
+      "unrealized_pnl": 142.8
+    },
+    {
+      "symbol": "OLMA",
+      "qty": 78.0,
+      "market_value": 2148.12,
+      "current_price": 27.54,
+      "unrealized_pnl": 64.74
+    },
+    {
+      "symbol": "OUST",
+      "qty": 93.0,
+      "market_value": 2604.0,
+      "current_price": 28.0,
+      "unrealized_pnl": -51.15
+    },
+    {
+      "symbol": "OXM",
+      "qty": 59.0,
+      "market_value": 2125.18,
+      "current_price": 36.02,
+      "unrealized_pnl": -8.85
+    },
+    {
+      "symbol": "PARR",
+      "qty": 56.0,
+      "market_value": 2075.92,
+      "current_price": 37.07,
+      "unrealized_pnl": 66.64
+    },
+    {
+      "symbol": "PBF",
+      "qty": 76.0,
+      "market_value": 2485.2,
+      "current_price": 32.7,
+      "unrealized_pnl": 67.64
+    },
+    {
+      "symbol": "SLV",
+      "qty": 3.0,
+      "market_value": 217.29,
+      "current_price": 72.43,
+      "unrealized_pnl": 9.15
+    },
+    {
+      "symbol": "STZ",
+      "qty": 13.0,
+      "market_value": 1907.8657,
+      "current_price": 146.7589,
+      "unrealized_pnl": -11.4543
+    },
+    {
+      "symbol": "UEC",
+      "qty": 114.0,
+      "market_value": 1694.04,
+      "current_price": 14.86,
+      "unrealized_pnl": 60.42
+    },
+    {
+      "symbol": "UVXY",
+      "qty": 56.0,
+      "market_value": 1916.88,
+      "current_price": 34.23,
+      "unrealized_pnl": -62.72
+    },
+    {
+      "symbol": "VIXY",
+      "qty": 78.0,
+      "market_value": 1949.22,
+      "current_price": 24.99,
+      "unrealized_pnl": -40.56
+    },
+    {
+      "symbol": "VLO",
+      "qty": 10.0,
+      "market_value": 1860.54,
+      "current_price": 186.054,
+      "unrealized_pnl": -3.96
+    },
+    {
+      "symbol": "VSAT",
+      "qty": 50.0,
+      "market_value": 2040.0,
+      "current_price": 40.8,
+      "unrealized_pnl": 107.5
+    },
+    {
+      "symbol": "VXX",
+      "qty": 76.0,
+      "market_value": 1959.28,
+      "current_price": 25.78,
+      "unrealized_pnl": -41.04
+    }
+  ]
+}

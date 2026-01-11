@@ -978,6 +978,8 @@ def create_rapid_fitness_function(
     Returns:
         Fitness function that takes genes dict and returns float
     """
+    import math
+
     weights = weights or {
         'sharpe': 0.35,
         'sortino': 0.25,
@@ -985,6 +987,14 @@ def create_rapid_fitness_function(
         'alpha': 0.10,
         'crisis_survival': 0.10,
     }
+
+    # Statistical validity threshold (research recommends 30+ for basic inference)
+    MIN_TRADES_THRESHOLD = 30
+
+    # Fitness ranges:
+    # - 0.0: Strategy crashed or produced no results
+    # - 0.01-0.10: Infeasible (below threshold) - ranked by Deb's feasibility rules
+    # - 0.10-1.0+: Feasible - actual performance with exponential trade factor
 
     def fitness_fn(genes: Dict[str, float]) -> float:
         try:
@@ -997,28 +1007,58 @@ def create_rapid_fitness_function(
                 period_names=period_names
             )
 
-            if not result.results or result.total_trades < 10:
+            # No results at all = crashed strategy
+            if not result.results:
                 return 0.0
 
-            # Calculate weighted fitness
-            fitness = 0.0
+            total_trades = result.total_trades
+
+            # =================================================================
+            # Deb's Feasibility Rules for infeasible solutions
+            # =================================================================
+            # Instead of fitness=0 (death penalty), rank by constraint violation.
+            # This gives the GA gradient information to navigate toward feasibility.
+            # Range: 0.01 (0 trades) to 0.10 (threshold-1 trades)
+            if total_trades < MIN_TRADES_THRESHOLD:
+                # Proxy metric: small score based on how close to threshold
+                # Zero trades gets 0.01, threshold-1 trades gets ~0.10
+                feasibility_score = 0.01 + 0.09 * (total_trades / MIN_TRADES_THRESHOLD)
+                return feasibility_score
+
+            # =================================================================
+            # Feasible solutions: Calculate actual performance fitness
+            # =================================================================
+
+            # Calculate base fitness from performance metrics
+            base_fitness = 0.0
 
             # Sharpe (normalized to ~0-1 range for typical values)
             sharpe_score = max(0, min(1, result.avg_sharpe / 2))
-            fitness += sharpe_score * weights['sharpe']
+            base_fitness += sharpe_score * weights['sharpe']
 
             # Consistency (inverse of variance)
             consistency = result.consistency_score
-            fitness += consistency * weights['consistency']
+            base_fitness += consistency * weights['consistency']
 
             # Alpha (beat market by meaningful amount)
             alpha_score = max(0, min(1, (result.avg_alpha + 10) / 20))
-            fitness += alpha_score * weights['alpha']
+            base_fitness += alpha_score * weights['alpha']
 
             # Crisis survival (not blowing up during crisis)
             if result.crisis_sharpe is not None:
                 crisis_score = max(0, min(1, (result.crisis_sharpe + 1) / 2))
-                fitness += crisis_score * weights['crisis_survival']
+                base_fitness += crisis_score * weights['crisis_survival']
+
+            # =================================================================
+            # Exponential soft penalty for trade count
+            # =================================================================
+            # Even feasible solutions get rewarded for more trades (statistical robustness)
+            # At 30 trades: factor = 0.63, at 60: 0.86, at 90: 0.95
+            trade_factor = 1 - math.exp(-total_trades / MIN_TRADES_THRESHOLD)
+
+            # Final fitness: base performance scaled by trade factor
+            # Minimum 0.10 to ensure feasible always beats infeasible
+            fitness = 0.10 + base_fitness * trade_factor
 
             return fitness
 

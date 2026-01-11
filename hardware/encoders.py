@@ -1,9 +1,7 @@
 """
 Rotary Encoder Input Handler for Trading System
 
-Handles 2 rotary encoders with push buttons:
-- Encoder 1: Trading screen control
-- Encoder 2: Research screen control
+Handles rotary encoder with push button for screen navigation.
 
 Uses gpiod for Pi 5 compatibility with polling-based reading.
 """
@@ -58,16 +56,14 @@ class EncoderHandler:
 
         # State tracking
         self._states: Dict[str, EncoderState] = {
-            'trading': EncoderState(),
-            'research': EncoderState(),
+            'main': EncoderState(),
         }
         self._last_gpio: Dict[int, int] = {}
         self._button_press_time: Dict[str, float] = {}
 
         # Callbacks: Dict[encoder_name, Dict[event_type, List[callbacks]]]
         self._callbacks: Dict[str, Dict[EncoderEvent, List[Callable]]] = {
-            'trading': {e: [] for e in EncoderEvent},
-            'research': {e: [] for e in EncoderEvent},
+            'main': {e: [] for e in EncoderEvent},
         }
 
         # GPIO line request
@@ -204,7 +200,7 @@ class EncoderHandler:
         Register a callback for encoder events.
 
         Args:
-            encoder: 'trading' or 'research'
+            encoder: 'main' (single encoder)
             event: EncoderEvent type to listen for
             callback: Function(encoder_name, event, position) to call
         """

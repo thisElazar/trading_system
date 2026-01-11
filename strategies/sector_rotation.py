@@ -112,6 +112,10 @@ class SectorRotationStrategy(BaseStrategy):
         rebalance_threshold: float = 0.05,  # 5% drift triggers rebalance
         momentum_weight: float = 0.3,  # 30% momentum overlay
         min_days_between_rebalance: int = 5,  # Minimum days between rebalances
+        # BUG-003: GA-optimized parameters (Sharpe -0.38 -> 1.08)
+        momentum_period: int = 105,  # GA optimal: ~5 months lookback
+        top_n_sectors: int = 2,      # GA optimal: concentrate in top 2 sectors
+        rebalance_days: int = 28,    # GA optimal: monthly rebalancing
     ):
         super().__init__(name="sector_rotation")
 
@@ -121,6 +125,11 @@ class SectorRotationStrategy(BaseStrategy):
         self.rebalance_threshold = rebalance_threshold
         self.momentum_weight = momentum_weight
         self.min_days_between_rebalance = min_days_between_rebalance
+
+        # BUG-003: GA-discovered optimal parameters
+        self.momentum_period = momentum_period
+        self.top_n_sectors = top_n_sectors
+        self.rebalance_days = rebalance_days
 
         self.data_mgr = CachedDataManager()
         self.current_regime = None
@@ -139,76 +148,73 @@ class SectorRotationStrategy(BaseStrategy):
         return 'normal'
     
     def calculate_momentum(self, symbol: str, data: pd.DataFrame = None) -> Optional[SectorScore]:
-        """Calculate momentum scores for a sector ETF."""
+        """
+        Calculate momentum scores for a sector ETF.
+
+        BUG-003: Now uses configurable momentum_period (GA optimal: 105 days).
+        """
         if data is None:
             data = self.data_mgr.get_bars(symbol)
-        
-        if data is None or len(data) < 126:  # Need 6 months
+
+        if data is None or len(data) < self.momentum_period:
             return None
-        
+
         close = data['close']
-        
-        # Momentum at different horizons
+
+        # BUG-003: Use single momentum period (GA discovered this beats multi-horizon)
+        # Primary momentum: configurable period (default 105 days = ~5 months)
+        mom_primary = (close.iloc[-1] / close.iloc[-self.momentum_period] - 1) if len(close) >= self.momentum_period else 0
+
+        # Secondary horizons for reference (lower weights)
         mom_1m = (close.iloc[-1] / close.iloc[-21] - 1) if len(close) >= 21 else 0
         mom_3m = (close.iloc[-1] / close.iloc[-63] - 1) if len(close) >= 63 else 0
-        mom_6m = (close.iloc[-1] / close.iloc[-126] - 1) if len(close) >= 126 else 0
-        
-        # Combined score (weight recent momentum more)
-        combined = 0.5 * mom_1m + 0.3 * mom_3m + 0.2 * mom_6m
-        
+
+        # BUG-003: Primary period dominates (GA optimal)
+        combined = 0.7 * mom_primary + 0.2 * mom_3m + 0.1 * mom_1m
+
         return SectorScore(
             symbol=symbol,
             momentum_1m=mom_1m,
             momentum_3m=mom_3m,
-            momentum_6m=mom_6m,
+            momentum_6m=mom_primary,  # Use primary period for 6m slot
             combined_score=combined,
             regime_weight=0  # Set later
         )
     
     def get_target_allocations(self, regime: str, include_momentum: bool = True) -> Dict[str, float]:
         """
-        Get target allocations for current regime, optionally with momentum overlay.
+        Get target allocations for current regime.
+
+        BUG-003: GA optimization discovered that concentrating in top N sectors
+        by momentum dramatically outperforms diversified regime allocation.
+        - Original approach: Spread across all sectors by regime
+        - GA optimal: Select only top 2 sectors by momentum (Sharpe: -0.38 -> 1.08)
         """
         base_alloc = REGIME_ALLOCATIONS.get(regime, REGIME_ALLOCATIONS['normal']).copy()
-        
+
         if not include_momentum:
             return base_alloc
-        
-        # Calculate momentum scores
+
+        # Calculate momentum scores for all sectors
         scores = {}
-        for symbol in base_alloc.keys():
+        for symbol in ALL_SECTOR_ETFS:
             score = self.calculate_momentum(symbol)
             if score:
                 scores[symbol] = score.combined_score
-        
+
         if not scores:
             return base_alloc
-        
-        # Rank by momentum
+
+        # BUG-003: Select only top N sectors by momentum (GA optimal: top 2)
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        n = len(ranked)
-        
-        # Adjust allocations by momentum rank
-        adjusted = base_alloc.copy()
-        
-        for i, (symbol, _) in enumerate(ranked):
-            if symbol not in adjusted:
-                continue
-            
-            # Top quartile gets +20% weight, bottom quartile gets -20%
-            rank_pct = i / n
-            if rank_pct < 0.25:
-                adjustment = self.momentum_weight
-            elif rank_pct > 0.75:
-                adjustment = -self.momentum_weight
-            else:
-                adjustment = 0
-            
-            adjusted[symbol] = adjusted[symbol] * (1 + adjustment)
-        
-        # Normalize to sum to 1
-        total = sum(adjusted.values())
-        return {s: w / total for s, w in adjusted.items()}
+        top_sectors = [symbol for symbol, _ in ranked[:self.top_n_sectors]]
+
+        logger.debug(f"BUG-003: Top {self.top_n_sectors} sectors by momentum: {top_sectors}")
+
+        # Equal weight among top sectors (GA discovered this beats regime weighting)
+        equal_weight = 1.0 / self.top_n_sectors
+
+        return {symbol: equal_weight for symbol in top_sectors}
     
     def check_drift(self, targets: Dict[str, float]) -> Tuple[bool, Dict[str, float]]:
         """
@@ -241,12 +247,15 @@ class SectorRotationStrategy(BaseStrategy):
     def can_rebalance(self, current_date: datetime) -> bool:
         """
         Check if enough time has passed since last rebalance.
+
+        BUG-003: Uses GA-optimized rebalance_days (default 28 = monthly).
         """
         if self.last_rebalance is None:
             return True
 
         days_since = (current_date - self.last_rebalance).days
-        return days_since >= self.min_days_between_rebalance
+        # BUG-003: Use rebalance_days (GA optimal: 28 days = monthly)
+        return days_since >= self.rebalance_days
 
     def generate_signals(
         self,

@@ -2244,6 +2244,20 @@ class DailyOrchestrator:
                 logger.warning("Nightly research script not found")
                 return False
 
+            # Check for orphaned research processes before starting
+            # This prevents deadlocks from multiple research processes competing
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", "run_nightly_research.py"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    existing_pids = result.stdout.strip().split('\n')
+                    logger.warning(f"Research already running (PIDs: {', '.join(existing_pids)}) - skipping new launch")
+                    return True
+            except Exception as e:
+                logger.debug(f"pgrep check failed (non-critical): {e}")
+
             # Pre-flight system check - wait for memory and load to be reasonable
             self._preflight_system_check(min_memory_mb=1500, max_load=3.0)
 
@@ -3941,6 +3955,23 @@ class DailyOrchestrator:
         """Run extended weekend research with configurable parameters."""
         try:
             logger.info("Starting weekend research...")
+
+            # Check for orphaned research processes before starting
+            # This prevents deadlocks from multiple research processes competing
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", "run_nightly_research.py"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    existing_pids = result.stdout.strip().split('\n')
+                    logger.warning(f"Research already running (PIDs: {', '.join(existing_pids)}) - skipping new launch")
+                    # Update state to reflect existing process
+                    self.state.weekend_research_progress['status'] = 'running'
+                    self.state.weekend_research_progress['pid'] = int(existing_pids[0])
+                    return True
+            except Exception as e:
+                logger.debug(f"pgrep check failed (non-critical): {e}")
 
             # Pre-flight system check - wait for memory and load to be reasonable
             self._preflight_system_check(min_memory_mb=1500, max_load=3.0)

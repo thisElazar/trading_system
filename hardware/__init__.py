@@ -29,7 +29,7 @@ Usage:
     hw.leds.set_status('trading', 'active')
 
     # Register encoder callbacks
-    hw.encoders.on_click('trading', lambda e, ev, pos: print(f"Clicked!"))
+    hw.encoders.on_click('main', lambda e, ev, pos: print(f"Clicked!"))
 
     # Clean shutdown
     hw.shutdown()

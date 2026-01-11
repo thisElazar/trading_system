@@ -40,6 +40,7 @@ class FitnessVector:
     - cvar_95: Conditional Value at Risk at 95% (minimize)
     - novelty: Behavioral novelty score (maximize)
     - deflated_sharpe: DSR corrected for multiple testing (informational)
+    - calmar: Calmar ratio CAGR/|MaxDD| (GP-009: critical for swing trading)
 
     Constraints:
     - trades: Total number of trades (for constraint checking)
@@ -50,6 +51,7 @@ class FitnessVector:
     cvar_95: float           # Negative (e.g., -0.02 for -2% expected loss)
     novelty: float           # 0 to infinity
     deflated_sharpe: float   # 0 to 1 (probability Sharpe is not due to luck)
+    calmar: float = 0.0      # GP-009: Calmar ratio (CAGR / |MaxDD|)
 
     # Constraints (not optimized, used for filtering)
     trades: int = 0
@@ -102,7 +104,40 @@ class FitnessVector:
         return (f"FitnessVector(sortino={self.sortino:.3f}, "
                 f"max_dd={self.max_drawdown:.1f}%, "
                 f"cvar={self.cvar_95:.3f}, "
+                f"calmar={self.calmar:.3f}, "
                 f"novelty={self.novelty:.3f})")
+
+
+def calculate_calmar_ratio(returns: pd.Series, max_drawdown_pct: float) -> float:
+    """
+    Calculate Calmar Ratio (CAGR / |MaxDD|).
+
+    GP-009: Critical for swing trading where drawdown survival matters
+    more than volatility smoothness.
+
+    Args:
+        returns: Series of period returns
+        max_drawdown_pct: Maximum drawdown as negative percentage (e.g., -15.0)
+
+    Returns:
+        Calmar ratio (higher is better)
+    """
+    if len(returns) < 20 or max_drawdown_pct >= 0:
+        return 0.0
+
+    # Calculate annualized return (CAGR approximation)
+    total_return = (1 + returns).prod() - 1
+    n_years = len(returns) / 252
+    if n_years <= 0:
+        return 0.0
+
+    cagr = (1 + total_return) ** (1 / n_years) - 1
+
+    # Calmar = CAGR / |MaxDD|
+    calmar = cagr / abs(max_drawdown_pct / 100)
+
+    # Clamp extreme values
+    return float(max(-5.0, min(10.0, calmar))) if not np.isnan(calmar) else 0.0
 
 
 def calculate_sortino_ratio(returns: pd.Series, target_return: float = 0.0,
@@ -294,12 +329,16 @@ def calculate_fitness_vector(
         kurtosis=kurt
     )
 
+    # GP-009: Calmar ratio for swing trading risk assessment
+    calmar = calculate_calmar_ratio(returns, max_dd)
+
     return FitnessVector(
         sortino=sortino,
         max_drawdown=max_dd,  # Already negative or zero
         cvar_95=cvar,
         novelty=novelty_score,
         deflated_sharpe=dsr,
+        calmar=calmar,
         trades=result.total_trades,
         win_rate=result.win_rate,
         sharpe=sharpe

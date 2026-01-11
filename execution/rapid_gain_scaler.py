@@ -327,7 +327,7 @@ class RapidGainScaler:
         profit_locked: float,
         gain_pct: float
     ) -> None:
-        """Record the trim as a trade in the trades table."""
+        """Record the trim as a trade in the trades table using original strategy."""
         try:
             import sqlite3
 
@@ -340,6 +340,15 @@ class RapidGainScaler:
             now = datetime.now().isoformat()
             pnl_percent = gain_pct * 100
 
+            # Look up original strategy from positions table
+            cursor.execute("""
+                SELECT strategy_name FROM positions
+                WHERE symbol = ? AND status = 'open'
+                LIMIT 1
+            """, (symbol,))
+            row = cursor.fetchone()
+            original_strategy = row[0] if row else 'unknown'
+
             cursor.execute("""
                 INSERT INTO trades (
                     timestamp, symbol, strategy, side, quantity,
@@ -348,7 +357,7 @@ class RapidGainScaler:
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                now, symbol, 'rapid_gain_scale', 'SELL', shares_trimmed,
+                now, symbol, original_strategy, 'SELL', shares_trimmed,
                 entry_price, exit_price, now,
                 profit_locked, pnl_percent, 'CLOSED', 'rapid_gain_trim',
                 now, now
@@ -357,10 +366,64 @@ class RapidGainScaler:
             conn.commit()
             conn.close()
 
-            logger.info(f"Recorded trim trade for {symbol}: {shares_trimmed} shares, P&L ${profit_locked:.2f}")
+            # Update strategy stats
+            self._update_strategy_stats(original_strategy, profit_locked, gain_pct)
+
+            logger.info(f"Recorded trim trade for {symbol} ({original_strategy}): {shares_trimmed} shares, P&L ${profit_locked:.2f}")
 
         except Exception as e:
             logger.warning(f"Failed to record trim trade for {symbol}: {e}")
+
+    def _update_strategy_stats(
+        self,
+        strategy: str,
+        pnl: float,
+        pnl_pct: float
+    ) -> None:
+        """Update strategy performance stats after a trim."""
+        try:
+            import sqlite3
+            from config import DATABASES
+
+            perf_db = DATABASES.get('performance')
+            if not perf_db:
+                return
+
+            is_win = pnl > 0
+            conn = sqlite3.connect(str(perf_db))
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+
+            cursor.execute("""
+                INSERT INTO strategy_stats (strategy, total_trades, winning_trades, losing_trades,
+                                           total_pnl, last_trade_date, updated_at)
+                VALUES (?, 1, ?, ?, ?, ?, ?)
+                ON CONFLICT(strategy) DO UPDATE SET
+                    total_trades = total_trades + 1,
+                    winning_trades = winning_trades + ?,
+                    losing_trades = losing_trades + ?,
+                    total_pnl = total_pnl + ?,
+                    avg_pnl = (total_pnl + ?) / (total_trades + 1),
+                    win_rate = CAST(winning_trades + ? AS REAL) / (total_trades + 1),
+                    best_trade = MAX(best_trade, ?),
+                    worst_trade = MIN(worst_trade, ?),
+                    last_trade_date = ?,
+                    updated_at = ?
+            """, (
+                strategy,
+                1 if is_win else 0, 0 if is_win else 1, pnl, now, now,
+                1 if is_win else 0, 0 if is_win else 1, pnl, pnl,
+                1 if is_win else 0,
+                pnl if pnl > 0 else None,
+                pnl if pnl < 0 else None,
+                now, now
+            ))
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            logger.warning(f"Failed to update strategy stats: {e}")
 
     def _update_position_after_trim(
         self,

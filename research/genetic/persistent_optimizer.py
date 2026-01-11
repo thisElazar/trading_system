@@ -23,6 +23,9 @@ Usage:
 """
 
 import logging
+import multiprocessing as mp
+import time
+from multiprocessing import Pool
 from typing import Dict, List, Callable, Optional, Tuple
 from dataclasses import asdict
 from pathlib import Path
@@ -38,6 +41,12 @@ from research.genetic.fitness_utils import calculate_composite_fitness
 from data.storage.db_manager import get_db
 
 logger = logging.getLogger(__name__)
+
+
+# Module-level function for pool warmup (lambdas can't be pickled)
+def _warmup_worker(worker_id: int) -> bool:
+    """Dummy function to trigger worker initialization."""
+    return True
 
 
 # ============================================================================
@@ -76,6 +85,10 @@ CONSTRAINT_THRESHOLDS = {
 # Minimum fitness for "rejected" individuals - allows some selection pressure
 # while maintaining diversity. Set to small positive value instead of 0.
 REJECTION_FITNESS = 0.01
+
+# Maximum fitness for infeasible solutions (Deb's feasibility rules)
+# Feasible solutions always beat infeasible, so we cap infeasible at this value
+MAX_INFEASIBLE_FITNESS = 0.10
 
 # Map strategies to constraint profiles
 STRATEGY_CONSTRAINT_PROFILE = {
@@ -141,13 +154,19 @@ def apply_fitness_constraints(
         low_trades_scaled = thresholds['low_trades']
 
     # ========================================================================
-    # HARD CONSTRAINTS - Return small positive fitness (not 0)
-    # This maintains diversity while strongly penalizing poor performers
+    # HARD CONSTRAINTS - Apply Deb's feasibility rules
+    # Instead of flat rejection, rank by constraint violation magnitude.
+    # This gives the GA gradient information to navigate toward feasibility.
+    # Fitness range for infeasible: 0.01 to 0.10
     # ========================================================================
 
     # Minimum trades for statistical significance
+    # Use Deb's feasibility rules: rank infeasible by how close to threshold
     if result.total_trades < min_trades_scaled:
-        return REJECTION_FITNESS, f"Low fitness: Only {result.total_trades} trades (min {min_trades_scaled})"
+        # Scale from REJECTION_FITNESS (0 trades) to MAX_INFEASIBLE_FITNESS (threshold-1)
+        trade_ratio = result.total_trades / min_trades_scaled
+        infeasible_fitness = REJECTION_FITNESS + (MAX_INFEASIBLE_FITNESS - REJECTION_FITNESS) * trade_ratio
+        return infeasible_fitness, f"Low fitness: Only {result.total_trades} trades (min {min_trades_scaled})"
 
     # Maximum drawdown (catastrophic loss prevention)
     if result.max_drawdown_pct < thresholds['max_drawdown']:
@@ -298,6 +317,153 @@ class PersistentGAOptimizer:
 
         # Adaptive mutation tracking
         self._current_mutation_rate = self.BASE_MUTATION_RATE
+
+        # Persistent pool management
+        self._pool: Optional[Pool] = None
+        self._pool_initialized: bool = False
+        self._n_workers: int = self.config.n_workers if self.config.parallel else 1
+
+    # =========================================================================
+    # Persistent Pool Management
+    # =========================================================================
+
+    def init_pool(self, stagger_delay: float = 3.0) -> bool:
+        """
+        Initialize persistent worker pool for parallel fitness evaluation.
+
+        Call this once before evolve_incremental() when using parallel evaluation.
+        Pool will be reused across all generations in the session.
+
+        Args:
+            stagger_delay: Seconds between starting each worker (prevents memory stampede)
+
+        Returns:
+            True if pool started successfully, False otherwise
+        """
+        if self._pool_initialized:
+            logger.debug("Pool already initialized")
+            return True
+
+        if not self.config.parallel:
+            logger.debug("Parallel mode disabled, skipping pool init")
+            return True
+
+        try:
+            logger.info(f"Starting persistent pool with {self._n_workers} workers...")
+
+            # CRITICAL: Close database connections before fork to prevent SQLite deadlock
+            from data.storage.db_manager import get_db
+            get_db().close_thread_connections()
+
+            # Import worker initializer from run_nightly_research
+            from run_nightly_research import _init_parallel_worker
+
+            # Use fork context for shared globals (Linux)
+            ctx = mp.get_context('fork')
+
+            self._pool = ctx.Pool(
+                processes=self._n_workers,
+                initializer=_init_parallel_worker
+            )
+
+            # Stagger worker initialization - each worker imports heavy libs on first task
+            logger.info("Warming up workers with staggered initialization...")
+            for i in range(self._n_workers):
+                # Dummy task to trigger worker initialization (uses module-level function for pickling)
+                self._pool.apply(_warmup_worker, args=(i,))
+                logger.debug(f"Worker {i+1}/{self._n_workers} initialized")
+                if i < self._n_workers - 1:
+                    time.sleep(stagger_delay)
+
+            self._pool_initialized = True
+            logger.info("Persistent pool started successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to initialize pool: {e}")
+            self._pool = None
+            self._pool_initialized = False
+            return False
+
+    def shutdown_pool(self, wait: bool = True) -> None:
+        """
+        Shutdown the persistent worker pool.
+
+        Args:
+            wait: If True, wait for workers to finish. If False, terminate immediately.
+        """
+        if not self._pool_initialized or self._pool is None:
+            return
+
+        logger.info("Shutting down persistent pool...")
+
+        try:
+            if wait:
+                self._pool.close()
+                self._pool.join()
+            else:
+                self._pool.terminate()
+        except Exception as e:
+            logger.warning(f"Error shutting down pool: {e}")
+        finally:
+            self._pool = None
+            self._pool_initialized = False
+            logger.info("Pool shutdown complete")
+
+    def __enter__(self):
+        """Context manager entry - initialize pool."""
+        self.init_pool()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - shutdown pool."""
+        self.shutdown_pool()
+        return False  # Don't suppress exceptions
+
+    def _evaluate_population_with_pool(self, individuals: List[Individual]) -> None:
+        """
+        Evaluate fitness for individuals using the persistent pool.
+
+        Uses the internal pool if initialized, otherwise falls back to
+        the optimizer's built-in parallel evaluation.
+
+        Args:
+            individuals: List of individuals to evaluate
+        """
+        # Filter to only evaluate individuals that need evaluation
+        to_evaluate = [(i, ind) for i, ind in enumerate(individuals) if ind.fitness == 0]
+
+        if not to_evaluate:
+            return
+
+        if not self._pool_initialized or self._pool is None:
+            # Fallback to optimizer's method (creates temp pool)
+            logger.debug("Pool not initialized, using fallback evaluation")
+            if self.config.parallel:
+                self.optimizer._evaluate_population_parallel(individuals)
+            else:
+                self.optimizer._evaluate_population_sequential(individuals)
+            return
+
+        logger.info(f"Evaluating {len(to_evaluate)} individuals with persistent pool")
+
+        try:
+            # Import the module-level parallel evaluation function
+            from run_nightly_research import evaluate_genes_parallel
+
+            # Map genes to fitness values using persistent pool
+            genes_list = [ind.genes for _, ind in to_evaluate]
+            results = self._pool.map(evaluate_genes_parallel, genes_list)
+
+            # Apply results
+            for (idx, ind), fitness in zip(to_evaluate, results):
+                individuals[idx].fitness = fitness if fitness is not None else float('-inf')
+
+            logger.info(f"Persistent pool evaluation completed: {len(results)} individuals")
+
+        except Exception as e:
+            logger.warning(f"Persistent pool evaluation failed ({e}), falling back to sequential")
+            self.optimizer._evaluate_population_sequential(individuals)
 
     # =========================================================================
     # Anti-Stagnation Methods
@@ -642,12 +808,8 @@ class PersistentGAOptimizer:
                 for _ in range(self.config.population_size)
             ]
             
-            # Evaluate initial population (parallel if enabled)
-            if self.config.parallel:
-                self.optimizer._evaluate_population_parallel(self.optimizer.population)
-            else:
-                for ind in self.optimizer.population:
-                    ind.fitness = self.optimizer._evaluate_fitness(ind)
+            # Evaluate initial population (uses persistent pool if available)
+            self._evaluate_population_with_pool(self.optimizer.population)
             
             self.optimizer.best_individual = max(
                 self.optimizer.population, 
@@ -684,13 +846,8 @@ class PersistentGAOptimizer:
                 self.current_generation
             )
 
-            # Evaluate new individuals (parallel if enabled)
-            if self.config.parallel:
-                self.optimizer._evaluate_population_parallel(self.optimizer.population)
-            else:
-                for ind in self.optimizer.population:
-                    if ind.fitness == 0:
-                        ind.fitness = self.optimizer._evaluate_fitness(ind)
+            # Evaluate new individuals (uses persistent pool if available)
+            self._evaluate_population_with_pool(self.optimizer.population)
 
             # Log fitness summary for this generation
             fitnesses = [ind.fitness for ind in self.optimizer.population]
@@ -718,12 +875,7 @@ class PersistentGAOptimizer:
 
             # Re-evaluate injected individuals
             if n_injected > 0:
-                if self.config.parallel:
-                    self.optimizer._evaluate_population_parallel(self.optimizer.population)
-                else:
-                    for ind in self.optimizer.population:
-                        if ind.fitness == 0:
-                            ind.fitness = self.optimizer._evaluate_fitness(ind)
+                self._evaluate_population_with_pool(self.optimizer.population)
 
             # Find generation best
             gen_best = max(self.optimizer.population, key=lambda x: x.fitness)
@@ -754,12 +906,7 @@ class PersistentGAOptimizer:
             # If stagnating for too long despite all measures, reset population
             if self._hard_reset_population(self.current_generation):
                 # Re-evaluate the new population
-                if self.config.parallel:
-                    self.optimizer._evaluate_population_parallel(self.optimizer.population)
-                else:
-                    for ind in self.optimizer.population:
-                        if ind.fitness == 0:
-                            ind.fitness = self.optimizer._evaluate_fitness(ind)
+                self._evaluate_population_with_pool(self.optimizer.population)
 
             # === ADAPTIVE MUTATION ===
             # Increase mutation rate when stagnating, reset when improving

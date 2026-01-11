@@ -512,20 +512,21 @@ class ScreenController:
         if vix > 0:
             self._prev_vix = vix
 
-        # Header shows phase and time remaining
-        # Add staleness indicator if data is old
+        # Header always shows phase and countdown to next phase
+        header = f"{phase_short} ({time_remaining})"
+
+        # Show staleness indicator on time line if data is old
         data_age = self._get_trading_data_age_str()
         if data_age in ("live", "no data"):
-            header = f"{phase_short} ({time_remaining})"
+            time_line = f"Time: {now}"
         else:
-            # Show staleness in header for market data
-            header = f"{phase_short} [{data_age}]"
+            time_line = f"{now} [{data_age}]"
 
         lines = [
             header.center(20),
             f"SPY: ${spy:.2f} {spy_arrow}",
             f"VIX: {vix:.1f} {vix_arrow}",
-            f"Time: {now}"
+            time_line
         ]
         self._screen.write_all(lines)
 
@@ -908,11 +909,12 @@ class ScreenController:
                     today = date.today().isoformat()
 
                     # Get the MOST RECENT ga_history entry (current strategy being evolved)
+                    # Use generation DESC as tiebreaker when multiple gens have same timestamp
                     cursor = conn.execute("""
                         SELECT strategy, generation, best_fitness, created_at
                         FROM ga_history
                         WHERE run_date = ?
-                        ORDER BY created_at DESC
+                        ORDER BY created_at DESC, generation DESC
                         LIMIT 1
                     """, (today,))
                     latest = cursor.fetchone()
@@ -941,15 +943,69 @@ class ScreenController:
                                     'last_update': latest['created_at'],
                                 })
                         else:
-                            # Database says running but no recent writes - stalled/orphaned
-                            with self._lock:
-                                self._research_stats.update({
-                                    'status': 'STALLED',
-                                    'strategy': '',
-                                    'generation': 0,
-                                    'best_sharpe': 0.0,
-                                    'last_update': latest['created_at'],
-                                })
+                            # GA history is stale - check if discovery phase is active
+                            # Discovery phase writes to evolution_history, not ga_history
+                            discovery_active = False
+                            try:
+                                cursor = conn.execute("""
+                                    SELECT generation, best_sortino, created_at
+                                    FROM evolution_history
+                                    ORDER BY created_at DESC
+                                    LIMIT 1
+                                """)
+                                discovery_row = cursor.fetchone()
+                                if discovery_row and discovery_row['created_at']:
+                                    disc_write = datetime.fromisoformat(discovery_row['created_at'])
+                                    disc_age = (datetime.utcnow() - disc_write).total_seconds()
+                                    if disc_age < self._research_stale_threshold:
+                                        discovery_active = True
+                                        with self._lock:
+                                            self._research_stats.update({
+                                                'status': 'EVOLVING',
+                                                'strategy': 'GP-Discovery',
+                                                'generation': discovery_row['generation'] or 0,
+                                                'best_sharpe': round(discovery_row['best_sortino'] or 0, 2),
+                                                'last_update': discovery_row['created_at'],
+                                            })
+                            except Exception:
+                                pass  # Table might not exist
+
+                            if not discovery_active:
+                                # Check if research process is actively computing
+                                # (high CPU = computing, not stalled)
+                                research_computing = False
+                                try:
+                                    for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent']):
+                                        cmdline = proc.info.get('cmdline') or []
+                                        if any('run_nightly_research.py' in arg for arg in cmdline):
+                                            # Get CPU over short interval
+                                            cpu = proc.cpu_percent(interval=0.1)
+                                            if cpu > 5.0:  # >5% CPU = actively computing
+                                                research_computing = True
+                                                break
+                                except Exception:
+                                    pass
+
+                                if research_computing:
+                                    # Show as computing (between phases or slow evaluation)
+                                    with self._lock:
+                                        self._research_stats.update({
+                                            'status': 'EVOLVING',
+                                            'strategy': 'Computing...',
+                                            'generation': latest['generation'] or 0,
+                                            'best_sharpe': round(latest['best_fitness'] or 0, 2),
+                                            'last_update': latest['created_at'],
+                                        })
+                                else:
+                                    # Neither active DB writes nor CPU - truly stalled
+                                    with self._lock:
+                                        self._research_stats.update({
+                                            'status': 'STALLED',
+                                            'strategy': '',
+                                            'generation': 0,
+                                            'best_sharpe': 0.0,
+                                            'last_update': latest['created_at'],
+                                        })
                     else:
                         # No ga_history entries yet - research just started
                         with self._lock:

@@ -468,17 +468,29 @@ class MultiScaleFitnessCalculator:
         weights: FitnessWeights
     ) -> float:
         """Apply penalties for undesirable characteristics."""
+        import math
+
         fitness = base_fitness
 
         if not all_results:
             return 0.0
 
-        # Low trades penalty
+        # Statistical validity threshold (research recommends 30+ for basic inference)
+        MIN_TRADES_THRESHOLD = 30
+
+        # Low trades penalty using exponential soft penalty
+        # Instead of hard thresholds, use continuous penalty that rewards more trades
         total_trades = sum(r.total_trades for r in all_results)
-        if total_trades < 10:
-            fitness *= (1 - weights.low_trades_penalty)
-        elif total_trades < 20:
-            fitness *= (1 - weights.low_trades_penalty / 2)
+        if total_trades < MIN_TRADES_THRESHOLD:
+            # Deb's feasibility rules: rank by constraint violation
+            # Scale fitness down proportionally to how far below threshold
+            trade_factor = total_trades / MIN_TRADES_THRESHOLD
+            fitness *= trade_factor
+        else:
+            # Exponential soft penalty - still reward more trades for statistical robustness
+            # At 30 trades: factor = 0.63, at 60: 0.86, at 90: 0.95
+            trade_factor = 1 - math.exp(-total_trades / MIN_TRADES_THRESHOLD)
+            fitness *= trade_factor
 
         # High drawdown penalty
         worst_dd = min(r.max_drawdown for r in all_results)

@@ -1,0 +1,11 @@
+============================================================
+WEEKLY PERFORMANCE REPORT
+Week ending: 2026-01-10
+============================================================
+
+Total trades this week: 16
+
+Strategy Performance:
+  No strategy performance data available
+
+============================================================

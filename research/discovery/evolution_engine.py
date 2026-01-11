@@ -173,7 +173,8 @@ class EvolutionEngine:
         use_portfolio_fitness: bool = True,
         use_fast_backtester: bool = False,
         enable_diversity_monitor: bool = True,
-        enable_map_elites: bool = True
+        enable_map_elites: bool = True,
+        promotion_pipeline=None
     ):
         """
         Initialize evolution engine.
@@ -187,9 +188,11 @@ class EvolutionEngine:
             use_fast_backtester: Use FastBacktester for faster GA iterations (default False)
             enable_diversity_monitor: Enable auto-intervention for diversity (default True)
             enable_map_elites: Enable MAP-Elites grid for quality-diversity (default True)
+            promotion_pipeline: PromotionPipeline instance for registering candidates (optional)
         """
         self.config = config or EvolutionConfig()
         self.data_loader = data_loader
+        self.promotion_pipeline = promotion_pipeline
 
         # Choose backtester - FastBacktester is ~2-5x faster but slightly less accurate
         if backtester:
@@ -786,14 +789,36 @@ class EvolutionEngine:
         return True  # Continue evolution
 
     def _tournament_select(self, candidates: List[StrategyGenome]) -> StrategyGenome:
-        """Tournament selection."""
+        """
+        Tournament selection with GP-012 adaptive novelty weighting.
+
+        During fitness plateaus, novelty weight is elevated to encourage
+        exploration of diverse strategies.
+        """
         tournament = random.sample(
             candidates,
             min(self.config.tournament_size, len(candidates))
         )
-        return max(
-            tournament,
-            key=lambda g: self.fitness_cache.get(g.genome_id, FitnessVector(0, 0, 0, 0, 0)).sortino
+
+        # GP-012: Get effective novelty weight (elevated during plateaus)
+        if self.diversity_monitor is not None:
+            novelty_weight = self.diversity_monitor.get_effective_novelty_weight(
+                base_weight=self.config.novelty_weight,
+                plateau_weight=self.config.novelty_weight_plateau
+            )
+        else:
+            novelty_weight = self.config.novelty_weight
+
+        fitness_weight = 1.0 - novelty_weight
+
+        def weighted_score(genome):
+            fitness = self.fitness_cache.get(genome.genome_id, FitnessVector(0, 0, 0, 0, 0))
+            # Weighted combination of normalized sortino and novelty
+            # Sortino normalized to roughly 0-1 range (typical good range: -2 to 5)
+            normalized_sortino = max(0, min(1, (fitness.sortino + 2) / 7))
+            return fitness_weight * normalized_sortino + novelty_weight * fitness.novelty
+
+        return max(tournament, key=weighted_score
         )
 
     def _update_pareto_front(self):
@@ -1088,6 +1113,22 @@ class EvolutionEngine:
                     self.strategies_promoted += 1
                     logger.info(f"Promoted strategy {genome.genome_id}: "
                                f"Sortino={fitness.sortino:.2f}, DSR={fitness.deflated_sharpe:.2f}")
+
+                    # Register with promotion pipeline for lifecycle tracking
+                    if self.promotion_pipeline is not None:
+                        try:
+                            self.promotion_pipeline.register_candidate(
+                                strategy_id=genome.genome_id,
+                                generation=self.current_generation,
+                                sharpe=fitness.sharpe,
+                                sortino=fitness.sortino,
+                                max_drawdown=fitness.max_drawdown,
+                                trades=fitness.trades,
+                                deflated_sharpe=fitness.deflated_sharpe,
+                                genome_json=json.dumps(self.factory.serialize_genome(genome))
+                            )
+                        except Exception as pp_err:
+                            logger.warning(f"Failed to register with promotion pipeline: {pp_err}")
 
                     # Add to portfolio evaluator for future marginal calculations
                     if self.portfolio_evaluator is not None and genome.backtest_result:
