@@ -2,6 +2,27 @@
 
 Automated trading system on Raspberry Pi 5. Paper trading via Alpaca.
 
+## Timezone Convention
+
+**ALWAYS include timezone when discussing times.** The user is in Pacific Time (PT).
+
+| Context | Timezone | Examples |
+|---------|----------|----------|
+| Market hours | Eastern (ET) | "Market opens 9:30 AM ET" |
+| Database storage | UTC | research.db timestamps are UTC |
+| User's local | Pacific (PT) | "It's 10:52 PM PT" |
+| Cron/systemd timers | System local (PT) | Pi is set to America/Los_Angeles |
+
+**Quick Reference:**
+- Market open: 9:30 AM ET = 6:30 AM PT
+- Market close: 4:00 PM ET = 1:00 PM PT
+- Overnight research: Starts after 8:00 PM ET = 5:00 PM PT
+
+**Code Policy (from `utils/timezone.py`):**
+- Internal data: UTC-naive timestamps (no timezone info, interpreted as UTC)
+- Display/market logic: Eastern time via `now_eastern()`, `is_market_hours()`
+- Always use `from utils.timezone import ...` for new code
+
 ## Critical Safety Rules
 
 1. **Never modify config.py without explicit approval** - affects live trading
