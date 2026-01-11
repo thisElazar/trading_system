@@ -211,9 +211,9 @@ class UnifiedDataLoader:
         alpaca_df = alpaca_df[alpaca_cols].copy()
 
         # Use Yahoo as base (extended history)
-        # Add any more recent Alpaca data
-        yahoo_max = yahoo_df['timestamp'].max()
-        alpaca_new = alpaca_df[alpaca_df['timestamp'] > yahoo_max]
+        # Add any more recent Alpaca data - compare by DATE to avoid timezone duplicates
+        yahoo_max_date = yahoo_df['timestamp'].dt.date.max()
+        alpaca_new = alpaca_df[alpaca_df['timestamp'].dt.date > yahoo_max_date]
 
         if not alpaca_new.empty:
             merged = pd.concat([yahoo_df, alpaca_new], ignore_index=True)
