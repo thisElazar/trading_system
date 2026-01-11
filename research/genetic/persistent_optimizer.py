@@ -257,8 +257,9 @@ class PersistentGAOptimizer:
     BASE_MUTATION_RATE = 0.15             # Reset to this when improvement found
 
     # Hard reset settings (last resort for deeply stuck populations)
-    HARD_RESET_THRESHOLD = 10             # Reset population after 10 gens without improvement
-    HARD_RESET_PRESERVE_ELITES = 2        # Keep top N individuals during reset
+    # Note: This now uses CROSS-SESSION stagnation tracking
+    HARD_RESET_THRESHOLD = 50             # Reset population after 50 gens without improvement
+    HARD_RESET_PRESERVE_RATIO = 0.20      # Keep top 20% of individuals during reset
 
     def __init__(
         self,
@@ -314,6 +315,9 @@ class PersistentGAOptimizer:
         self.generations_without_improvement = 0
         self.best_ever_fitness = float('-inf')
         self.best_ever_genes = None
+
+        # Cross-session stagnation tracking
+        self.cross_session_stagnation = 0
 
         # Adaptive mutation tracking
         self._current_mutation_rate = self.BASE_MUTATION_RATE
@@ -644,12 +648,59 @@ class PersistentGAOptimizer:
 
         return self._current_mutation_rate
 
+    def _check_cross_session_stagnation(self) -> int:
+        """
+        Check how many generations this strategy has been stuck across all sessions.
+
+        Queries the database to find:
+        1. The best fitness ever achieved
+        2. When that best fitness was first achieved
+        3. How many generations have passed since then
+
+        Returns:
+            Number of generations without improvement
+        """
+        try:
+            # Use raw SQL for efficiency
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+
+            # Get the best fitness ever and max generation
+            cursor.execute("""
+                SELECT MAX(best_fitness), MAX(generation)
+                FROM ga_history
+                WHERE strategy = ? AND generation >= 0
+            """, (self.strategy_name,))
+            row = cursor.fetchone()
+
+            if row is None or row[0] is None:
+                return 0
+
+            best_ever, max_gen = row
+
+            # Find when we first achieved this best fitness
+            cursor.execute("""
+                SELECT MIN(generation)
+                FROM ga_history
+                WHERE strategy = ? AND best_fitness = ? AND generation >= 0
+            """, (self.strategy_name, best_ever))
+            first_best_gen = cursor.fetchone()[0] or max_gen
+
+            generations_stuck = max_gen - first_best_gen
+            self.cross_session_stagnation = generations_stuck
+
+            return generations_stuck
+
+        except Exception as e:
+            logger.warning(f"Error checking cross-session stagnation: {e}")
+            return 0
+
     def _hard_reset_population(self, generation: int) -> bool:
         """
         Reset the entire population except elites - last resort for deep stagnation.
 
-        This is triggered after HARD_RESET_THRESHOLD generations without improvement,
-        when all other anti-stagnation measures have failed.
+        This is triggered after HARD_RESET_THRESHOLD generations without improvement
+        ACROSS ALL SESSIONS, when all other anti-stagnation measures have failed.
 
         Args:
             generation: Current generation number
@@ -657,21 +708,25 @@ class PersistentGAOptimizer:
         Returns:
             True if reset was performed
         """
-        if self.generations_without_improvement < self.HARD_RESET_THRESHOLD:
+        # Check cross-session stagnation (not just within-session)
+        cross_session_stuck = self._check_cross_session_stagnation()
+
+        if cross_session_stuck < self.HARD_RESET_THRESHOLD:
             return False
 
         logger.warning(
-            f"  🔄 HARD RESET: {self.generations_without_improvement} generations "
-            f"without improvement - resetting population"
+            f"  HARD RESET: {self.strategy_name} stuck for {cross_session_stuck} generations "
+            f"(threshold: {self.HARD_RESET_THRESHOLD}) - resetting population"
         )
 
-        # Preserve elite individuals
+        # Preserve elite individuals (percentage-based)
         sorted_pop = sorted(
             self.optimizer.population,
             key=lambda x: x.fitness,
             reverse=True
         )
-        elites = sorted_pop[:self.HARD_RESET_PRESERVE_ELITES]
+        n_elites = max(2, int(len(sorted_pop) * self.HARD_RESET_PRESERVE_RATIO))
+        elites = sorted_pop[:n_elites]
 
         # Create fresh random population
         new_population = list(elites)  # Start with elites
@@ -684,12 +739,24 @@ class PersistentGAOptimizer:
         # Replace population
         self.optimizer.population = new_population
 
-        # Reset stagnation counter (give fresh population a chance)
+        # Reset stagnation counters (give fresh population a chance)
         self.generations_without_improvement = 0
+        self.cross_session_stagnation = 0
 
         # Reset mutation rate to base
         self._current_mutation_rate = self.BASE_MUTATION_RATE
         self.config.mutation_rate = self._current_mutation_rate
+
+        # Log restart event to database for tracking
+        self.db.log_ga_history(
+            strategy=self.strategy_name,
+            generation=-1,  # Special marker for restart event
+            best_fitness=elites[0].fitness if elites else 0,
+            mean_fitness=0.0,
+            std_fitness=0.0,
+            best_genes=elites[0].genes if elites else {},
+            generations_without_improvement=cross_session_stuck
+        )
 
         logger.info(
             f"  Hard reset complete: Preserved {len(elites)} elites, "

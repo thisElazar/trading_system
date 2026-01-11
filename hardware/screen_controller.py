@@ -186,7 +186,8 @@ class ScreenController:
         self._last_research_stats_fetch: float = 0
         self._research_stats_interval_active: float = 5.0   # Fetch every 5s when research running
         self._research_stats_interval_idle: float = 60.0    # Fetch every 60s when idle
-        self._research_stale_threshold: float = 300.0       # 5 minutes without writes = stalled
+        self._research_stale_threshold_ga: float = 300.0    # 5 minutes for GA history (fast updates)
+        self._research_stale_threshold_gp: float = 7200.0   # 2 hours for GP checkpoints (slow updates)
         self._research_db_path: Path = Path(__file__).parent.parent / "db" / "research.db"
         self._research_page_idx: int = 0                    # 0 = live progress, 1 = summary
 
@@ -928,7 +929,7 @@ class ScreenController:
                         except (ValueError, TypeError):
                             age_seconds = 9999  # Treat parse errors as stale
 
-                        if age_seconds < self._research_stale_threshold:
+                        if age_seconds < self._research_stale_threshold_ga:
                             # Actively evolving - show current strategy progress
                             # Shorten strategy name for display
                             strategy_name = latest['strategy'] or 'unknown'
@@ -943,44 +944,67 @@ class ScreenController:
                                     'last_update': latest['created_at'],
                                 })
                         else:
-                            # GA history is stale - check if discovery phase is active
-                            # Discovery phase writes to evolution_checkpoints table
+                            # GA history is stale - check if GP discovery phase is active
+                            # First check lightweight progress file (real-time, every generation)
                             discovery_active = False
+                            gp_progress_file = Path(__file__).parent.parent / "run" / "gp_progress.json"
                             try:
-                                # Check evolution_checkpoints for current generation
-                                cursor = conn.execute("""
-                                    SELECT generation, created_at
-                                    FROM evolution_checkpoints
-                                    ORDER BY created_at DESC
-                                    LIMIT 1
-                                """)
-                                checkpoint_row = cursor.fetchone()
-                                if checkpoint_row and checkpoint_row['created_at']:
-                                    cp_write = datetime.fromisoformat(checkpoint_row['created_at'])
-                                    cp_age = (datetime.utcnow() - cp_write).total_seconds()
-                                    if cp_age < self._research_stale_threshold:
+                                if gp_progress_file.exists():
+                                    with open(gp_progress_file, 'r') as f:
+                                        progress = json.load(f)
+                                    # Check if progress file is fresh (< 5 min)
+                                    prog_time = datetime.fromisoformat(progress['timestamp'])
+                                    prog_age = (datetime.now() - prog_time).total_seconds()
+                                    if prog_age < 300:  # 5 minutes
                                         discovery_active = True
-                                        # Get best Sortino from discovered_strategies
-                                        best_sortino = 0.0
-                                        try:
-                                            best_cursor = conn.execute("""
-                                                SELECT MAX(oos_sortino) FROM discovered_strategies
-                                            """)
-                                            best_row = best_cursor.fetchone()
-                                            if best_row and best_row[0]:
-                                                best_sortino = best_row[0]
-                                        except Exception:
-                                            pass
                                         with self._lock:
                                             self._research_stats.update({
                                                 'status': 'EVOLVING',
                                                 'strategy': 'GP-Discovery',
-                                                'generation': checkpoint_row['generation'] or 0,
-                                                'best_sharpe': round(best_sortino, 2),
-                                                'last_update': checkpoint_row['created_at'],
+                                                'generation': progress.get('generation', 0),
+                                                'best_sharpe': progress.get('best_sortino', 0.0),
+                                                'last_update': progress['timestamp'],
                                             })
                             except Exception:
-                                pass  # Table might not exist
+                                pass  # File might not exist or be invalid
+
+                            # Fall back to evolution_checkpoints table (less frequent updates)
+                            if not discovery_active:
+                                try:
+                                    cursor = conn.execute("""
+                                        SELECT generation, created_at
+                                        FROM evolution_checkpoints
+                                        ORDER BY created_at DESC
+                                        LIMIT 1
+                                    """)
+                                    checkpoint_row = cursor.fetchone()
+                                    if checkpoint_row and checkpoint_row['created_at']:
+                                        cp_write = datetime.fromisoformat(checkpoint_row['created_at'])
+                                        cp_age = (datetime.utcnow() - cp_write).total_seconds()
+                                        # Use longer threshold for GP checkpoints (2 hours)
+                                        if cp_age < self._research_stale_threshold_gp:
+                                            discovery_active = True
+                                            # Get best Sortino from discovered_strategies
+                                            best_sortino = 0.0
+                                            try:
+                                                best_cursor = conn.execute("""
+                                                    SELECT MAX(oos_sortino) FROM discovered_strategies
+                                                """)
+                                                best_row = best_cursor.fetchone()
+                                                if best_row and best_row[0]:
+                                                    best_sortino = best_row[0]
+                                            except Exception:
+                                                pass
+                                            with self._lock:
+                                                self._research_stats.update({
+                                                    'status': 'EVOLVING',
+                                                    'strategy': 'GP-Discovery',
+                                                    'generation': checkpoint_row['generation'] or 0,
+                                                    'best_sharpe': round(best_sortino, 2),
+                                                    'last_update': checkpoint_row['created_at'],
+                                                })
+                                except Exception:
+                                    pass  # Table might not exist
 
                             if not discovery_active:
                                 # Check if research process is actively computing

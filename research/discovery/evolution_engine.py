@@ -887,6 +887,30 @@ class EvolutionEngine:
 
         logger.info("  " + " | ".join(log_parts))
 
+        # Write lightweight progress file for LCD display
+        self._write_progress_file(max(sortinos), diversity)
+
+    def _write_progress_file(self, best_sortino: float, diversity: float):
+        """Write lightweight progress file for real-time LCD display updates."""
+        try:
+            progress_file = Path(__file__).parent.parent.parent / "run" / "gp_progress.json"
+            progress_file.parent.mkdir(parents=True, exist_ok=True)
+            progress = {
+                "generation": self.current_generation,
+                "best_sortino": round(best_sortino, 3),
+                "pareto_size": len(self.pareto_front),
+                "diversity": round(diversity, 3),
+                "discovered": len(getattr(self, '_discovered_count', 0) or 0),
+                "timestamp": datetime.now().isoformat(),
+            }
+            # Atomic write via temp file
+            tmp_file = progress_file.with_suffix('.tmp')
+            with open(tmp_file, 'w') as f:
+                json.dump(progress, f)
+            tmp_file.replace(progress_file)
+        except Exception:
+            pass  # Non-critical, don't crash evolution
+
     def run(self, generations: int = None, hours: float = None):
         """
         Run evolution for specified generations or time.

@@ -4318,8 +4318,9 @@ class DailyOrchestrator:
                 issues.append(f"Broker connection failed: {e}")
 
             # Check data freshness (weekend/holiday aware)
+            # Use merged daily directory (Yahoo + Alpaca), not Yahoo-only
             from config import DIRS
-            daily_dir = DIRS.get('daily_yahoo')
+            daily_dir = DIRS.get('daily') or DIRS.get('daily_yahoo')
             if daily_dir and daily_dir.exists():
                 files = list(daily_dir.glob('*.parquet'))
                 if files:

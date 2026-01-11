@@ -27,6 +27,7 @@ import logging
 import time
 import random
 import json
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Callable
@@ -119,10 +120,10 @@ class Island:
 @dataclass
 class AdaptiveGAConfig:
     """Configuration for AdaptiveGAOptimizer."""
-    # Population settings
-    total_population: int = 60
+    # Population settings (increased for better diversity)
+    total_population: int = 100
     n_islands: int = 4
-    island_population: int = 15  # total_population / n_islands
+    island_population: int = 25  # total_population / n_islands
 
     # Evolution settings
     generations_per_session: int = 10
@@ -130,7 +131,7 @@ class AdaptiveGAConfig:
 
     # Selection
     tournament_size: int = 3
-    elitism: int = 2
+    elitism: int = 3  # Preserve more winners (12% of pop)
 
     # Crossover and mutation
     crossover_rate: float = 0.7
@@ -145,6 +146,14 @@ class AdaptiveGAConfig:
     # Migration
     migration_interval: int = 3  # Migrate every N generations
     migration_size: int = 2  # Number of individuals to migrate
+
+    # Diversity injection (new)
+    diversity_injection_interval: int = 5  # Inject every N generations
+    diversity_injection_rate: float = 0.10  # Replace 10% of worst with random
+
+    # Cross-session restart (new)
+    restart_stagnation_threshold: int = 50  # Restart if stuck this many gens
+    restart_elite_preserve: float = 0.20  # Keep top 20% on restart
 
     # Fitness weighting
     long_term_weight: float = 0.35
@@ -190,7 +199,9 @@ class AdaptiveGAOptimizer:
         config: AdaptiveGAConfig = None,
         parameter_specs: Dict[str, Tuple] = None,
         period_library: MarketPeriodLibrary = None,
-        regime_engine: RegimeMatchingEngine = None
+        regime_engine: RegimeMatchingEngine = None,
+        strategy_name: str = None,
+        db_path: str = None
     ):
         """
         Initialize the adaptive optimizer.
@@ -200,11 +211,15 @@ class AdaptiveGAOptimizer:
             parameter_specs: Dict of parameter name -> (min, max, step)
             period_library: MarketPeriodLibrary instance
             regime_engine: RegimeMatchingEngine instance
+            strategy_name: Name of strategy being optimized (for DB tracking)
+            db_path: Path to research database
         """
         self.config = config or AdaptiveGAConfig()
         self.param_specs = parameter_specs or self.DEFAULT_PARAMS.copy()
         self.library = period_library or MarketPeriodLibrary()
         self.regime_engine = regime_engine or RegimeMatchingEngine(self.library)
+        self.strategy_name = strategy_name or "unknown"
+        self.db_path = db_path or str(Path(__file__).parent.parent.parent / "db" / "research.db")
 
         # Backtester for rapid evaluation
         self.rapid_backtester = RapidBacktester(
@@ -224,6 +239,10 @@ class AdaptiveGAOptimizer:
         self.current_generation = 0
         self.total_evaluations = 0
         self.stagnation_counter = 0
+
+        # Cross-session stagnation tracking
+        self.cross_session_stagnation = 0
+        self.last_known_best_fitness = 0.0
 
         # Current regime fingerprint
         self._current_fingerprint: Optional[RegimeFingerprint] = None
@@ -247,6 +266,144 @@ class AdaptiveGAOptimizer:
                 genes[name] = min_val + random.randint(0, n_steps) * step
 
         return Individual(genes=genes, generation=generation)
+
+    def _check_cross_session_stagnation(self) -> Tuple[int, float]:
+        """
+        Check how many generations this strategy has been stuck.
+
+        Returns:
+            Tuple of (generations_without_improvement, best_fitness_ever)
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # Get the best fitness ever achieved for this strategy
+            cursor.execute("""
+                SELECT MAX(best_fitness), MAX(generation)
+                FROM ga_history
+                WHERE strategy = ?
+            """, (self.strategy_name,))
+            row = cursor.fetchone()
+
+            if row is None or row[0] is None:
+                conn.close()
+                return 0, 0.0
+
+            best_ever = row[0]
+            max_gen = row[1]
+
+            # Find when we first achieved this best fitness
+            cursor.execute("""
+                SELECT MIN(generation)
+                FROM ga_history
+                WHERE strategy = ? AND best_fitness = ?
+            """, (self.strategy_name, best_ever))
+            first_best_gen = cursor.fetchone()[0] or max_gen
+
+            conn.close()
+
+            generations_stuck = max_gen - first_best_gen
+            return generations_stuck, best_ever
+
+        except Exception as e:
+            logger.warning(f"Error checking cross-session stagnation: {e}")
+            return 0, 0.0
+
+    def _maybe_restart_population(self) -> bool:
+        """
+        Check if population needs restart due to prolonged stagnation.
+
+        Returns:
+            True if restart was performed
+        """
+        gens_stuck, best_ever = self._check_cross_session_stagnation()
+        self.cross_session_stagnation = gens_stuck
+        self.last_known_best_fitness = best_ever
+
+        if gens_stuck < self.config.restart_stagnation_threshold:
+            return False
+
+        logger.warning(
+            f"RESTART TRIGGERED: {self.strategy_name} stuck at fitness {best_ever:.4f} "
+            f"for {gens_stuck} generations (threshold: {self.config.restart_stagnation_threshold})"
+        )
+
+        # Perform micro-GA restart on each island
+        for island_name, island in self.islands.items():
+            n_elite = max(1, int(len(island.population) * self.config.restart_elite_preserve))
+            n_random = len(island.population) - n_elite
+
+            # Sort by fitness to keep the best
+            island.population.sort(key=lambda x: -x.fitness)
+
+            # Keep top performers
+            elite = island.population[:n_elite]
+
+            # Generate fresh random individuals
+            fresh_randoms = [
+                self._create_random_individual(self.current_generation)
+                for _ in range(n_random)
+            ]
+
+            # Combine: elite + fresh randoms
+            island.population = elite + fresh_randoms
+
+            # Reset island improvement tracking
+            island.last_improvement_gen = island.generations_evolved
+
+            logger.info(
+                f"  Island '{island_name}': kept {n_elite} elite, "
+                f"injected {n_random} random individuals"
+            )
+
+        # Log restart to database
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO ga_history (strategy, generation, best_fitness, mean_fitness,
+                                       std_fitness, generations_without_improvement, run_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                self.strategy_name,
+                -1,  # Special marker for restart event
+                best_ever,
+                0.0,
+                0.0,
+                gens_stuck,
+                datetime.now().strftime("%Y-%m-%d")
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to log restart event: {e}")
+
+        return True
+
+    def _inject_diversity(self, island: 'Island') -> int:
+        """
+        Inject random individuals to maintain diversity.
+
+        Replaces worst performers with fresh random individuals.
+
+        Args:
+            island: The island to inject diversity into
+
+        Returns:
+            Number of individuals replaced
+        """
+        n_inject = max(1, int(len(island.population) * self.config.diversity_injection_rate))
+
+        # Sort by fitness (worst at end)
+        island.population.sort(key=lambda x: -x.fitness)
+
+        # Replace worst individuals with random ones
+        for i in range(n_inject):
+            idx = len(island.population) - 1 - i
+            island.population[idx] = self._create_random_individual(self.current_generation)
+
+        return n_inject
 
     def _initialize_islands(self):
         """Initialize island sub-populations."""
@@ -653,6 +810,14 @@ class AdaptiveGAOptimizer:
             island.population = new_population[:len(island.population)]
             island.generations_evolved += 1
 
+            # Periodic diversity injection
+            if island.generations_evolved % self.config.diversity_injection_interval == 0:
+                n_injected = self._inject_diversity(island)
+                logger.debug(
+                    f"Diversity injection in '{island.name}': "
+                    f"replaced {n_injected} individuals at gen {island.generations_evolved}"
+                )
+
         return island
 
     def _migrate_between_islands(self):
@@ -738,8 +903,17 @@ class AdaptiveGAOptimizer:
         # Cache data in rapid backtester
         self.rapid_backtester.cache_data(data)
 
-        logger.info(f"Starting evolution for {generations} generations")
+        # Check for cross-session stagnation and restart if needed
+        gens_stuck, best_ever = self._check_cross_session_stagnation()
+        logger.info(
+            f"Starting evolution for {generations} generations "
+            f"(strategy: {self.strategy_name}, stuck: {gens_stuck} gens, best: {best_ever:.4f})"
+        )
         logger.info(f"Current regime: {self._current_fingerprint.overall_regime}")
+
+        # Perform restart if stuck too long
+        if self._maybe_restart_population():
+            logger.info("Population restarted - beginning fresh exploration")
 
         # Main evolution loop
         for gen in range(generations):
