@@ -12,16 +12,18 @@
 |----------|----|----|----|---------:|------:|
 | Bugs | 0 | 0 | 0 | 8 | 8 |
 | Architecture | 0 | 1 | 1 | 4 | 6 |
-| Stability | 0 | 1 | 0 | 9 | 10 |
-| Research/GA | 0 | 0 | 3 | 3 | 6 |
+| Stability | 0 | 0 | 0 | 10 | 10 |
+| Research/GA | 0 | 0 | 2 | 4 | 6 |
 | GP Research Gaps | 0 | 0 | 5 | 6 | 11 |
-| **Total** | **0** | **2** | **9** | **30** | **41** |
+| **Total** | **0** | **1** | **8** | **32** | **41** |
 
 **Resolved Jan 4:** BUG-001 (pairs/cash account), BUG-002 (timezone), BUG-005 (signals table), BUG-007 (test data cleanup), ARCH-003 (error logging), STAB-003 (log rotation), STAB-005 (version pinning)
 
 **Resolved Jan 8:** ARCH-001 (startup recovery), STAB-006 (DB thread safety), STAB-007 (TOCTOU race), STAB-008 (partial fills), STAB-009 (screen cache), STAB-010 (VIX timeout)
 
 **Resolved Jan 9:** GP-007 (paper trading duration), GP-008 (CPCV validation), GP-009 (Calmar ratio), GP-010 (HMM regime), GP-011 (migration rate), GP-012 (novelty pulsation), GA-001 (stagnation detection), STAB-001 (memory monitoring), ARCH-002 (real-time P&L), STAB-004 (graceful shutdown), BUG-003 (sector rotation), GA-002 (fitness bounds), BUG-004 (gap-fill intraday data), ARCH-005 (intraday refresh)
+
+**Resolved Jan 10:** STAB-002 (database backups enabled), GA-006 (persistent pool refactor - fixes resource exhaustion)
 
 ---
 
@@ -394,29 +396,26 @@ Then initialize AlertManager with webhook_url parameter
 ---
 
 #### STAB-002: Database Backup Strategy
-**Status:** INFRASTRUCTURE EXISTS BUT NOT RUNNING (2026-01-09)
-**Impact:** Data loss risk still ACTIVE - backup directory empty
+**Status:** RESOLVED (2026-01-10)
+**Impact:** Data loss risk mitigated - daily backups now active
 
-**Investigation Findings (Jan 9):**
-- ✅ `scripts/backup_databases.py` exists (250 lines, full implementation)
-- ✅ `/etc/systemd/system/trading-backup.timer` exists (daily at 5 AM)
-- ✅ `/etc/systemd/system/trading-backup.service` exists
-- ❌ **Backup directory is EMPTY** - no backups ever created
-- ❌ **Service never executed** - journal shows "-- No entries --"
-- ❌ **Timer active but service disabled**
-
-**Root Cause:**
-Systemd service is `disabled` - timer triggers but service doesn't run.
-
-**Immediate Fix Required:**
+**Solution Applied (Jan 10):**
 ```bash
 sudo systemctl enable trading-backup.service
 sudo systemctl start trading-backup.timer
-# Verify first backup runs
-ls -la ~/trading_system/backups/databases/
 ```
 
-**Backup Script Features (already implemented):**
+**First Backup Verified:**
+- Location: `~/trading_system/data/backups/databases/20260110_190511/`
+- Total size: ~17 MB (research.db 16MB, trades.db 344KB, performance.db 160KB, pairs.db 40KB)
+- Schedule: Daily at 5 AM, 14-day retention
+
+**Additionally Configured:**
+- GitHub repository for code backups: `github.com/thisElazar/trading_system`
+- SSH key authentication configured
+- `.gitignore` updated to exclude databases, logs, and secrets
+
+**Backup Script Features:**
 - SQLite backup API with WAL mode support
 - 14-day retention (MAX_BACKUPS = 14)
 - Verification, restoration, and cleanup
@@ -612,30 +611,40 @@ Implement adaptive k = f(archive_fill_ratio) and archive_size expansion when div
 ---
 
 #### GA-006: Backtest Speed Optimization
-**Status:** ADVANCED FEATURES UNDERUTILIZED (2026-01-09)
-**Impact:** Not using full parallelization potential
+**Status:** RESOLVED (2026-01-10)
+**Impact:** Pool resource exhaustion fixed - stable parallel evolution
 
-**Investigation Findings (Jan 9):**
-**What Exists (rapid_backtester.py):**
-- ✅ Persistent worker pool with shared memory (`GAWorkerPool`)
-- ✅ NumPy vectorization for batch distance calculations
-- ✅ Batch novelty scoring
-- ✅ Data caching with LRU eviction (10 periods)
-- ✅ Multi-period parallel testing
+**Root Cause (Jan 10):**
+`GeneticOptimizer._evaluate_population_parallel()` created a NEW `multiprocessing.Pool` on every generation (20-30 times per session), causing:
+- Resource exhaustion (orphaned workers)
+- Pipe/fork deadlocks
+- Process stalls requiring manual intervention
 
-**Configuration Mismatch:**
-- `config.py:79-80`: `n_workers: int = 4, parallel_enabled: bool = True`
-- `rapid_backtester.py:244`: **`max_workers: int = 1`** (hardcoded default!)
+**Solution Applied:**
+Refactored `PersistentGAOptimizer` to own a persistent pool:
 
-**Result:** Parallelization requires explicit `init_parallel_pool()` call, but default is single-threaded.
+1. **Pool lifecycle management** (`persistent_optimizer.py`):
+   - `init_pool()` - Creates pool once with staggered worker warmup
+   - `shutdown_pool()` - Clean shutdown
+   - `__enter__/__exit__` - Context manager for automatic cleanup
+   - `_evaluate_population_with_pool()` - Reuses pool across generations
 
-**What's Missing:**
-- No Numba JIT compilation
-- No Cython files in codebase
-- Default worker count ignores config
+2. **Context manager pattern** (`run_nightly_research.py`):
+   ```python
+   with PersistentGAOptimizer(name, fitness_fn, config) as optimizer:
+       optimizer.load_population()
+       optimizer.evolve_incremental(generations=10)
+   # Pool automatically cleaned up
+   ```
 
-**Quick Fix:**
-Change `rapid_backtester.py:244` from `max_workers: int = 1` to `max_workers: int = 4` (or `os.cpu_count()`)
+3. **Lambda pickling fix**:
+   - Replaced `lambda x: True` with module-level `_warmup_worker()` function
+
+**Benefits:**
+- 1 pool per strategy vs 20-30 pools per session
+- Eliminates deadlocks and resource exhaustion
+- Automatic cleanup via context manager
+- Follows existing `RapidBacktester`/`GAWorkerPool` pattern
 
 ---
 
@@ -950,16 +959,16 @@ Add `regime_confirmation_days: int = 2` parameter and require stable regime clas
 
 | # | ID | Description | Effort | Impact | Status |
 |---|-----|-------------|--------|--------|--------|
-| 1 | **BUG-004** | Gap-fill 0 signals + stale data | HIGH | HIGH | ⚠️ CRITICAL |
-| 2 | **STAB-002** | Enable backup service | 5 min | HIGH | ⚠️ NOT RUNNING |
-| 3 | **ARCH-005** | Refresh intraday data (14d stale) | Medium | HIGH | ⚠️ CRITICAL |
+| 1 | BUG-004 | Gap-fill 0 signals + stale data | HIGH | HIGH | ✅ RESOLVED (Jan 9) |
+| 2 | STAB-002 | Enable backup service | 5 min | HIGH | ✅ RESOLVED (Jan 10) |
+| 3 | ARCH-005 | Refresh intraday data (14d stale) | Medium | HIGH | ✅ RESOLVED (Jan 9) |
 | 4 | GP-007 | Paper trading duration (14d → 90d) | 5 min | HIGH | ✅ RESOLVED |
 | 5 | GP-008 | CPCV validation + PBO threshold | High | HIGH | ✅ RESOLVED |
 | 6 | BUG-003 | Sector rotation GA optimization | Low | Medium | ✅ RESOLVED |
 | 7 | GA-002 | Erratic fitness jumps | Low | Medium | ✅ RESOLVED |
 | 8 | ARCH-002 | Real-time P&L dashboard | Medium | Medium | ✅ RESOLVED |
-| 9 | GA-004 | Enable portfolio fitness | 5 min | Medium | ⚪ DISABLED |
-| 10 | GA-006 | Fix worker count mismatch | 5 min | Medium | ⚪ UNDERUSED |
+| 9 | GA-006 | Persistent pool refactor | Medium | HIGH | ✅ RESOLVED (Jan 10) |
+| 10 | GA-004 | Enable portfolio fitness | 5 min | Medium | ⚪ DISABLED |
 
 ---
 
@@ -1083,6 +1092,17 @@ python3 -c "from execution.alpaca_connector import AlpacaConnector; c = AlpacaCo
 | 2026-01-09 | Added `INTRADAY_UNIVERSE` and `INTRADAY_SYMBOLS` to config.py with configurable retention (30d) and refresh (5d) settings |
 | 2026-01-09 | Updated `IntradayDataManager` to use config-driven universe; backwards compatible via `GAP_FILL_UNIVERSE` alias |
 | 2026-01-09 | Data architecture: Daily bars (2,562 symbols, 627MB) + Intraday bars (42 symbols, 5MB) |
+| 2026-01-10 | **GA-006 RESOLVED** - Persistent pool refactor: `PersistentGAOptimizer` now owns pool lifecycle with context manager |
+| 2026-01-10 | Pool deadlock fix: 1 pool per strategy vs 20-30 per session; eliminates resource exhaustion |
+| 2026-01-10 | Lambda pickling fix: Replaced lambda with module-level `_warmup_worker()` function |
+| 2026-01-10 | Screen controller: Fixed false "STALLED" during GP discovery (checks `evolution_history` + CPU usage) |
+| 2026-01-10 | Screen controller: Market page always shows countdown to next phase (staleness moved to time line) |
+| 2026-01-10 | Orchestrator: Added pgrep safeguard to prevent orphaned research processes after restart |
+| 2026-01-10 | Screen controller: Fixed generation display ORDER BY tiebreaker (was showing 215 instead of 217) |
+| 2026-01-10 | **STAB-002 RESOLVED** - Database backup service enabled; first backup verified (17MB total) |
+| 2026-01-10 | GitHub repository configured for code backups: `github.com/thisElazar/trading_system` |
+| 2026-01-10 | SSH key authentication set up for Pi → GitHub push access |
+| 2026-01-10 | `.gitignore` updated: excludes SQLite WAL files, trained models, backups, Claude settings |
 
 ---
 
