@@ -13,6 +13,7 @@ Each genome contains multiple GP trees:
 
 import uuid
 import json
+import random
 import logging
 from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import dataclass, field
@@ -61,6 +62,11 @@ class StrategyGenome:
     parent_ids: List[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
 
+    # Self-adaptive mutation parameters (evolve alongside strategy)
+    # These rates are subject to mutation themselves (meta-evolution)
+    mutation_rate: float = field(default_factory=lambda: random.uniform(0.15, 0.35))
+    crossover_rate: float = field(default_factory=lambda: random.uniform(0.6, 0.9))
+
     # Cached fitness (set by evaluator)
     fitness_values: Optional[Tuple[float, ...]] = None
     backtest_result: Optional[Any] = None
@@ -105,7 +111,10 @@ class StrategyGenome:
             },
             'complexity': self.total_complexity,
             'max_depth': self.max_depth,
-            'fitness_values': self.fitness_values
+            'fitness_values': self.fitness_values,
+            # Self-adaptive parameters
+            'mutation_rate': self.mutation_rate,
+            'crossover_rate': self.crossover_rate
         }
 
     def __str__(self) -> str:
@@ -289,9 +298,10 @@ class GenomeFactory:
 
     def mutate(self, genome: StrategyGenome, generation: int) -> StrategyGenome:
         """
-        Mutate a genome.
+        Mutate a genome using its self-adaptive mutation rate.
 
-        Each tree is mutated independently with probability mutation_rate.
+        Each tree is mutated independently with probability based on the genome's
+        own mutation_rate (self-adaptive). The mutation_rate itself also evolves.
 
         Args:
             genome: Genome to mutate
@@ -303,6 +313,10 @@ class GenomeFactory:
         import random
         import copy
 
+        # Use genome's own adaptive mutation rate (falls back to config if not set)
+        mutation_rate = getattr(genome, 'mutation_rate', self.config.mutation_rate)
+        crossover_rate = getattr(genome, 'crossover_rate', 0.7)
+
         # Deep copy all trees
         entry = copy.deepcopy(genome.entry_tree)
         exit_tree = copy.deepcopy(genome.exit_tree)
@@ -310,19 +324,29 @@ class GenomeFactory:
         stop_loss = copy.deepcopy(genome.stop_loss_tree)
         target = copy.deepcopy(genome.target_tree)
 
-        # Mutate each tree with probability
-        if random.random() < self.config.mutation_rate:
+        # Mutate each tree with genome's own probability
+        if random.random() < mutation_rate:
             entry = self._mutate_tree(entry, self.bool_pset, self.bool_toolbox)
-        if random.random() < self.config.mutation_rate:
+        if random.random() < mutation_rate:
             exit_tree = self._mutate_tree(exit_tree, self.bool_pset, self.bool_toolbox)
-        if random.random() < self.config.mutation_rate:
+        if random.random() < mutation_rate:
             position = self._mutate_tree(position, self.float_pset, self.float_toolbox)
-        if random.random() < self.config.mutation_rate:
+        if random.random() < mutation_rate:
             stop_loss = self._mutate_tree(stop_loss, self.float_pset, self.float_toolbox)
-        if random.random() < self.config.mutation_rate:
+        if random.random() < mutation_rate:
             target = self._mutate_tree(target, self.float_pset, self.float_toolbox)
 
-        return StrategyGenome(
+        # Self-adaptation: mutate the mutation parameters themselves
+        # Use log-normal distribution for multiplicative changes (standard ES approach)
+        tau = 1.0 / (2 * 5**0.5)  # Learning rate (1 / sqrt(2*n) where n=5 trees)
+        new_mutation_rate = mutation_rate * (1 + tau * random.gauss(0, 1))
+        new_crossover_rate = crossover_rate * (1 + tau * random.gauss(0, 1))
+
+        # Clamp to valid ranges
+        new_mutation_rate = max(0.05, min(0.5, new_mutation_rate))
+        new_crossover_rate = max(0.4, min(0.95, new_crossover_rate))
+
+        mutated = StrategyGenome(
             entry_tree=entry,
             exit_tree=exit_tree,
             position_tree=position,
@@ -331,6 +355,12 @@ class GenomeFactory:
             generation=generation,
             parent_ids=[genome.genome_id]
         )
+
+        # Set the adapted rates
+        mutated.mutation_rate = new_mutation_rate
+        mutated.crossover_rate = new_crossover_rate
+
+        return mutated
 
     def _mutate_tree(self, tree: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped,
                      toolbox) -> gp.PrimitiveTree:

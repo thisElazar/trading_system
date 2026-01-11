@@ -36,7 +36,7 @@ class BehaviorVector:
     Captures HOW a strategy trades, not just its returns.
     This enables diversity in trading approaches, not just parameters.
 
-    Dimensions:
+    Dimensions (10 total):
     - trade_frequency: Trades per week (activity level)
     - avg_hold_period: Average holding time in days (timeframe)
     - long_short_ratio: Balance between longs and shorts
@@ -44,6 +44,9 @@ class BehaviorVector:
     - drawdown_depth: Normalized max drawdown (risk tolerance)
     - benchmark_corr: Correlation to market (systematic vs idiosyncratic)
     - signal_variance: Volatility of position changes (stability)
+    - recovery_time: Days to recover from max drawdown (resilience)
+    - profit_factor: Gross profit / gross loss ratio (profitability pattern)
+    - sharpe_ratio: Risk-adjusted return in behavior space
     """
     trade_frequency: float      # Trades per week
     avg_hold_period: float      # Days (log-normalized)
@@ -52,6 +55,10 @@ class BehaviorVector:
     drawdown_depth: float       # 0 to 1 (normalized)
     benchmark_corr: float       # -1 to +1
     signal_variance: float      # Normalized variance
+    # New dimensions (GP-017)
+    recovery_time: float = 0.0      # Days to recover from max DD (0-1 normalized)
+    profit_factor: float = 1.0      # Gross profit / gross loss (1.0 = breakeven)
+    sharpe_ratio: float = 0.0       # Risk-adjusted return (-1 to 3 typical)
 
     def to_array(self) -> np.ndarray:
         """Convert to numpy array for distance calculations."""
@@ -63,8 +70,13 @@ class BehaviorVector:
         dd = np.clip(self.drawdown_depth, 0, 1)
         bench_corr = np.clip((self.benchmark_corr + 1) / 2.0, 0, 1)
         sig_var = np.clip(self.signal_variance * 10, 0, 1)
+        # New dimensions normalized to 0-1
+        recovery = np.clip(self.recovery_time / 252, 0, 1)  # Normalize to 1 year max
+        pf = np.clip((self.profit_factor - 0.5) / 2.5, 0, 1)  # 0.5-3.0 range -> 0-1
+        sharpe = np.clip((self.sharpe_ratio + 1) / 4, 0, 1)  # -1 to 3 range -> 0-1
 
-        arr = np.array([trade_freq, hold_period, ls_ratio, autocorr, dd, bench_corr, sig_var])
+        arr = np.array([trade_freq, hold_period, ls_ratio, autocorr, dd, bench_corr,
+                       sig_var, recovery, pf, sharpe])
         # Replace any NaN with 0
         arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
         return arr
@@ -72,6 +84,10 @@ class BehaviorVector:
     @classmethod
     def from_array(cls, arr: np.ndarray) -> 'BehaviorVector':
         """Create from numpy array."""
+        # Handle both old (7-dim) and new (10-dim) arrays
+        if len(arr) < 10:
+            # Pad with defaults for backwards compatibility
+            arr = np.concatenate([arr, np.array([0.0, 0.4, 0.25])])  # Default values
         return cls(
             trade_frequency=arr[0] * 10.0,
             avg_hold_period=np.expm1(arr[1] * 3.0),
@@ -79,7 +95,10 @@ class BehaviorVector:
             return_autocorr=arr[3] * 2 - 1,
             drawdown_depth=arr[4],
             benchmark_corr=arr[5] * 2 - 1,
-            signal_variance=arr[6] / 10.0
+            signal_variance=arr[6] / 10.0,
+            recovery_time=arr[7] * 252,  # Denormalize from year
+            profit_factor=arr[8] * 2.5 + 0.5,  # Denormalize from 0-1
+            sharpe_ratio=arr[9] * 4 - 1  # Denormalize from 0-1
         )
 
     def distance(self, other: 'BehaviorVector') -> float:
@@ -194,7 +213,7 @@ class NoveltyArchive:
     """
 
     def __init__(self, k_neighbors: int = 20, archive_size: int = 500,
-                 min_fitness: float = 0.0):
+                 min_fitness: float = 0.0, adaptive: bool = True):
         """
         Initialize novelty archive.
 
@@ -202,10 +221,14 @@ class NoveltyArchive:
             k_neighbors: Number of neighbors for novelty calculation
             archive_size: Maximum archive size
             min_fitness: Minimum fitness to consider for archive
+            adaptive: Enable dynamic k and archive size adjustment
         """
+        self.base_k = k_neighbors
         self.k = k_neighbors
+        self.base_max_size = archive_size
         self.max_size = archive_size
         self.min_fitness = min_fitness
+        self.adaptive = adaptive
 
         self.archive: List[BehaviorVector] = []
         self.archive_fitness: List[float] = []  # Track fitness for context
@@ -213,6 +236,13 @@ class NoveltyArchive:
         # Precomputed distance matrix (updated on add)
         self._distance_matrix: Optional[np.ndarray] = None
         self._behavior_matrix: Optional[np.ndarray] = None
+
+        # Diversity tracking for adaptive tuning
+        self._diversity_history: List[float] = []
+        self._diversity_window: int = 10  # Generations to track
+        self._expansion_factor: float = 1.5  # How much to expand archive
+        self._min_k: int = 5  # Minimum k value
+        self._diversity_drop_threshold: float = 0.15  # 15% drop triggers expansion
 
     def calculate_novelty(self, behavior: BehaviorVector) -> float:
         """
@@ -348,12 +378,86 @@ class NoveltyArchive:
         novelties = self._calculate_internal_novelties()
         return float(np.mean(novelties))
 
+    def update_adaptive_params(self) -> Dict[str, Any]:
+        """
+        Dynamically adjust k and archive size based on current state.
+
+        Called once per generation to adapt parameters.
+
+        Returns:
+            Dict with adjustment info for logging
+        """
+        if not self.adaptive:
+            return {'adjusted': False}
+
+        adjustments = {'adjusted': False, 'k_before': self.k, 'size_before': self.max_size}
+
+        # 1. Adjust k based on archive fill ratio
+        # When archive is sparse, use smaller k for more sensitivity
+        # When archive is full, use larger k for more selective novelty
+        fill_ratio = len(self.archive) / self.max_size if self.max_size > 0 else 0
+        new_k = max(self._min_k, int(self.base_k * (0.5 + 0.5 * fill_ratio)))
+        if new_k != self.k:
+            self.k = new_k
+            adjustments['adjusted'] = True
+            adjustments['k_after'] = new_k
+            adjustments['k_reason'] = f'fill_ratio={fill_ratio:.2f}'
+
+        # 2. Track diversity and expand archive if diversity drops
+        current_diversity = self.get_archive_diversity()
+        self._diversity_history.append(current_diversity)
+
+        # Keep only recent history
+        if len(self._diversity_history) > self._diversity_window:
+            self._diversity_history = self._diversity_history[-self._diversity_window:]
+
+        # Check for diversity drop
+        if len(self._diversity_history) >= self._diversity_window:
+            early_diversity = np.mean(self._diversity_history[:self._diversity_window // 2])
+            recent_diversity = np.mean(self._diversity_history[self._diversity_window // 2:])
+
+            if early_diversity > 0:
+                diversity_change = (recent_diversity - early_diversity) / early_diversity
+
+                if diversity_change < -self._diversity_drop_threshold:
+                    # Diversity dropped significantly - expand archive
+                    new_size = int(self.max_size * self._expansion_factor)
+                    # Cap at 3x base size to prevent runaway growth
+                    new_size = min(new_size, self.base_max_size * 3)
+
+                    if new_size > self.max_size:
+                        self.max_size = new_size
+                        adjustments['adjusted'] = True
+                        adjustments['size_after'] = new_size
+                        adjustments['size_reason'] = f'diversity_drop={diversity_change:.1%}'
+                        logger.info(f"Novelty archive expanded to {new_size} (diversity drop: {diversity_change:.1%})")
+
+        return adjustments
+
+    def get_adaptive_stats(self) -> Dict[str, Any]:
+        """Get current adaptive parameter state for monitoring."""
+        return {
+            'k': self.k,
+            'base_k': self.base_k,
+            'max_size': self.max_size,
+            'base_max_size': self.base_max_size,
+            'archive_count': len(self.archive),
+            'fill_ratio': len(self.archive) / self.max_size if self.max_size > 0 else 0,
+            'current_diversity': self.get_archive_diversity(),
+            'diversity_history_len': len(self._diversity_history),
+            'adaptive_enabled': self.adaptive,
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize archive to dictionary."""
         return {
             'k_neighbors': self.k,
+            'base_k': self.base_k,
             'archive_size': self.max_size,
+            'base_max_size': self.base_max_size,
             'min_fitness': self.min_fitness,
+            'adaptive': self.adaptive,
+            'diversity_history': self._diversity_history,
             'behaviors': [
                 {
                     'trade_frequency': b.trade_frequency,
@@ -373,10 +477,16 @@ class NoveltyArchive:
     def from_dict(cls, data: Dict[str, Any]) -> 'NoveltyArchive':
         """Deserialize archive from dictionary."""
         archive = cls(
-            k_neighbors=data['k_neighbors'],
-            archive_size=data['archive_size'],
-            min_fitness=data.get('min_fitness', 0.0)
+            k_neighbors=data.get('base_k', data['k_neighbors']),
+            archive_size=data.get('base_max_size', data['archive_size']),
+            min_fitness=data.get('min_fitness', 0.0),
+            adaptive=data.get('adaptive', True)
         )
+
+        # Restore current adaptive state (may differ from base)
+        archive.k = data['k_neighbors']
+        archive.max_size = data['archive_size']
+        archive._diversity_history = data.get('diversity_history', [])
 
         for b_data in data.get('behaviors', []):
             behavior = BehaviorVector(

@@ -8,13 +8,82 @@ weights to ensure strategies are evaluated holistically:
 - Sharpe Ratio: General risk-adjusted performance
 - Sortino Ratio: Downside risk-adjusted (more relevant for trading)
 - Calmar Ratio: Return per unit of max drawdown
+- Omega Ratio: Full distribution capture (gains/losses ratio)
 - Win Rate: Trading consistency and psychological tradability
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, Union
+import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def calculate_omega_ratio(
+    returns: Union[pd.Series, np.ndarray, list],
+    threshold: float = 0.0,
+    annualize: bool = False,
+    periods_per_year: int = 252
+) -> float:
+    """
+    Calculate Omega Ratio - captures all moments of the return distribution.
+
+    The Omega ratio is superior to Sharpe for non-normal distributions because
+    it considers the entire return distribution, not just mean and variance.
+
+    Omega(r) = sum(gains above threshold) / sum(losses below threshold)
+
+    A higher Omega means the strategy has better upside relative to downside.
+    - Omega = 1.0: Gains equal losses relative to threshold
+    - Omega > 1.0: More gains than losses (desirable)
+    - Omega < 1.0: More losses than gains (undesirable)
+
+    Args:
+        returns: Series or array of period returns (not cumulative)
+        threshold: Return threshold (default 0 = risk-free rate)
+        annualize: If True, annualize the threshold
+        periods_per_year: Trading periods per year (252 for daily)
+
+    Returns:
+        Omega ratio (1.0 = breakeven, higher = better)
+
+    Reference:
+        Keating & Shadwick (2002) "A Universal Performance Measure"
+    """
+    # Convert to numpy array
+    if isinstance(returns, pd.Series):
+        returns = returns.dropna().values
+    elif isinstance(returns, list):
+        returns = np.array(returns)
+
+    if len(returns) < 10:
+        return 1.0  # Insufficient data
+
+    # Annualize threshold if requested (convert annual rate to period rate)
+    if annualize and threshold != 0:
+        threshold = (1 + threshold) ** (1 / periods_per_year) - 1
+
+    # Calculate excess returns
+    excess = returns - threshold
+
+    # Sum of gains (positive excess returns)
+    gains = np.sum(excess[excess > 0])
+
+    # Sum of losses (absolute value of negative excess returns)
+    losses = np.abs(np.sum(excess[excess < 0]))
+
+    # Handle edge cases
+    if losses == 0:
+        if gains > 0:
+            return 10.0  # Cap at 10 (extremely good - all gains, no losses)
+        else:
+            return 1.0  # No gains, no losses
+
+    omega = gains / losses
+
+    # Cap at reasonable range to prevent outliers
+    return min(max(omega, 0.1), 10.0)
 
 
 def calculate_composite_fitness(result: Any, verbose: bool = False) -> float:

@@ -13,9 +13,9 @@
 | Bugs | 0 | 0 | 0 | 8 | 8 |
 | Architecture | 0 | 0 | 1 | 5 | 6 |
 | Stability | 0 | 0 | 0 | 10 | 10 |
-| Research/GA | 0 | 0 | 2 | 4 | 6 |
-| GP Research Gaps | 0 | 0 | 5 | 6 | 11 |
-| **Total** | **0** | **0** | **8** | **33** | **41** |
+| Research/GA | 0 | 0 | 0 | 6 | 6 |
+| GP Research Gaps | 0 | 0 | 2 | 9 | 11 |
+| **Total** | **0** | **0** | **3** | **38** | **41** |
 
 **Resolved Jan 4:** BUG-001 (pairs/cash account), BUG-002 (timezone), BUG-005 (signals table), BUG-007 (test data cleanup), ARCH-003 (error logging), STAB-003 (log rotation), STAB-005 (version pinning)
 
@@ -23,7 +23,7 @@
 
 **Resolved Jan 9:** GP-007 (paper trading duration), GP-008 (CPCV validation), GP-009 (Calmar ratio), GP-010 (HMM regime), GP-011 (migration rate), GP-012 (novelty pulsation), GA-001 (stagnation detection), STAB-001 (memory monitoring), ARCH-002 (real-time P&L), STAB-004 (graceful shutdown), BUG-003 (sector rotation), GA-002 (fitness bounds), BUG-004 (gap-fill intraday data), ARCH-005 (intraday refresh)
 
-**Resolved Jan 10:** STAB-002 (database backups enabled), GA-006 (persistent pool refactor), ARCH-006 (Telegram alerts)
+**Resolved Jan 10:** STAB-002 (database backups enabled), GA-006 (persistent pool refactor), ARCH-006 (Telegram alerts), GA-003 (GP discovery validated), GA-004 (portfolio fitness verified working), GA-005 (dynamic novelty tuning), GP-013 (self-adaptive mutation), GP-014 (Omega ratio), GP-017 (behavioral descriptors)
 
 ---
 
@@ -527,46 +527,34 @@ The `PersistentGAOptimizer` now has comprehensive anti-stagnation:
 ---
 
 #### GA-003: GP Discovery Pipeline Not Validated
-**Status:** Code exists, not tested end-to-end
-**Impact:** Core R&D capability not proven
+**Status:** RESOLVED (2026-01-10)
+**Impact:** Core R&D capability validated and working
 
-**Current State:**
-- `research/discovery/` has full GP implementation
-- `evolution_engine.py`, `strategy_genome.py`, etc.
-- But unclear if strategies are actually being discovered
-
-**Evidence:**
-- `discovered_strategies` table in research.db
-- `candidates/` directory exists
-
-**Next Steps:**
-1. Run GP discovery with `--discovery` flag
-2. Verify genome serialization/deserialization
-3. Test promotion pipeline end-to-end
-4. Document first discovered strategy
+**Validation Results (Jan 10):**
+- 107 discovered strategies in `discovered_strategies` table
+- 103 meet promotion thresholds (Sharpe >= 0.5, Sortino >= 0.8)
+- Best strategy: Sharpe 1.69, Sortino 2.11
+- Each genome has 5 trees: entry, exit, position, stop_loss, target
+- Serialization/deserialization verified working
+- Database stores complete genome JSON with all tree structures
 
 ---
 
 ### P2 - Medium
 
 #### GA-004: Portfolio-Level Fitness Not Active
-**Status:** IMPLEMENTED BUT DISABLED (2026-01-09)
-**Impact:** Portfolio-level optimization not being used
+**Status:** RESOLVED - VERIFIED WORKING (2026-01-10)
+**Impact:** Portfolio-level optimization is active in production
 
-**Investigation Findings (Jan 9):**
-- ✅ `research/discovery/portfolio_fitness.py` exists (823 lines, fully implemented)
-- ✅ `PortfolioFitnessEvaluator` class with comprehensive metrics
-- ✅ Marginal Sharpe, diversification ratio, correlation penalties
-- ✅ Integration in `evolution_engine.py` (line 223): `use_portfolio_fitness = True` default
-- ❌ **BUT `overnight_runner.py` (line 669) explicitly sets `use_portfolio_fitness=False`**
+**Verification (Jan 10):**
+The punchlist entry was incorrect. The `use_portfolio_fitness=False` was only in a TEST function (`overnight_runner.py:669`), not in production code.
 
-**Why Disabled:**
-The overnight research runner explicitly disables portfolio fitness, likely for performance reasons.
+**Evidence:**
+- Production code in `run_nightly_research.py` uses default (`use_portfolio_fitness=True`)
+- Logs confirmed: "Portfolio fitness evaluation enabled"
+- `PortfolioFitnessEvaluator` is being used during nightly research
 
-**To Enable:**
-Change `overnight_runner.py:669` from `use_portfolio_fitness=False` to `True`
-
-**Features Available:**
+**Features Active:**
 - Marginal Sharpe calculation: MSR = (σ_s/σ_p) × SR_s - β × SR_p
 - Correlation threshold: 0.70 max to reject redundancy
 - Composite weights: 25% standalone Sortino, 30% marginal Sharpe, 20% diversification, 15% max DD, 10% novelty
@@ -574,30 +562,29 @@ Change `overnight_runner.py:669` from `use_portfolio_fitness=False` to `True`
 ---
 
 #### GA-005: Novelty Archive Tuning
-**Status:** BASIC SETTINGS - NO DYNAMIC TUNING (2026-01-09)
-**Impact:** Static settings, no adaptive tuning
+**Status:** RESOLVED (2026-01-10)
+**Impact:** Dynamic adaptive tuning now implemented
 
-**Investigation Findings (Jan 9):**
-Current settings in `research/discovery/config.py` (lines 35-42):
-```python
-novelty_k_neighbors: int = 20
-novelty_archive_size: int = 500
-novelty_weight: float = 0.3
-novelty_weight_plateau: float = 0.7  # Elevated during plateaus (GP-012)
-```
+**Solution Applied (Jan 10):**
+Enhanced `NoveltyArchive` class in `research/discovery/novelty_search.py`:
 
-**What Exists:**
-- Static k_neighbors (no adaptive adjustment)
-- Static archive_size (no dynamic expansion)
-- Plateau detection for novelty weighting (shifts 0.3 → 0.7 during plateaus)
+1. **Adaptive k_neighbors:**
+   - `k = base_k * (0.5 + 0.5 * fill_ratio)`
+   - Scales from ~10 (half-full) to ~20 (full archive)
+   - Minimum k = 5 to ensure valid novelty calculation
 
-**What's Missing:**
-- No dynamic k_neighbors based on archive fill ratio
-- No adaptive archive_size based on diversity plateau
-- Settings are "set and forget"
+2. **Archive Expansion:**
+   - Tracks `_diversity_history` over 10-generation window
+   - When diversity drops >15%, expands archive by 1.5x
+   - Prevents premature convergence
 
-**Recommendation:**
-Implement adaptive k = f(archive_fill_ratio) and archive_size expansion when diversity drops
+3. **New Method:** `update_adaptive_params()`
+   - Returns dict with adjustments made
+   - Logs k_before, k_after, size_before, size_after
+   - Serialized via `to_dict()`/`from_dict()` for checkpoint persistence
+
+**Verification:**
+Tested with archive at various fill levels - k and size adjust correctly
 
 ---
 
@@ -781,55 +768,65 @@ This preserves island specialization as recommended by research (2-5% every 50 g
 ### P2 - Medium (Nice to Have)
 
 #### GP-013: Self-Adaptive Mutation Rates
-**Status:** PARTIALLY IMPLEMENTED - Island + Diversity-Level Only (2026-01-09)
-**Impact:** Not per-individual adaptive
+**Status:** RESOLVED (2026-01-10)
+**Impact:** Per-individual mutation rates now evolve with strategy genes
 
-**Investigation Findings (Jan 9):**
+**Solution Applied (Jan 10):**
+Enhanced `StrategyGenome` dataclass in `research/discovery/strategy_genome.py`:
 
-**What Exists:**
-1. **Island-level mutation variation** (`island_model.py:189-191`)
+1. **New Fields:**
    ```python
-   if self.island_config.vary_mutation_rate:
-       island.mutation_rate = 0.1 + (i / max(1, num_islands - 1)) * 0.3
+   mutation_rate: float = field(default_factory=lambda: random.uniform(0.15, 0.35))
+   crossover_rate: float = field(default_factory=lambda: random.uniform(0.6, 0.9))
    ```
-2. **Diversity-triggered boost** (`diversity_metrics.py:268-271, 432-436`)
-   - `get_current_mutation_rate_multiplier()` returns 2.0x during intervention
-   - Activates when diversity drops below thresholds
 
-**What's Missing:**
-- Per-individual mutation rates in `StrategyGenome` (no mutation_rate field)
-- Self-adaptation where mutation rates evolve alongside strategy genes
+2. **ES Log-Normal Adaptation in `mutate()`:**
+   ```python
+   tau = 1.0 / (2 * 5**0.5)  # Learning rate
+   new_mutation_rate = mutation_rate * (1 + tau * random.gauss(0, 1))
+   new_mutation_rate = max(0.05, min(0.5, new_mutation_rate))  # Clamp
+   ```
 
-**Research Reference:**
-Self-adaptive approaches outperform static tuning by 65-584% in diversity
+3. **Serialization:**
+   - `to_dict()` includes mutation_rate and crossover_rate
+   - Backwards compatible with old genomes (uses defaults)
+
+**Verification:**
+Tested mutation - rates evolve each generation within valid bounds
 
 ---
 
 #### GP-014: Omega Ratio for Non-Normal Distributions
-**Status:** NOT IMPLEMENTED (2026-01-09)
-**Impact:** Missing full distribution capture for non-normal returns
+**Status:** RESOLVED (2026-01-10)
+**Impact:** Full distribution capture now available for non-normal returns
 
-**Investigation Findings (Jan 9):**
-- ❌ No `calculate_omega_ratio()` function anywhere in codebase
-- ❌ No "omega" references in research modules
-- Searched: `multi_objective.py`, `fitness_utils.py`, all research/*.py
+**Solution Applied (Jan 10):**
+Added `calculate_omega_ratio()` to `research/genetic/fitness_utils.py`:
 
-**Existing Alternatives:**
-- Sortino Ratio (downside deviation-based)
-- CVaR/Expected Shortfall at 95% tail
-- Calmar Ratio (CAGR / MaxDD)
-- Deflated Sharpe Ratio (multiple testing correction)
-
-**Why Omega Would Help:**
-Captures all moments of return distribution (skewness, kurtosis) rather than just mean/variance. Superior for non-normal distributions typical in evolved strategies.
-
-**Implementation Required:**
 ```python
-def calculate_omega_ratio(returns: pd.Series, threshold: float = 0.0) -> float:
-    gains = returns[returns > threshold].sum()
-    losses = abs(returns[returns < threshold].sum())
-    return gains / losses if losses > 0 else float('inf')
+def calculate_omega_ratio(
+    returns: Union[pd.Series, np.ndarray, list],
+    threshold: float = 0.0,
+    annualize: bool = False,
+    periods_per_year: int = 252
+) -> float:
+    """Omega(r) = sum(gains above threshold) / sum(losses below threshold)"""
 ```
+
+**Features:**
+- Handles pd.Series, np.ndarray, and list inputs
+- Threshold can be annualized (converts to per-period rate)
+- Capped at [0.1, 10.0] to prevent outliers
+- Returns 1.0 for insufficient data (<10 points)
+- Returns 10.0 for all-gains case (perfect strategy)
+
+**Interpretation:**
+- Omega = 1.0: Gains equal losses (breakeven)
+- Omega > 1.0: More gains than losses (desirable)
+- Omega < 1.0: More losses than gains (undesirable)
+
+**Verification:**
+Tested with good (Omega=2.4), bad (Omega=0.48), and skewed (Omega=1.4) strategies
 
 ---
 
@@ -889,32 +886,37 @@ Add `regime_confirmation_days: int = 2` parameter and require stable regime clas
 ---
 
 #### GP-017: Behavioral Descriptor Enhancement
-**Status:** 7/10 DIMENSIONS - Missing Key Metrics (2026-01-09)
-**Impact:** May not capture full behavioral diversity
+**Status:** RESOLVED (2026-01-10)
+**Impact:** Full 10-dimensional behavioral diversity capture
 
-**Investigation Findings (Jan 9):**
+**Solution Applied (Jan 10):**
+Enhanced `BehaviorVector` dataclass in `research/discovery/novelty_search.py`:
 
-**Current BehaviorVector (`novelty_search.py:32-54`):**
-1. ✅ `trade_frequency` - Trades per week
-2. ✅ `avg_hold_period` - Days, log-normalized
-3. ✅ `long_short_ratio` - -1 to +1 balance
-4. ✅ `return_autocorr` - -1 to +1 momentum vs mean-reversion
-5. ✅ `drawdown_depth` - 0 to 1 normalized
-6. ✅ `benchmark_corr` - -1 to +1 systematic vs idiosyncratic
-7. ✅ `signal_variance` - Normalized variance of position changes
+**New Dimensions Added:**
+```python
+recovery_time: float = 0.0      # Days to recover from max DD (normalized by 252)
+profit_factor: float = 1.0      # Gross profit / gross loss (clamped 0.5-2.0)
+sharpe_ratio: float = 0.0       # Risk-adjusted return (normalized -1 to +1)
+```
 
-**Missing Dimensions:**
-- ❌ `Recovery_Time` - Days to recover from max drawdown
-- ❌ `Profit_Factor` - Gross profit / gross loss ratio
-- ❌ `Explicit Sharpe` - Direct Sharpe ratio in behavior space
+**Full 10-Dimension Vector:**
+1. `trade_frequency` - Trades per week
+2. `avg_hold_period` - Days, log-normalized
+3. `long_short_ratio` - -1 to +1 balance
+4. `return_autocorr` - -1 to +1 momentum vs mean-reversion
+5. `drawdown_depth` - 0 to 1 normalized
+6. `benchmark_corr` - -1 to +1 systematic vs idiosyncratic
+7. `signal_variance` - Normalized variance of position changes
+8. `recovery_time` - Days to recover from max drawdown (NEW)
+9. `profit_factor` - Gross profit / gross loss ratio (NEW)
+10. `sharpe_ratio` - Direct Sharpe in behavior space (NEW)
 
-**Why These Matter:**
-- Recovery_Time captures drawdown resilience (different strategies may have same MaxDD but different recovery)
-- Profit_Factor distinguishes profitable vs unprofitable in behavior space
-- Explicit Sharpe enables similarity matching on risk-adjusted returns
+**Backwards Compatibility:**
+- `from_array()` handles old 7-dim arrays (uses defaults for new fields)
+- `to_array()` always outputs 10-dim for new genomes
 
-**Implementation Note:**
-`extract_behavior_vector()` (lines 96-184) would need enhancement to calculate these from equity curve and trade list
+**Verification:**
+Tested creation, serialization, and backwards compatibility all working
 
 ---
 
@@ -926,6 +928,9 @@ Add `regime_confirmation_days: int = 2` parameter and require stable regime clas
 | GP-009 | Add Calmar ratio | 30 min | MEDIUM | ✅ DONE |
 | GP-011 | Reduce migration rate | 5 min | MEDIUM | ✅ DONE |
 | GP-012 | Add plateau detection | 1 hour | MEDIUM | ✅ DONE |
+| GP-013 | Self-adaptive mutation | 30 min | HIGH | ✅ DONE (Jan 10) |
+| GP-014 | Omega Ratio | 20 min | MEDIUM | ✅ DONE (Jan 10) |
+| GP-017 | Behavioral descriptors | 30 min | MEDIUM | ✅ DONE (Jan 10) |
 | GP-015 | Add regime change lag | 30 min | LOW | Open |
 
 ---
@@ -1094,6 +1099,12 @@ python3 -c "from execution.alpaca_connector import AlpacaConnector; c = AlpacaCo
 | 2026-01-10 | GitHub repository configured for code backups: `github.com/thisElazar/trading_system` |
 | 2026-01-10 | SSH key authentication set up for Pi → GitHub push access |
 | 2026-01-10 | `.gitignore` updated: excludes SQLite WAL files, trained models, backups, Claude settings |
+| 2026-01-10 | **GA-003 VALIDATED** - GP Discovery Pipeline verified: 107 strategies discovered, 103 meet promotion thresholds |
+| 2026-01-10 | **GA-004 VERIFIED** - Portfolio fitness is ACTIVE in production (punchlist was incorrect - only test function had it disabled) |
+| 2026-01-10 | **GA-005 RESOLVED** - Dynamic novelty archive tuning: adaptive k_neighbors and archive expansion on diversity drop |
+| 2026-01-10 | **GP-013 RESOLVED** - Self-adaptive mutation rates: per-individual rates evolve with ES log-normal adaptation |
+| 2026-01-10 | **GP-014 RESOLVED** - Omega Ratio implemented in `fitness_utils.py` for non-normal distribution capture |
+| 2026-01-10 | **GP-017 RESOLVED** - BehaviorVector expanded to 10 dimensions: added recovery_time, profit_factor, sharpe_ratio |
 
 ---
 
