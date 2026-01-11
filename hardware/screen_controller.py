@@ -944,28 +944,40 @@ class ScreenController:
                                 })
                         else:
                             # GA history is stale - check if discovery phase is active
-                            # Discovery phase writes to evolution_history, not ga_history
+                            # Discovery phase writes to evolution_checkpoints table
                             discovery_active = False
                             try:
+                                # Check evolution_checkpoints for current generation
                                 cursor = conn.execute("""
-                                    SELECT generation, best_sortino, created_at
-                                    FROM evolution_history
+                                    SELECT generation, created_at
+                                    FROM evolution_checkpoints
                                     ORDER BY created_at DESC
                                     LIMIT 1
                                 """)
-                                discovery_row = cursor.fetchone()
-                                if discovery_row and discovery_row['created_at']:
-                                    disc_write = datetime.fromisoformat(discovery_row['created_at'])
-                                    disc_age = (datetime.utcnow() - disc_write).total_seconds()
-                                    if disc_age < self._research_stale_threshold:
+                                checkpoint_row = cursor.fetchone()
+                                if checkpoint_row and checkpoint_row['created_at']:
+                                    cp_write = datetime.fromisoformat(checkpoint_row['created_at'])
+                                    cp_age = (datetime.utcnow() - cp_write).total_seconds()
+                                    if cp_age < self._research_stale_threshold:
                                         discovery_active = True
+                                        # Get best Sortino from discovered_strategies
+                                        best_sortino = 0.0
+                                        try:
+                                            best_cursor = conn.execute("""
+                                                SELECT MAX(oos_sortino) FROM discovered_strategies
+                                            """)
+                                            best_row = best_cursor.fetchone()
+                                            if best_row and best_row[0]:
+                                                best_sortino = best_row[0]
+                                        except Exception:
+                                            pass
                                         with self._lock:
                                             self._research_stats.update({
                                                 'status': 'EVOLVING',
                                                 'strategy': 'GP-Discovery',
-                                                'generation': discovery_row['generation'] or 0,
-                                                'best_sharpe': round(discovery_row['best_sortino'] or 0, 2),
-                                                'last_update': discovery_row['created_at'],
+                                                'generation': checkpoint_row['generation'] or 0,
+                                                'best_sharpe': round(best_sortino, 2),
+                                                'last_update': checkpoint_row['created_at'],
                                             })
                             except Exception:
                                 pass  # Table might not exist
