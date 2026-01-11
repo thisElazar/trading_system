@@ -193,15 +193,77 @@ class WebhookHandler(AlertHandler):
             logger.warning(f"Webhook error: {e}")
 
 
+class TelegramHandler(AlertHandler):
+    """Send alerts via Telegram Bot API."""
+
+    def __init__(
+        self,
+        bot_token: str,
+        chat_id: str,
+        min_level: AlertLevel = AlertLevel.WARNING
+    ):
+        super().__init__(min_level)
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+    def _format_message(self, alert: Alert) -> str:
+        """Format alert for Telegram (Markdown)."""
+        icon = {
+            AlertLevel.DEBUG: "🔍",
+            AlertLevel.INFO: "ℹ️",
+            AlertLevel.WARNING: "⚠️",
+            AlertLevel.ERROR: "❌",
+            AlertLevel.CRITICAL: "🚨"
+        }.get(alert.level, "•")
+
+        # Escape markdown special chars in message
+        message = alert.message.replace('_', '\\_').replace('*', '\\*')
+        title = alert.title.replace('_', '\\_').replace('*', '\\*')
+
+        return f"{icon} *{title}*\n{message}"
+
+    def handle(self, alert: Alert):
+        if not self.should_handle(alert):
+            return
+
+        if not self.bot_token or not self.chat_id:
+            return
+
+        try:
+            payload = {
+                'chat_id': self.chat_id,
+                'text': self._format_message(alert),
+                'parse_mode': 'Markdown'
+            }
+
+            data = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(
+                self.api_url,
+                data=data,
+                headers={'Content-Type': 'application/json'}
+            )
+
+            with urllib.request.urlopen(req, timeout=10) as response:
+                if response.status != 200:
+                    logger.warning(f"Telegram returned {response.status}")
+
+        except urllib.error.URLError as e:
+            logger.warning(f"Telegram failed: {e}")
+        except Exception as e:
+            logger.warning(f"Telegram error: {e}")
+
+
 class AlertManager:
     """
     Central alert management.
-    
+
     Usage:
         alerts = AlertManager()
         alerts.add_handler(ConsoleHandler())
         alerts.add_handler(WebhookHandler(slack_url))
-        
+        alerts.add_handler(TelegramHandler(bot_token, chat_id))
+
         alerts.signal("AAPL", "long", 150.0, "pairs_trading")
         alerts.error("Strategy failed", exception)
     """
@@ -428,20 +490,25 @@ class AlertManager:
 def create_alert_manager(
     console: bool = True,
     file: bool = True,
-    webhook_url: str = None
+    webhook_url: str = None,
+    telegram_token: str = None,
+    telegram_chat_id: str = None
 ) -> AlertManager:
     """Create alert manager with common handlers."""
     manager = AlertManager()
-    
+
     if console:
         manager.add_handler(ConsoleHandler(min_level=AlertLevel.INFO))
-    
+
     if file:
         manager.add_handler(FileHandler(min_level=AlertLevel.DEBUG))
-    
+
     if webhook_url:
         manager.add_handler(WebhookHandler(webhook_url, min_level=AlertLevel.WARNING))
-    
+
+    if telegram_token and telegram_chat_id:
+        manager.add_handler(TelegramHandler(telegram_token, telegram_chat_id, min_level=AlertLevel.WARNING))
+
     return manager
 
 

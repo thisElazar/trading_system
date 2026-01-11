@@ -46,9 +46,9 @@ from data.cached_data_manager import CachedDataManager
 from execution.scheduler import StrategyScheduler, MarketHours, create_default_scheduler
 from execution.signal_tracker import ExecutionTracker
 from execution.alpaca_connector import AlpacaConnector
-from execution.alerts import AlertManager
+from execution.alerts import AlertManager, TelegramHandler, ConsoleHandler, FileHandler, AlertLevel
 from execution.circuit_breaker import CircuitBreakerManager, CircuitBreakerConfig
-from config import CIRCUIT_BREAKER, WEEKEND_CONFIG, ALPACA_API_KEY, ALPACA_SECRET_KEY, DATABASES, INTRADAY_EXIT_CONFIG
+from config import CIRCUIT_BREAKER, WEEKEND_CONFIG, ALPACA_API_KEY, ALPACA_SECRET_KEY, DATABASES, INTRADAY_EXIT_CONFIG, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # Intelligence modules
 try:
@@ -443,6 +443,16 @@ class DailyOrchestrator:
     def alert_manager(self) -> AlertManager:
         if self._alert_manager is None:
             self._alert_manager = AlertManager()
+            # Add console handler (INFO level)
+            self._alert_manager.add_handler(ConsoleHandler(min_level=AlertLevel.INFO))
+            # Add file handler (DEBUG level for full history)
+            self._alert_manager.add_handler(FileHandler(min_level=AlertLevel.DEBUG))
+            # Add Telegram handler if configured (WARNING+ only)
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                self._alert_manager.add_handler(
+                    TelegramHandler(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, min_level=AlertLevel.WARNING)
+                )
+                logger.info("Telegram alerts enabled")
         return self._alert_manager
 
     @property

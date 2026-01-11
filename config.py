@@ -104,6 +104,10 @@ ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 
+# Telegram - for alerts
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 # ============================================================================
 # TRADING PARAMETERS
 # ============================================================================

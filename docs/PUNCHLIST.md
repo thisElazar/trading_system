@@ -11,11 +11,11 @@
 | Category | P0 | P1 | P2 | Resolved | Total |
 |----------|----|----|----|---------:|------:|
 | Bugs | 0 | 0 | 0 | 8 | 8 |
-| Architecture | 0 | 1 | 1 | 4 | 6 |
+| Architecture | 0 | 0 | 1 | 5 | 6 |
 | Stability | 0 | 0 | 0 | 10 | 10 |
 | Research/GA | 0 | 0 | 2 | 4 | 6 |
 | GP Research Gaps | 0 | 0 | 5 | 6 | 11 |
-| **Total** | **0** | **1** | **8** | **32** | **41** |
+| **Total** | **0** | **0** | **8** | **33** | **41** |
 
 **Resolved Jan 4:** BUG-001 (pairs/cash account), BUG-002 (timezone), BUG-005 (signals table), BUG-007 (test data cleanup), ARCH-003 (error logging), STAB-003 (log rotation), STAB-005 (version pinning)
 
@@ -23,7 +23,7 @@
 
 **Resolved Jan 9:** GP-007 (paper trading duration), GP-008 (CPCV validation), GP-009 (Calmar ratio), GP-010 (HMM regime), GP-011 (migration rate), GP-012 (novelty pulsation), GA-001 (stagnation detection), STAB-001 (memory monitoring), ARCH-002 (real-time P&L), STAB-004 (graceful shutdown), BUG-003 (sector rotation), GA-002 (fitness bounds), BUG-004 (gap-fill intraday data), ARCH-005 (intraday refresh)
 
-**Resolved Jan 10:** STAB-002 (database backups enabled), GA-006 (persistent pool refactor - fixes resource exhaustion)
+**Resolved Jan 10:** STAB-002 (database backups enabled), GA-006 (persistent pool refactor), ARCH-006 (Telegram alerts)
 
 ---
 
@@ -340,39 +340,30 @@ Gap-fill strategy is enabled (10% allocation, research Sharpe 2.38) but has NO f
 ---
 
 #### ARCH-006: No Alerting System
-**Status:** INFRASTRUCTURE EXISTS BUT NOT CONFIGURED (2026-01-09)
-**Impact:** Must manually check logs/dashboard
+**Status:** RESOLVED (2026-01-10)
+**Impact:** Now receiving Telegram alerts for warnings, errors, and critical events
 
-**Investigation Findings (Jan 9):**
+**Solution Applied (Jan 10):**
+1. Added `TelegramHandler` class to `execution/alerts.py`
+   - Uses Telegram Bot API (`/sendMessage` endpoint)
+   - Formats alerts with emoji icons and Markdown
+   - Sends WARNING+ level alerts to Telegram
+2. Added Telegram config to `config.py`:
+   - `TELEGRAM_BOT_TOKEN` from environment
+   - `TELEGRAM_CHAT_ID` from environment
+3. Credentials stored in `.env`:
+   - Bot: @thisElazar_TradeBot
+   - Chat ID: User's personal chat
+4. Wired up in `daily_orchestrator.py`:
+   - `alert_manager` property now initializes handlers
+   - Console (INFO+), File (DEBUG+), Telegram (WARNING+)
 
-**What Exists (`execution/alerts.py` - 476 lines):**
-- ✅ `Alert` data class with formatting methods
-- ✅ `AlertLevel` enum (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-- ✅ `AlertType` enum (SIGNAL, EXECUTION, POSITION, STOP_LOSS, etc.)
-- ✅ `ConsoleHandler` - Prints to stdout
-- ✅ `FileHandler` - Writes to logs/alerts.log
-- ✅ `WebhookHandler` - Sends to Slack/Discord via webhook URL
-- ✅ `AlertManager` with 12+ convenience methods
-
-**Wiring Status:**
-- ✅ Imported in `daily_orchestrator.py` (line 49)
-- ✅ Integrated in `circuit_breaker.py` (uses `.send_alert()`)
-- ✅ Integrated in `orchestration/intervention.py`
-- ❌ **No webhook URL configured** anywhere
-- ❌ `logs/alerts.log` is empty (1 byte)
-
-**What's Missing:**
-- ❌ No ALERT, WEBHOOK, SLACK config in config.py
-- ❌ No email notifications (no EmailHandler)
-- ❌ No Telegram notifications
-- ❌ Handlers not initialized in production path
-
-**Quick Fix:**
-Add to `.env` or config.py:
-```python
-SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/..."
-```
-Then initialize AlertManager with webhook_url parameter
+**Alert Triggers:**
+- Circuit breaker events
+- Position exits (stop loss, take profit)
+- Strategy errors
+- Critical system issues
+- Daily performance summary
 
 ---
 
