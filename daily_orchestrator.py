@@ -242,7 +242,7 @@ class DailyOrchestrator:
         MarketPhase.PRE_MARKET: PhaseConfig(
             start_hour=8, start_minute=0,
             end_hour=9, end_minute=30,
-            tasks=["refresh_premarket_data", "refresh_intraday_data", "refresh_data", "system_check", "sync_positions_from_broker", "review_positions", "cancel_stale_orders", "update_regime_detection", "calculate_position_scalars", "load_live_strategies"],
+            tasks=["stop_research_processes", "refresh_premarket_data", "refresh_intraday_data", "refresh_data", "system_check", "sync_positions_from_broker", "review_positions", "cancel_stale_orders", "update_regime_detection", "calculate_position_scalars", "load_live_strategies"],
             check_interval_seconds=60
         ),
         MarketPhase.INTRADAY_OPEN: PhaseConfig(
@@ -342,6 +342,7 @@ class DailyOrchestrator:
         # Task registry
         self._task_registry: Dict[str, Callable] = {
             # Pre-market tasks
+            "stop_research_processes": self._task_stop_research_processes,
             "refresh_premarket_data": self._task_refresh_premarket_data,
             "refresh_data": self._task_refresh_data,
             "system_check": self._task_system_check,
@@ -685,6 +686,69 @@ class DailyOrchestrator:
         except Exception as e:
             logger.error(f"Data refresh failed: {e}")
             return False
+
+    def _task_stop_research_processes(self) -> bool:
+        """Kill any running research processes before trading begins.
+
+        This ensures research doesn't compete for CPU/memory during market hours.
+        Research processes may still be running from overnight or weekend phases.
+        """
+        import subprocess
+
+        try:
+            # Find all research processes
+            result = subprocess.run(
+                ["pgrep", "-f", "run_nightly_research.py"],
+                capture_output=True, text=True, timeout=5
+            )
+
+            if result.returncode != 0 or not result.stdout.strip():
+                logger.info("No research processes running - ready for trading")
+                return True
+
+            pids = result.stdout.strip().split('\n')
+            logger.warning(f"Found {len(pids)} research processes still running at pre-market: {pids}")
+
+            # Kill each process
+            killed = 0
+            for pid in pids:
+                try:
+                    pid = int(pid.strip())
+                    os.kill(pid, signal.SIGTERM)
+                    killed += 1
+                    logger.info(f"Sent SIGTERM to research process {pid}")
+                except (ValueError, ProcessLookupError, PermissionError) as e:
+                    logger.debug(f"Could not kill PID {pid}: {e}")
+
+            # Wait briefly and check if they're gone
+            time.sleep(2)
+
+            # Force kill any remaining
+            result = subprocess.run(
+                ["pgrep", "-f", "run_nightly_research.py"],
+                capture_output=True, text=True, timeout=5
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                remaining = result.stdout.strip().split('\n')
+                logger.warning(f"Force killing {len(remaining)} stubborn research processes")
+                for pid in remaining:
+                    try:
+                        os.kill(int(pid.strip()), signal.SIGKILL)
+                    except (ValueError, ProcessLookupError, PermissionError):
+                        pass
+
+            # Update hardware display
+            if self._hardware:
+                self._hardware.set_research_active(False)
+
+            logger.info(f"Research cleanup complete - killed {killed} processes")
+            return True
+
+        except Exception as e:
+            logger.error(f"Research cleanup failed: {e}")
+            # Don't fail the phase - trading can proceed even if cleanup fails
+            return True
 
     def _task_refresh_premarket_data(self) -> bool:
         """Fetch fresh daily data from Alpaca before market open.
