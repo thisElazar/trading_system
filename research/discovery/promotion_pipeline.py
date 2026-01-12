@@ -30,7 +30,7 @@ import sqlite3
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Any
+from typing import Callable, Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
@@ -99,10 +99,63 @@ class PromotionCriteria:
     min_rolling_sharpe: float = 0.0     # 60-day rolling
     max_correlation_increase: float = 0.3
 
+    # GP-016: Alpha Decay Detection
+    # Rolling Sharpe thresholds for multi-window analysis
+    rolling_sharpe_windows: Tuple[int, int, int] = (756, 252, 63)  # 36-mo, 12-mo, 3-mo (trading days)
+    min_sharpe_36mo: float = 0.3          # Long-term baseline
+    min_sharpe_12mo: float = 0.2          # Medium-term signal
+    min_sharpe_3mo: float = 0.0           # Short-term can be negative briefly
+    sharpe_decay_threshold: float = 0.5   # 50% decline from peak = decay warning
+    max_factor_correlation: float = 0.6   # Crowding risk if correlated with major factors
+    max_slippage_ratio: float = 2.0       # paper_slippage / expected_slippage
+
     # Allocation
     initial_paper_allocation: float = 0.05    # 5%
     initial_live_allocation: float = 0.03     # 3%
     max_strategy_allocation: float = 0.15     # 15%
+
+
+@dataclass
+class AlphaDecayMetrics:
+    """GP-016: Metrics for alpha decay detection."""
+    strategy_id: str
+    analysis_date: datetime
+
+    # Rolling Sharpe at different windows
+    sharpe_36mo: Optional[float] = None
+    sharpe_12mo: Optional[float] = None
+    sharpe_3mo: Optional[float] = None
+
+    # Historical peak and decay
+    peak_sharpe: float = 0.0
+    peak_sharpe_date: Optional[datetime] = None
+    sharpe_decay_pct: float = 0.0  # Current vs peak
+
+    # Factor correlations (crowding risk)
+    momentum_corr: float = 0.0
+    value_corr: float = 0.0
+    quality_corr: float = 0.0
+    volatility_corr: float = 0.0
+    max_factor_corr: float = 0.0
+
+    # Execution quality
+    avg_slippage_bps: float = 0.0
+    slippage_trend: float = 0.0  # Positive = worsening
+    paper_vs_live_gap: float = 0.0  # Difference in Sharpe
+
+    # Decay signals
+    is_decaying: bool = False
+    decay_signals: List[str] = field(default_factory=list)
+    severity: str = "none"  # none, mild, moderate, severe
+
+    def to_dict(self) -> dict:
+        result = {}
+        for key, value in asdict(self).items():
+            if isinstance(value, datetime):
+                result[key] = value.isoformat() if value else None
+            else:
+                result[key] = value
+        return result
 
 
 @dataclass
@@ -182,6 +235,229 @@ class PromotionResult:
 
 
 # =============================================================================
+# GP-016: ALPHA DECAY MONITOR
+# =============================================================================
+
+class AlphaDecayMonitor:
+    """
+    GP-016: Monitor strategies for alpha decay.
+
+    Detects performance degradation through:
+    - Multi-window rolling Sharpe analysis (36/12/3 month)
+    - Trend analysis of Sharpe degradation over time
+    - Factor correlation monitoring (momentum, value, quality crowding)
+    - Slippage trend tracking (paper vs live execution gap)
+
+    Research basis:
+    - Rolling 36-month Sharpe identifies long-term trend
+    - Factor correlation > 0.6 signals crowding risk
+    - Slippage growth indicates capacity constraints
+    """
+
+    def __init__(self, criteria: PromotionCriteria = None):
+        self.criteria = criteria or PromotionCriteria()
+        self._sharpe_history: Dict[str, List[Tuple[datetime, float]]] = {}
+
+    def calculate_rolling_sharpe(
+        self,
+        returns: pd.Series,
+        window_days: int
+    ) -> Optional[float]:
+        """Calculate rolling Sharpe ratio for a given window."""
+        if len(returns) < window_days:
+            return None
+
+        window_returns = returns.iloc[-window_days:]
+        if window_returns.std() == 0:
+            return 0.0
+
+        return float(window_returns.mean() / window_returns.std() * np.sqrt(252))
+
+    def calculate_factor_correlations(
+        self,
+        strategy_returns: pd.Series,
+        factor_returns: Dict[str, pd.Series]
+    ) -> Dict[str, float]:
+        """
+        Calculate correlations with common factors.
+
+        Args:
+            strategy_returns: Strategy daily returns
+            factor_returns: Dict of factor name -> returns series
+
+        Returns:
+            Dict of factor name -> correlation
+        """
+        correlations = {}
+
+        for factor_name, factor_ret in factor_returns.items():
+            # Align series
+            common_idx = strategy_returns.index.intersection(factor_ret.index)
+            if len(common_idx) < 60:  # Need at least 60 days
+                correlations[factor_name] = 0.0
+                continue
+
+            strat = strategy_returns.loc[common_idx]
+            factor = factor_ret.loc[common_idx]
+
+            if strat.std() == 0 or factor.std() == 0:
+                correlations[factor_name] = 0.0
+            else:
+                correlations[factor_name] = float(strat.corr(factor))
+
+        return correlations
+
+    def analyze_decay(
+        self,
+        strategy_id: str,
+        returns: pd.Series,
+        factor_returns: Optional[Dict[str, pd.Series]] = None,
+        slippage_history: Optional[pd.Series] = None,
+        paper_sharpe: Optional[float] = None
+    ) -> AlphaDecayMetrics:
+        """
+        Comprehensive alpha decay analysis.
+
+        Args:
+            strategy_id: Strategy identifier
+            returns: Daily returns series
+            factor_returns: Optional factor return series for correlation
+            slippage_history: Optional slippage basis points over time
+            paper_sharpe: Optional paper trading Sharpe for comparison
+
+        Returns:
+            AlphaDecayMetrics with full analysis
+        """
+        now = datetime.now()
+        metrics = AlphaDecayMetrics(
+            strategy_id=strategy_id,
+            analysis_date=now
+        )
+        decay_signals = []
+
+        # Calculate rolling Sharpes
+        windows = self.criteria.rolling_sharpe_windows
+        metrics.sharpe_36mo = self.calculate_rolling_sharpe(returns, windows[0])
+        metrics.sharpe_12mo = self.calculate_rolling_sharpe(returns, windows[1])
+        metrics.sharpe_3mo = self.calculate_rolling_sharpe(returns, windows[2])
+
+        # Track Sharpe history and find peak
+        if strategy_id not in self._sharpe_history:
+            self._sharpe_history[strategy_id] = []
+
+        current_sharpe = metrics.sharpe_12mo or 0.0
+        self._sharpe_history[strategy_id].append((now, current_sharpe))
+
+        # Find peak Sharpe
+        if self._sharpe_history[strategy_id]:
+            peak_entry = max(self._sharpe_history[strategy_id], key=lambda x: x[1])
+            metrics.peak_sharpe = peak_entry[1]
+            metrics.peak_sharpe_date = peak_entry[0]
+
+            # Calculate decay percentage
+            if metrics.peak_sharpe > 0:
+                metrics.sharpe_decay_pct = 1.0 - (current_sharpe / metrics.peak_sharpe)
+            else:
+                metrics.sharpe_decay_pct = 0.0
+
+        # Check Sharpe thresholds
+        if metrics.sharpe_36mo is not None and metrics.sharpe_36mo < self.criteria.min_sharpe_36mo:
+            decay_signals.append(f"36mo Sharpe {metrics.sharpe_36mo:.2f} < {self.criteria.min_sharpe_36mo}")
+
+        if metrics.sharpe_12mo is not None and metrics.sharpe_12mo < self.criteria.min_sharpe_12mo:
+            decay_signals.append(f"12mo Sharpe {metrics.sharpe_12mo:.2f} < {self.criteria.min_sharpe_12mo}")
+
+        if metrics.sharpe_3mo is not None and metrics.sharpe_3mo < self.criteria.min_sharpe_3mo:
+            decay_signals.append(f"3mo Sharpe {metrics.sharpe_3mo:.2f} < {self.criteria.min_sharpe_3mo}")
+
+        # Check decay from peak
+        if metrics.sharpe_decay_pct > self.criteria.sharpe_decay_threshold:
+            decay_signals.append(
+                f"Sharpe declined {metrics.sharpe_decay_pct:.1%} from peak "
+                f"({metrics.peak_sharpe:.2f} -> {current_sharpe:.2f})"
+            )
+
+        # Factor correlations (crowding detection)
+        if factor_returns:
+            correlations = self.calculate_factor_correlations(returns, factor_returns)
+            metrics.momentum_corr = correlations.get('momentum', 0.0)
+            metrics.value_corr = correlations.get('value', 0.0)
+            metrics.quality_corr = correlations.get('quality', 0.0)
+            metrics.volatility_corr = correlations.get('volatility', 0.0)
+            metrics.max_factor_corr = max(abs(c) for c in correlations.values()) if correlations else 0.0
+
+            if metrics.max_factor_corr > self.criteria.max_factor_correlation:
+                crowded_factors = [
+                    f for f, c in correlations.items()
+                    if abs(c) > self.criteria.max_factor_correlation
+                ]
+                decay_signals.append(
+                    f"High factor correlation: {', '.join(crowded_factors)} "
+                    f"(max={metrics.max_factor_corr:.2f})"
+                )
+
+        # Slippage analysis
+        if slippage_history is not None and len(slippage_history) > 20:
+            metrics.avg_slippage_bps = float(slippage_history.mean())
+
+            # Calculate slippage trend (slope of linear regression)
+            x = np.arange(len(slippage_history))
+            if len(x) > 1:
+                coeffs = np.polyfit(x, slippage_history.values, 1)
+                metrics.slippage_trend = float(coeffs[0])  # Positive = worsening
+
+                if metrics.slippage_trend > 0.1:  # Significant positive trend
+                    decay_signals.append(
+                        f"Slippage trending up: {metrics.slippage_trend:.2f} bps/day"
+                    )
+
+        # Paper vs live gap
+        if paper_sharpe is not None and metrics.sharpe_12mo is not None:
+            metrics.paper_vs_live_gap = paper_sharpe - metrics.sharpe_12mo
+            if metrics.paper_vs_live_gap > 0.5:  # Live significantly worse than paper
+                decay_signals.append(
+                    f"Live Sharpe {metrics.paper_vs_live_gap:.2f} below paper trading"
+                )
+
+        # Determine decay status and severity
+        metrics.decay_signals = decay_signals
+        metrics.is_decaying = len(decay_signals) > 0
+
+        if len(decay_signals) == 0:
+            metrics.severity = "none"
+        elif len(decay_signals) == 1:
+            metrics.severity = "mild"
+        elif len(decay_signals) <= 3:
+            metrics.severity = "moderate"
+        else:
+            metrics.severity = "severe"
+
+        return metrics
+
+    def should_retire(self, metrics: AlphaDecayMetrics) -> Tuple[bool, str]:
+        """
+        Determine if strategy should be retired based on decay metrics.
+
+        Returns:
+            Tuple of (should_retire, reason)
+        """
+        if metrics.severity == "severe":
+            return True, f"Severe alpha decay: {'; '.join(metrics.decay_signals[:3])}"
+
+        # Specific retirement triggers
+        if metrics.sharpe_36mo is not None and metrics.sharpe_36mo < 0:
+            return True, f"36-month Sharpe negative ({metrics.sharpe_36mo:.2f})"
+
+        if metrics.sharpe_decay_pct > 0.7:  # 70% decline from peak
+            return True, f"Sharpe declined {metrics.sharpe_decay_pct:.1%} from peak"
+
+        if metrics.max_factor_corr > 0.8:  # Highly crowded
+            return True, f"Strategy highly crowded (factor corr={metrics.max_factor_corr:.2f})"
+
+        return False, "Within acceptable decay limits"
+
+
+# =============================================================================
 # PROMOTION PIPELINE
 # =============================================================================
 
@@ -219,6 +495,9 @@ class PromotionPipeline:
         self._on_retirement_callback = on_retirement
         self.db_path = db_path or Path(__file__).parent.parent.parent / "data" / "promotion_pipeline.db"
         self.db = get_db()
+
+        # GP-016: Alpha decay monitor
+        self.decay_monitor = AlphaDecayMonitor(self.criteria)
 
         # Initialize database
         self._init_db()
@@ -568,14 +847,28 @@ class PromotionPipeline:
 
         return True, "Ready for live trading", metrics
 
-    def check_live_for_retirement(self, strategy_id: str) -> Tuple[bool, str, Dict]:
+    def check_live_for_retirement(
+        self,
+        strategy_id: str,
+        returns: Optional[pd.Series] = None,
+        factor_returns: Optional[Dict[str, pd.Series]] = None,
+        slippage_history: Optional[pd.Series] = None
+    ) -> Tuple[bool, str, Dict]:
         """
         Check if a live strategy should be retired.
 
-        Criteria:
+        GP-016 Enhanced with alpha decay detection:
         - Max DD exceeded
-        - Rolling Sharpe negative
-        - Correlation increased significantly
+        - Rolling Sharpe analysis (36/12/3 month windows)
+        - Sharpe decay from peak
+        - Factor correlation monitoring (crowding)
+        - Slippage trend tracking
+
+        Args:
+            strategy_id: Strategy identifier
+            returns: Optional daily returns series for decay analysis
+            factor_returns: Optional factor return series for correlation
+            slippage_history: Optional slippage basis points over time
 
         Returns:
             Tuple of (should_retire, reason, metrics)
@@ -594,14 +887,73 @@ class PromotionPipeline:
             'live_max_drawdown': record.live_max_drawdown
         }
 
-        # Check retirement criteria
+        # Original basic checks
         if record.live_max_drawdown < self.criteria.max_live_drawdown:
             return True, f"Max drawdown {record.live_max_drawdown:.1f}% exceeded limit", metrics
 
         if record.live_sharpe < self.criteria.min_rolling_sharpe and record.live_days > 30:
             return True, f"Rolling Sharpe {record.live_sharpe:.2f} below threshold", metrics
 
+        # GP-016: Enhanced alpha decay analysis
+        if returns is not None and len(returns) >= 63:  # At least 3 months of data
+            decay_metrics = self.decay_monitor.analyze_decay(
+                strategy_id=strategy_id,
+                returns=returns,
+                factor_returns=factor_returns,
+                slippage_history=slippage_history,
+                paper_sharpe=record.paper_sharpe
+            )
+
+            # Add decay metrics to return
+            metrics['decay_analysis'] = decay_metrics.to_dict()
+            metrics['decay_severity'] = decay_metrics.severity
+            metrics['decay_signals'] = decay_metrics.decay_signals
+
+            # Check if decay warrants retirement
+            should_retire, decay_reason = self.decay_monitor.should_retire(decay_metrics)
+            if should_retire:
+                return True, f"Alpha decay detected: {decay_reason}", metrics
+
+            # Log warning for moderate decay
+            if decay_metrics.severity in ('moderate', 'mild'):
+                logger.warning(
+                    f"Strategy {strategy_id} showing {decay_metrics.severity} decay: "
+                    f"{', '.join(decay_metrics.decay_signals)}"
+                )
+
         return False, "Strategy performing within limits", metrics
+
+    def analyze_strategy_decay(
+        self,
+        strategy_id: str,
+        returns: pd.Series,
+        factor_returns: Optional[Dict[str, pd.Series]] = None,
+        slippage_history: Optional[pd.Series] = None
+    ) -> AlphaDecayMetrics:
+        """
+        GP-016: Standalone alpha decay analysis for a strategy.
+
+        Use this for monitoring without retirement decision.
+
+        Args:
+            strategy_id: Strategy identifier
+            returns: Daily returns series
+            factor_returns: Optional factor return series for correlation
+            slippage_history: Optional slippage basis points over time
+
+        Returns:
+            AlphaDecayMetrics with full analysis
+        """
+        record = self.get_strategy_record(strategy_id)
+        paper_sharpe = record.paper_sharpe if record else None
+
+        return self.decay_monitor.analyze_decay(
+            strategy_id=strategy_id,
+            returns=returns,
+            factor_returns=factor_returns,
+            slippage_history=slippage_history,
+            paper_sharpe=paper_sharpe
+        )
 
     # =========================================================================
     # PROMOTIONS

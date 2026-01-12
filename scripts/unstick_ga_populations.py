@@ -189,18 +189,22 @@ def reset_strategy_population(
         logger.info(f"    Creating {n_new} new random individuals")
         logger.info(f"    New generation: {new_generation}")
     else:
-        # Update population in database
+        # Delete existing population and insert fresh one
+        cursor.execute("DELETE FROM ga_populations WHERE strategy = ?", (strategy,))
+
         cursor.execute("""
-            UPDATE ga_populations
-            SET population_json = ?,
-                generation = ?,
-                updated_at = ?
-            WHERE strategy = ?
+            INSERT INTO ga_populations (
+                strategy, generation, population_json, best_fitness,
+                best_genes_json, population_size, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
-            json.dumps(new_population),
+            strategy,
             new_generation,
-            datetime.now().isoformat(),
-            strategy
+            json.dumps(new_population),
+            best_fitness,
+            best_genes_json,
+            len(new_population),
+            datetime.now().isoformat()
         ))
 
         # Log restart event in history

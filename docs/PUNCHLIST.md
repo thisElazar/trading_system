@@ -11,11 +11,13 @@
 | Category | P0 | P1 | P2 | Resolved | Total |
 |----------|----|----|----|---------:|------:|
 | Bugs | 0 | 0 | 0 | 8 | 8 |
-| Architecture | 0 | 0 | 1 | 5 | 6 |
+| Architecture | 0 | 0 | 0 | 6 | 6 |
 | Stability | 0 | 0 | 0 | 10 | 10 |
 | Research/GA | 0 | 0 | 0 | 6 | 6 |
-| GP Research Gaps | 0 | 0 | 2 | 9 | 11 |
-| **Total** | **0** | **0** | **3** | **38** | **41** |
+| GP Research Gaps | 0 | 0 | 0 | 11 | 11 |
+| **Total** | **0** | **0** | **0** | **41** | **41** |
+
+**ALL ITEMS RESOLVED - PUNCHLIST COMPLETE!**
 
 **Resolved Jan 4:** BUG-001 (pairs/cash account), BUG-002 (timezone), BUG-005 (signals table), BUG-007 (test data cleanup), ARCH-003 (error logging), STAB-003 (log rotation), STAB-005 (version pinning)
 
@@ -24,6 +26,8 @@
 **Resolved Jan 9:** GP-007 (paper trading duration), GP-008 (CPCV validation), GP-009 (Calmar ratio), GP-010 (HMM regime), GP-011 (migration rate), GP-012 (novelty pulsation), GA-001 (stagnation detection), STAB-001 (memory monitoring), ARCH-002 (real-time P&L), STAB-004 (graceful shutdown), BUG-003 (sector rotation), GA-002 (fitness bounds), BUG-004 (gap-fill intraday data), ARCH-005 (intraday refresh)
 
 **Resolved Jan 10:** STAB-002 (database backups enabled), GA-006 (persistent pool refactor), ARCH-006 (Telegram alerts), GA-003 (GP discovery validated), GA-004 (portfolio fitness verified working), GA-005 (dynamic novelty tuning), GP-013 (self-adaptive mutation), GP-014 (Omega ratio), GP-017 (behavioral descriptors)
+
+**Resolved Jan 11:** GP-015 (regime confirmation lag), GP-016 (alpha decay detection)
 
 ---
 
@@ -831,57 +835,74 @@ Tested with good (Omega=2.4), bad (Omega=0.48), and skewed (Omega=1.4) strategie
 ---
 
 #### GP-015: 2-Day Lag Before Regime Changes
-**Status:** NOT IMPLEMENTED (2026-01-09)
-**Impact:** Potential whipsaws from noisy regime detection
+**Status:** RESOLVED (2026-01-11)
+**Impact:** Prevents whipsaws from noisy regime detection
 
-**Investigation Findings (Jan 9):**
+**Solution Applied (Jan 11):**
+
+Added regime confirmation state machine to both regime detectors:
+
+**Config (`config.py`):**
+- Added `regime_confirmation_days: 2` to `HMM_REGIME_CONFIG`
 
 **ML Regime Detector (`ml_regime_detector.py`):**
-- ❌ No lag/delay logic before acting on regime changes
-- `predict_regime()` returns immediate classification
-- `transition_lookback_days: int = 5` defined but unused in actual logic
-- Transition detection only checks probability spread (reactive, not anticipatory)
+- Added `MLRegimeConfig.regime_confirmation_days: int = 2`
+- Added `_regime_confirmation_buffer`, `_confirmed_regime`, `_pending_regime` tracking
+- Added `_update_regime_confirmation()` state machine
+- Added `get_confirmed_regime()` -> (regime, confidence, is_transitioning)
+- Reduces confidence during transition by up to 30%
 
 **HMM Regime Detector (`hmm_regime_detector.py`):**
-- ❌ Pure probabilistic detection with immediate regime assignment
-- `detect_regime()` returns current regime without lag
-- `predict_next_regime()` exists for forecasts but not for delaying signals
+- Added `HMMConfig.regime_confirmation_days: int = 2`
+- Added identical confirmation state machine
+- Added `get_confirmed_regime()` method
 
-**What's Missing:**
-- No confirmation counter requiring regime stability across 2+ consecutive days
-- No state machine tracking "detected" vs "confirmed" regimes
-- No smoothing filter for brief regime fluctuations
-
-**Recommendation:**
-Add `regime_confirmation_days: int = 2` parameter and require stable regime classification before propagating to strategies
+**Behavior:**
+- Raw detection continues as before (unchanged API)
+- New `get_confirmed_regime()` returns stable regime only after N consecutive days
+- Logs regime change confirmations for monitoring
 
 ---
 
 #### GP-016: Alpha Decay Detection System
-**Status:** BASIC ONLY - Missing Rolling Windows (2026-01-09)
-**Impact:** May not catch decay early enough
+**Status:** RESOLVED (2026-01-11)
+**Impact:** Early detection of strategy performance degradation
 
-**Investigation Findings (Jan 9):**
+**Solution Applied (Jan 11):**
 
-**What Exists (`promotion_pipeline.py`):**
-- `check_live_for_retirement()` (lines 571-604)
-- Only checks: `live_sharpe < 0.0` (line 601-602)
-- `min_rolling_sharpe: float = 0.0` threshold (line 99)
+Added comprehensive alpha decay detection system:
 
-**What's Missing:**
-- ❌ No rolling Sharpe calculations (36-month, 12-month, 3-month windows)
-- ❌ No trend analysis of Sharpe degradation over time
-- ❌ No factor correlation monitoring (momentum/value crowding detection)
-- ❌ No slippage trend tracking (paper vs live execution comparison)
-- ❌ No time-series analysis in database schema
+**PromotionCriteria (`promotion_pipeline.py`):**
+- `rolling_sharpe_windows: (756, 252, 63)` - 36/12/3 month windows
+- `min_sharpe_36mo: 0.3`, `min_sharpe_12mo: 0.2`, `min_sharpe_3mo: 0.0`
+- `sharpe_decay_threshold: 0.5` - 50% decline from peak triggers warning
+- `max_factor_correlation: 0.6` - crowding risk threshold
+- `max_slippage_ratio: 2.0` - paper vs live execution gap
 
-**Comment at Line 577:**
-"Rolling Sharpe negative" mentioned but only as variable name, not calculated
+**AlphaDecayMetrics dataclass:**
+- Rolling Sharpe at 3 windows (36mo, 12mo, 3mo)
+- Peak Sharpe tracking with date and decay percentage
+- Factor correlations (momentum, value, quality, volatility)
+- Slippage trend analysis via linear regression
+- Decay severity classification (none, mild, moderate, severe)
 
-**Research Recommendation:**
-- Rolling 36-month Sharpe for trend identification
-- Factor correlation > 0.6 signals crowding risk
-- Slippage growth indicates capacity constraints
+**AlphaDecayMonitor class:**
+- `calculate_rolling_sharpe()` - windowed Sharpe calculation
+- `calculate_factor_correlations()` - crowding detection
+- `analyze_decay()` - comprehensive decay analysis
+- `should_retire()` - retirement decision with reason
+
+**Enhanced `check_live_for_retirement()`:**
+- Now accepts optional returns, factor_returns, slippage_history
+- Performs full decay analysis when data available
+- Logs warnings for mild/moderate decay before retirement
+- Returns decay metrics in response dict
+
+**Retirement Triggers:**
+- Severe decay (3+ signals)
+- 36-month Sharpe negative
+- 70% decline from peak Sharpe
+- Factor correlation > 0.8 (highly crowded)
 
 ---
 

@@ -303,6 +303,11 @@ HMM_REGIME_CONFIG = {
     "confidence_threshold": 0.7,        # Min confidence to use HMM regime
     "blend_with_vix": True,            # Combine HMM + VIX for robust detection
     "blend_hmm_weight": 0.6,           # Weight for HMM in blended detection
+
+    # GP-015: Regime change confirmation lag
+    # Requires stable regime classification for N consecutive days before confirming
+    # Prevents whipsaws from noisy single-day regime fluctuations
+    "regime_confirmation_days": 2,      # Days of stable regime before confirming change
 }
 
 # ============================================================================

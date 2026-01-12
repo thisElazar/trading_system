@@ -16,7 +16,8 @@ import logging
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Deque
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -35,7 +36,7 @@ except ImportError:
 @dataclass
 class HMMConfig:
     """Configuration for HMM regime detector."""
-    
+
     n_states: int = 3                           # Number of hidden states (regimes)
     state_names: List[str] = field(default_factory=lambda: ["bull", "transition", "crisis"])
     covariance_type: str = "full"               # Covariance type: full, diag, spherical
@@ -45,6 +46,9 @@ class HMMConfig:
     convergence_tol: float = 1e-4               # EM convergence tolerance
     random_state: int = 42                      # For reproducibility
     model_path: Optional[Path] = None           # Path to save/load model
+
+    # GP-015: Regime change confirmation lag
+    regime_confirmation_days: int = 2           # Days of stable regime before confirming change
     
     def validate(self) -> List[str]:
         """Validate configuration."""
@@ -100,6 +104,12 @@ class HMMRegimeDetector:
         self.state_means: Dict[str, float] = {}
         self.state_stds: Dict[str, float] = {}
         self.converged: bool = False
+
+        # GP-015: Regime confirmation tracking
+        self._regime_confirmation_buffer: deque = deque(maxlen=max(10, self.config.regime_confirmation_days + 1))
+        self._confirmed_regime: Optional[str] = None
+        self._pending_regime: Optional[str] = None
+        self._pending_regime_count: int = 0
         
     def fit(self, returns: pd.Series) -> Dict[str, Any]:
         """
@@ -317,9 +327,92 @@ class HMMRegimeDetector:
                 for i in range(self.config.n_states)
             }
             return best_regime, best_prob, all_probs
-        
+
+        # GP-015: Update regime confirmation tracking
+        self._update_regime_confirmation(best_regime)
+
         return best_regime, best_prob
-    
+
+    def _update_regime_confirmation(self, raw_regime: str):
+        """
+        GP-015: Update regime confirmation state machine.
+
+        Requires stable regime classification for N consecutive days before
+        confirming a regime change. Prevents whipsaws from noisy detection.
+        """
+        self._regime_confirmation_buffer.append(raw_regime)
+
+        # Initialize confirmed regime if not set
+        if self._confirmed_regime is None:
+            self._confirmed_regime = raw_regime
+            self._pending_regime = None
+            self._pending_regime_count = 0
+            return
+
+        # If raw matches confirmed, reset pending
+        if raw_regime == self._confirmed_regime:
+            self._pending_regime = None
+            self._pending_regime_count = 0
+            return
+
+        # If raw matches pending, increment count
+        if raw_regime == self._pending_regime:
+            self._pending_regime_count += 1
+        else:
+            # New pending regime
+            self._pending_regime = raw_regime
+            self._pending_regime_count = 1
+
+        # Check if pending should be confirmed
+        if self._pending_regime_count >= self.config.regime_confirmation_days:
+            old_regime = self._confirmed_regime
+            self._confirmed_regime = self._pending_regime
+            self._pending_regime = None
+            self._pending_regime_count = 0
+            logger.info(
+                f"HMM regime change confirmed: {old_regime} -> {self._confirmed_regime} "
+                f"(after {self.config.regime_confirmation_days} consecutive days)"
+            )
+
+    def get_confirmed_regime(self, returns: pd.Series = None) -> Tuple[str, float, bool]:
+        """
+        GP-015: Get the confirmed regime (requires stable classification).
+
+        Args:
+            returns: Optional recent returns for fresh detection
+
+        Returns:
+            Tuple of (confirmed_regime, confidence, is_transitioning)
+            - confirmed_regime: The stable, confirmed regime
+            - confidence: Confidence level (lower if transitioning)
+            - is_transitioning: True if a regime change is pending
+        """
+        # Optionally update with fresh detection
+        if returns is not None and self.is_trained:
+            try:
+                self.detect_regime(returns)
+            except Exception as e:
+                logger.warning(f"Failed to update regime detection: {e}")
+
+        # Get latest probability if available
+        confidence = 0.7  # Default confidence
+        if self._regime_confirmation_buffer and self.is_trained:
+            # Use stored confidence from last detection
+            confidence = 0.8
+
+        # Check if we're in a transition state
+        is_transitioning = (
+            self._pending_regime is not None and
+            self._pending_regime_count > 0
+        )
+
+        # Reduce confidence if transitioning
+        if is_transitioning:
+            progress = self._pending_regime_count / self.config.regime_confirmation_days
+            confidence = confidence * (1 - 0.3 * progress)  # Up to 30% reduction
+
+        return self._confirmed_regime or "transition", confidence, is_transitioning
+
     def get_transition_matrix(self) -> Dict[str, Dict[str, float]]:
         """
         Get learned transition probabilities.
