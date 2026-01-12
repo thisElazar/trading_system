@@ -952,7 +952,7 @@ Tested creation, serialization, and backwards compatibility all working
 | GP-013 | Self-adaptive mutation | 30 min | HIGH | ✅ DONE (Jan 10) |
 | GP-014 | Omega Ratio | 20 min | MEDIUM | ✅ DONE (Jan 10) |
 | GP-017 | Behavioral descriptors | 30 min | MEDIUM | ✅ DONE (Jan 10) |
-| GP-015 | Add regime change lag | 30 min | LOW | Open |
+| GP-015 | Add regime change lag | 30 min | LOW | ✅ DONE (Jan 11) |
 
 ---
 
