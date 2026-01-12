@@ -253,6 +253,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # Import database error handler for dashboard visibility
 from observability.logger import DatabaseErrorHandler
 from logging.handlers import RotatingFileHandler
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 # Log rotation: 10MB per file, keep 5 backups
 LOG_MAX_BYTES = 10_000_000
@@ -804,8 +805,7 @@ def create_fitness_function(strategy_name: str, backtester: Backtester,
                 # Handle both DatetimeIndex and 'timestamp' column
                 if isinstance(df.index, pd.DatetimeIndex):
                     dates = df.index
-                    if dates.tz is not None:
-                        dates = dates.tz_localize(None)
+                    dates = normalize_timestamp(dates)
                     all_dates.update(dates.tolist())
                 elif 'timestamp' in df.columns:
                     dates = pd.to_datetime(df['timestamp'])
@@ -826,8 +826,7 @@ def create_fitness_function(strategy_name: str, backtester: Backtester,
                     # Handle both DatetimeIndex and 'timestamp' column
                     if isinstance(df.index, pd.DatetimeIndex):
                         idx = df.index
-                        if idx.tz is not None:
-                            idx = idx.tz_localize(None)
+                        idx = normalize_timestamp(idx)
                         train_data[sym] = df[idx <= split_date].copy()
                         test_data[sym] = df[idx > split_date].copy()
                     elif 'timestamp' in df.columns:
@@ -845,8 +844,7 @@ def create_fitness_function(strategy_name: str, backtester: Backtester,
             if vix_data is not None and len(vix_data) > 0:
                 if isinstance(vix_data.index, pd.DatetimeIndex):
                     idx = vix_data.index
-                    if idx.tz is not None:
-                        idx = idx.tz_localize(None)
+                    idx = normalize_timestamp(idx)
                     train_vix = vix_data[idx <= split_date].copy()
                     test_vix = vix_data[idx > split_date].copy()
                 elif 'timestamp' in vix_data.columns:
@@ -1606,8 +1604,7 @@ class NightlyResearchEngine:
                     df = df.set_index('timestamp')
                 if not isinstance(df.index, pd.DatetimeIndex):
                     df.index = pd.to_datetime(df.index)
-                if df.index.tz is not None:
-                    df.index = df.index.tz_localize(None)
+                df = normalize_dataframe(df)
 
                 # Apply date cutoff
                 if cutoff_date:

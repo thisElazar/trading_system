@@ -67,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import VALIDATION, TRANSACTION_COSTS_BPS, get_transaction_cost
 from strategies.base import BaseStrategy, Signal, SignalType
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logger = logging.getLogger(__name__)
 
@@ -431,8 +432,7 @@ class Backtester:
                 # Ensure both sides are comparable (handle timezone issues)
                 try:
                     current_date_normalized = pd.Timestamp(current_date)
-                    if current_date_normalized.tz is not None:
-                        current_date_normalized = current_date_normalized.tz_localize(None)
+                    current_date_normalized = normalize_timestamp(current_date_normalized)
                     
                     # Check if current date is within VIX data range
                     vix_max_date = vix_data.index.max()

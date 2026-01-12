@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategies.base import BaseStrategy, Signal, SignalType
 from data.cached_data_manager import CachedDataManager
 from config import DIRS, DATABASES
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +202,7 @@ class PairsAnalyzer:
             df.index = pd.to_datetime(df.index)
         
         # Normalize timezone (remove tz info for consistency)
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
+        df = normalize_dataframe(df)
         
         # Get last N days
         df = df.tail(days)

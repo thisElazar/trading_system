@@ -38,6 +38,7 @@ from strategies.vix_regime_rotation import VIXRegimeRotationStrategy
 from strategies.sector_rotation import SectorRotationStrategy
 from strategies.pairs_trading import PairsAnalyzer, PairsTradingStrategy
 from strategies.relative_volume_breakout import RelativeVolumeBreakout
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logger = logging.getLogger(__name__)
 
@@ -167,8 +168,7 @@ class UnifiedTester:
         # Ensure datetime index
         if 'timestamp' in vix_df.columns:
             vix_df = vix_df.set_index('timestamp')
-        if vix_df.index.tz is not None:
-            vix_df.index = vix_df.index.tz_localize(None)
+        vix_df = normalize_dataframe(vix_df)
         
         # Add regime
         vix_df['regime'] = 'normal'

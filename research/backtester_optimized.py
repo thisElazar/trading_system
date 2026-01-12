@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import VALIDATION, TRANSACTION_COSTS_BPS, get_transaction_cost
 from strategies.base import BaseStrategy, Signal, SignalType
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logger = logging.getLogger(__name__)
 
@@ -410,14 +411,12 @@ class OptimizedBacktester:
         
         if start_date is not None:
             start_date = pd.Timestamp(start_date)
-            if start_date.tz is not None:
-                start_date = start_date.tz_localize(None)
+            start_date = normalize_timestamp(start_date)
             dates = dates[dates >= start_date]
         
         if end_date is not None:
             end_date = pd.Timestamp(end_date)
-            if end_date.tz is not None:
-                end_date = end_date.tz_localize(None)
+            end_date = normalize_timestamp(end_date)
             dates = dates[dates <= end_date]
         
         if len(dates) == 0:
@@ -431,8 +430,7 @@ class OptimizedBacktester:
             if not isinstance(vix_data.index, pd.DatetimeIndex):
                 if 'timestamp' in vix_data.columns:
                     vix_data = vix_data.set_index('timestamp')
-            if vix_data.index.tz is not None:
-                vix_data.index = vix_data.index.tz_localize(None)
+            vix_data = normalize_dataframe(vix_data)
             
             # Pre-compute regime for each date
             for d in dates:
@@ -715,8 +713,7 @@ if __name__ == "__main__":
         vix_data = pd.read_parquet(vix_path)
         if 'timestamp' in vix_data.columns:
             vix_data = vix_data.set_index('timestamp')
-        if vix_data.index.tz is not None:
-            vix_data.index = vix_data.index.tz_localize(None)
+        vix_data = normalize_dataframe(vix_data)
         vix_data['regime'] = 'normal'
         vix_data.loc[vix_data['close'] < 15, 'regime'] = 'low'
         vix_data.loc[vix_data['close'] > 25, 'regime'] = 'high'

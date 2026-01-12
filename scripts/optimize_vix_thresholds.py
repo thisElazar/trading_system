@@ -18,6 +18,7 @@ import pandas as pd
 import numpy as np
 
 from config import DIRS
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -78,8 +79,7 @@ def load_data() -> dict:
                     df = df.set_index('date')
             # Remove timezone info and normalize to date only
             if isinstance(df.index, pd.DatetimeIndex):
-                if df.index.tz is not None:
-                    df.index = df.index.tz_localize(None)
+                df = normalize_dataframe(df)
                 # Normalize to date (remove time component)
                 df.index = df.index.normalize()
             data[symbol] = df
@@ -100,8 +100,7 @@ def load_data() -> dict:
                 vix_df['date'] = pd.to_datetime(vix_df['date'])
                 vix_df = vix_df.set_index('date')
         if isinstance(vix_df.index, pd.DatetimeIndex):
-            if vix_df.index.tz is not None:
-                vix_df.index = vix_df.index.tz_localize(None)
+            vix_df = normalize_dataframe(vix_df)
             vix_df.index = vix_df.index.normalize()
         data['VIX'] = vix_df
         logger.info(f"Loaded VIX: {len(vix_df)} bars, {vix_df.index.min().date()} to {vix_df.index.max().date()}")

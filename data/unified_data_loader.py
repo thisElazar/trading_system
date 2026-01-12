@@ -36,6 +36,7 @@ import pandas as pd
 import numpy as np
 
 from config import DIRS
+from utils.timezone import normalize_dataframe
 
 logger = logging.getLogger(__name__)
 
@@ -110,13 +111,11 @@ class UnifiedDataLoader:
                     if 'index' in df.columns:
                         df = df.rename(columns={'index': 'timestamp'})
 
-            # Ensure timestamp is datetime
+            # Ensure timestamp is datetime and normalize timezone
             if 'timestamp' in df.columns:
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-                # Remove timezone if present - use tz_convert(None) for aware datetimes
-                if df['timestamp'].dt.tz is not None:
-                    df['timestamp'] = df['timestamp'].dt.tz_convert(None)
+                # Normalize timezone using centralized utility
+                df = normalize_dataframe(df)
 
             # Sort by timestamp
             if 'timestamp' in df.columns:

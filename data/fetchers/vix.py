@@ -21,6 +21,7 @@ from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY,
     DIRS, VIX_REGIMES, get_vix_regime
 )
+from utils.timezone import normalize_timestamp, normalize_dataframe, now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -203,11 +204,9 @@ class VIXFetcher:
             # Check if data is stale (> 1 day old)
             last_date = df.index.max()
             if isinstance(last_date, pd.Timestamp):
-                # Remove timezone for comparison
-                if last_date.tz is not None:
-                    last_date = last_date.tz_convert(None)
-                last_date = last_date.to_pydatetime()
-            
+                # Normalize timezone using centralized utility
+                last_date = normalize_timestamp(last_date).to_pydatetime()
+
             if (datetime.now() - last_date).days > 1:
                 df = self.fetch_vix_proxy(days=30)
         
@@ -250,14 +249,12 @@ class VIXFetcher:
         
         if df is None or df.empty:
             return pd.DataFrame()
-        
-        # Normalize timezone - remove tz info for consistent comparison
-        if df.index.tz is not None:
-            df = df.copy()
-            df.index = df.index.tz_convert(None)
-        
+
+        # Normalize timezone using centralized utility
+        df = normalize_dataframe(df)
+
         # Filter to requested days
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = now_naive() - timedelta(days=days)
         df = df[df.index >= cutoff]
         
         # Add regime classification

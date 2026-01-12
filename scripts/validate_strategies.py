@@ -45,6 +45,7 @@ from strategies.sector_rotation import SectorRotationStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.relative_volume_breakout import RelativeVolumeBreakout
 from strategies.gap_fill import GapFillStrategy
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,8 +91,7 @@ def load_market_data(quick: bool = False) -> Tuple[Dict[str, pd.DataFrame], Opti
         vix_data = pd.read_parquet(vix_path)
         if 'timestamp' in vix_data.columns:
             vix_data = vix_data.set_index('timestamp')
-        if vix_data.index.tz is not None:
-            vix_data.index = vix_data.index.tz_localize(None)
+        vix_data = normalize_dataframe(vix_data)
 
         # Add regime classification
         vix_data['regime'] = 'normal'
@@ -132,8 +132,7 @@ def split_train_test(data: Dict[str, pd.DataFrame],
     for sym, df in data.items():
         if isinstance(df.index, pd.DatetimeIndex):
             idx = df.index
-            if idx.tz is not None:
-                idx = idx.tz_localize(None)
+            idx = normalize_timestamp(idx)
             train_data[sym] = df[idx <= split_date].copy()
             test_data[sym] = df[idx > split_date].copy()
         elif 'timestamp' in df.columns:
@@ -150,8 +149,7 @@ def split_train_test(data: Dict[str, pd.DataFrame],
     test_vix = None
     if vix_data is not None:
         idx = vix_data.index
-        if idx.tz is not None:
-            idx = idx.tz_localize(None)
+        idx = normalize_timestamp(idx)
         train_vix = vix_data[idx <= split_date].copy()
         test_vix = vix_data[idx > split_date].copy()
 

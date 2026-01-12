@@ -17,9 +17,10 @@ import pandas as pd
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from config import (
-    ALPACA_API_KEY, ALPACA_SECRET_KEY, 
+    ALPACA_API_KEY, ALPACA_SECRET_KEY,
     DIRS, HISTORICAL_YEARS, BATCH_SIZE
 )
+from utils.timezone import normalize_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +83,8 @@ class DailyBarsFetcher:
             if len(existing_df) > 0:
                 last_date = existing_df.index.max()
                 if isinstance(last_date, pd.Timestamp):
-                    # Convert to naive datetime (strip timezone if present)
-                    if last_date.tz is not None:
-                        last_date = last_date.tz_convert(None).to_pydatetime()
-                    else:
-                        last_date = last_date.to_pydatetime()
+                    # Convert to naive datetime using centralized timezone utility
+                    last_date = normalize_timestamp(last_date).to_pydatetime()
 
                 # If data is from today or yesterday, don't refetch
                 if (datetime.now() - last_date).days <= 1:

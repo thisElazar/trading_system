@@ -1,7 +1,7 @@
 # Timezone Handling Migration Guide
 
 **Created:** January 4, 2026
-**Status:** In Progress
+**Status:** Complete (Jan 11, 2026)
 **Location:** `utils/timezone.py`
 
 ---
@@ -103,31 +103,31 @@ Based on grep results, these files have timezone handling:
 
 ### Critical (Data Loading)
 - [x] `daily_orchestrator.py` - Fixed `_get_historical_regime_data()`
-- [ ] `data/fetchers/daily_bars.py` - 3 instances
-- [ ] `data/fetchers/vix.py` - 3 instances
-- [ ] `data/unified_data_loader.py` - 1 instance
+- [x] `data/fetchers/daily_bars.py` - 3 instances (Jan 11)
+- [x] `data/fetchers/vix.py` - 3 instances (Jan 11)
+- [x] `data/unified_data_loader.py` - 1 instance (Jan 11)
 
 ### Strategies (Many Instances)
-- [ ] `strategies/mean_reversion.py` - 2 instances
-- [ ] `strategies/vol_managed_momentum_v2.py` - 2 instances
-- [ ] `strategies/vol_managed_momentum.py` - 1 instance
-- [ ] `strategies/pairs_trading.py` - 1 instance
-- [ ] `strategies/relative_volume_breakout.py` - 2 instances
-- [ ] `strategies/sector_rotation.py` - 2 instances
+- [x] `strategies/mean_reversion.py` - 2 instances (Jan 11)
+- [x] `strategies/vol_managed_momentum_v2.py` - 2 instances (Jan 11)
+- [x] `strategies/vol_managed_momentum.py` - 1 instance (Jan 11)
+- [x] `strategies/pairs_trading.py` - 1 instance (Jan 11)
+- [x] `strategies/relative_volume_breakout.py` - 2 instances (Jan 11)
+- [x] `strategies/sector_rotation.py` - 2 instances (Jan 11)
 
 ### Research (Many Instances)
-- [ ] `research/backtester.py` - 3 instances
-- [ ] `research/backtester_fast.py` - 1 instance
-- [ ] `research/backtester_optimized.py` - 5 instances
-- [ ] `research/parallel_backtester.py` - 2 instances
-- [ ] `research/unified_tester.py` - 1 instance
-- [ ] `run_nightly_research.py` - 15+ instances (most complex)
+- [x] `research/backtester.py` - 3 instances (Jan 11)
+- [x] `research/backtester_fast.py` - No tz patterns found (clean)
+- [x] `research/backtester_optimized.py` - 5 instances (Jan 11)
+- [x] `research/parallel_backtester.py` - 2 instances (Jan 11)
+- [x] `research/unified_tester.py` - 1 instance (Jan 11)
+- [x] `run_nightly_research.py` - 15+ instances (Jan 11)
 
 ### Scripts
-- [ ] `scripts/validate_strategies.py` - 3 instances
-- [ ] `scripts/run_baseline_backtest.py` - 1 instance
-- [ ] `scripts/optimize_vix_thresholds.py` - 2 instances
-- [ ] `scripts/download_all_history.py` - 2 instances
+- [x] `scripts/validate_strategies.py` - 3 instances (Jan 11)
+- [x] `scripts/run_baseline_backtest.py` - 1 instance (Jan 11)
+- [x] `scripts/optimize_vix_thresholds.py` - 2 instances (Jan 11)
+- [x] `scripts/download_all_history.py` - 2 instances (Jan 11)
 
 ## Migration Pattern
 
@@ -177,6 +177,7 @@ python -c "from module import function; print('OK')"
 |------|------|--------|
 | 2026-01-04 | `utils/timezone.py` | Created centralized module |
 | 2026-01-04 | `daily_orchestrator.py` | Migrated `_get_historical_regime_data()` |
+| 2026-01-11 | All remaining files | Bulk migration of 19 files using `normalize_dataframe()` |
 
 ---
 

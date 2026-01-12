@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 from config import (
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
     DIRS, DATA_ROOT,
     ALPACA_API_KEY, ALPACA_SECRET_KEY
 )
@@ -201,8 +202,7 @@ def download_yahoo_daily(symbol: str, start_date: str = YAHOO_START_DATE,
         df['timestamp'] = pd.to_datetime(df['timestamp'])
 
         # Remove timezone if present
-        if df['timestamp'].dt.tz is not None:
-            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+        df = normalize_dataframe(df)
 
         df = df.set_index('timestamp')
 
@@ -359,8 +359,7 @@ def download_alpaca_1min(symbol: str, client, start_date: datetime = ALPACA_1MIN
         df['timestamp'] = pd.to_datetime(df['timestamp'])
 
         # Remove timezone
-        if df['timestamp'].dt.tz is not None:
-            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+        df = normalize_dataframe(df)
 
         df = df.drop_duplicates(subset=['timestamp'])
         df = df.sort_values('timestamp')

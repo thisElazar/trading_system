@@ -18,6 +18,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +122,7 @@ class StrategyCorrelationAnalyzer:
             returns.index = pd.to_datetime(returns.index)
 
         # Ensure timezone-naive for consistency
-        if returns.index.tz is not None:
-            returns.index = returns.index.tz_localize(None)
+        returns = normalize_dataframe(returns)
 
         self.strategy_returns[strategy_name] = returns.sort_index()
         logger.debug(f"Added returns for {strategy_name}: {len(returns)} observations")
@@ -131,8 +131,7 @@ class StrategyCorrelationAnalyzer:
         """Set VIX data for regime-based correlation analysis."""
         if not isinstance(vix_data.index, pd.DatetimeIndex):
             vix_data.index = pd.to_datetime(vix_data.index)
-        if vix_data.index.tz is not None:
-            vix_data.index = vix_data.index.tz_localize(None)
+        vix_data = normalize_dataframe(vix_data)
         self.vix_data = vix_data.sort_index()
 
     def _build_returns_matrix(self) -> pd.DataFrame:

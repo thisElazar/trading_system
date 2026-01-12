@@ -33,6 +33,7 @@ from strategies import (
     FactorMomentumStrategy,
 )
 import pandas as pd
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 # Setup logging
 logging.basicConfig(
@@ -133,8 +134,7 @@ def run_baseline_backtest(quick_mode: bool = False):
         vix_data = pd.read_parquet(vix_path)
         if 'timestamp' in vix_data.columns:
             vix_data = vix_data.set_index('timestamp')
-        if vix_data.index.tz is not None:
-            vix_data.index = vix_data.index.tz_localize(None)
+        vix_data = normalize_dataframe(vix_data)
         logger.info(f"  Loaded VIX data: {len(vix_data)} bars")
     else:
         logger.warning("  VIX data not found - some strategies may not work correctly")

@@ -38,6 +38,7 @@ from research.backtester import Backtester, BacktestResult
 from data.cached_data_manager import CachedDataManager
 from data.storage.db_manager import get_db
 from strategies import (
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
     VolManagedMomentumStrategy,
     MeanReversionStrategy,
     VIXRegimeRotationStrategy,
@@ -160,8 +161,7 @@ class StrategyComparison:
                 vix_data = vix_data.set_index('timestamp')
             
             # Ensure timezone-naive index
-            if vix_data.index.tz is not None:
-                vix_data.index = vix_data.index.tz_localize(None)
+            vix_data = normalize_dataframe(vix_data)
             
             # Add regime classification (always do this)
             vix_data['regime'] = 'normal'

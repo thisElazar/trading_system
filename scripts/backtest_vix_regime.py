@@ -20,6 +20,7 @@ import numpy as np
 from config import DIRS
 from data.fetchers.daily_bars import DailyBarsFetcher
 from data.indicators.technical import add_all_indicators
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ def load_data():
         df = fetcher.load_symbol(symbol)
         if df is not None and len(df) > 50:
             # Remove timezone info for easier comparison
-            df.index = df.index.tz_localize(None) if df.index.tz else df.index
+            df = normalize_dataframe(df)
             data[symbol] = df
             logger.info(f"Loaded {symbol}: {len(df)} bars")
         else:

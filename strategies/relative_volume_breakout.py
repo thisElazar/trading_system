@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategies.base import BaseStrategy, Signal, SignalType
 from data.cached_data_manager import CachedDataManager
 from config import DIRS
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logger = logging.getLogger(__name__)
 
@@ -419,8 +420,7 @@ class RVBreakoutBacktester:
             df.index = pd.to_datetime(df.index)
         
         # Normalize timezone
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
+        df = normalize_dataframe(df)
         
         if start_date:
             df = df[df.index >= pd.Timestamp(start_date)]

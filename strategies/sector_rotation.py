@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategies.base import BaseStrategy, Signal, SignalType
 from data.cached_data_manager import CachedDataManager
 from config import DIRS, VIX_REGIMES
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logger = logging.getLogger(__name__)
 
@@ -520,8 +521,7 @@ class SectorRotationBacktester:
             logger.error("No VIX data")
             return pd.DataFrame()
 
-        if vix_df.index.tz is not None:
-            vix_df.index = vix_df.index.tz_localize(None)
+        vix_df = normalize_dataframe(vix_df)
 
         # Get common date range
         all_dates = set(vix_df.index)

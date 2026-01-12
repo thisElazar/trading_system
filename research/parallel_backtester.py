@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from research.backtester import Backtester, BacktestResult
 from strategies.base import BaseStrategy
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
 logger = logging.getLogger(__name__)
 
@@ -554,8 +555,7 @@ def run_all_strategies_parallel(
                     df = df.copy()
                     df['timestamp'] = pd.to_datetime(df['timestamp'])
                     df = df.set_index('timestamp')
-                if df.index.tz is not None:
-                    df.index = df.index.tz_localize(None)
+                df = normalize_dataframe(df)
                 data[symbol] = df
 
         logger.info(f"Loaded {len(data)} symbols")
@@ -567,8 +567,7 @@ def run_all_strategies_parallel(
             vix_data = pd.read_parquet(vix_path)
             if 'timestamp' in vix_data.columns:
                 vix_data = vix_data.set_index('timestamp')
-            if vix_data.index.tz is not None:
-                vix_data.index = vix_data.index.tz_localize(None)
+            vix_data = normalize_dataframe(vix_data)
 
     # Create strategy instances
     strategies = {
