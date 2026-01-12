@@ -1145,6 +1145,17 @@ def run_strategy_discovery(data: dict, vix_data=None, config: dict = None,
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
 
+        # Process promotions after discovery completes
+        logger.info("Processing strategy promotions...")
+        try:
+            promotion_results = promotion_pipeline.process_all_promotions()
+            logger.info(f"Promotion results: promoted={promotion_results.get('promoted', 0)}, "
+                       f"retired={promotion_results.get('retired', 0)}, "
+                       f"failed={promotion_results.get('failed', 0)}")
+        except Exception as promo_err:
+            logger.error(f"Promotion processing failed: {promo_err}", exc_info=True)
+            promotion_results = {'error': str(promo_err)}
+
         # Compile results
         results = {
             'success': True,
@@ -1157,6 +1168,7 @@ def run_strategy_discovery(data: dict, vix_data=None, config: dict = None,
             'pareto_front_size': len(engine.pareto_front),
             'novelty_archive_size': len(engine.novelty_archive),
             'diversity': engine.novelty_archive.get_archive_diversity() if engine.novelty_archive else 0,
+            'promotion_pipeline': promotion_results,
         }
 
         logger.info(f"Strategy discovery complete: {results['strategies_evaluated']} evaluated, "

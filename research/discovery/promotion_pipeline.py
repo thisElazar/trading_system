@@ -1604,6 +1604,72 @@ class PromotionPipeline:
             'failed': failed_count
         }
 
+    def load_live_strategies(self) -> List['EvolvedStrategy']:
+        """
+        Load all LIVE strategies as executable EvolvedStrategy objects.
+
+        This is the key integration point between GP discovery and live trading.
+        Strategies with genome_json stored in the database are reconstructed
+        as EvolvedStrategy instances that can generate signals.
+
+        Returns:
+            List of EvolvedStrategy objects ready for execution
+        """
+        from research.discovery.strategy_genome import GenomeFactory
+        from research.discovery.strategy_compiler import EvolvedStrategy
+
+        strategies = []
+        factory = None  # Lazy initialization
+
+        live_ids = self.get_strategies_by_status(StrategyStatus.LIVE)
+        logger.info(f"Loading {len(live_ids)} LIVE strategies from promotion pipeline")
+
+        for strategy_id in live_ids:
+            try:
+                record = self.get_strategy_record(strategy_id)
+                if record is None:
+                    logger.warning(f"Strategy {strategy_id} not found in database")
+                    continue
+
+                if not record.genome_json:
+                    logger.warning(f"Strategy {strategy_id} has no genome_json, skipping")
+                    continue
+
+                # Initialize factory on first use
+                if factory is None:
+                    factory = GenomeFactory()
+
+                # Deserialize genome from JSON
+                genome = factory.deserialize_genome(record.genome_json)
+
+                # Create EvolvedStrategy wrapper
+                evolved = EvolvedStrategy(genome, factory)
+
+                # Attach metadata for execution context
+                evolved.strategy_id = strategy_id
+                evolved.run_time = record.run_time
+                evolved.live_start_date = record.live_start_date
+                evolved.discovery_generation = record.discovery_generation
+
+                strategies.append(evolved)
+                logger.debug(f"Loaded LIVE strategy: {strategy_id}")
+
+            except Exception as e:
+                logger.error(f"Failed to load strategy {strategy_id}: {e}", exc_info=True)
+                continue
+
+        logger.info(f"Successfully loaded {len(strategies)} LIVE GP strategies")
+        return strategies
+
+    def get_live_strategy_ids(self) -> List[str]:
+        """
+        Get list of LIVE strategy IDs (convenience method).
+
+        Returns:
+            List of strategy IDs currently in LIVE status
+        """
+        return self.get_strategies_by_status(StrategyStatus.LIVE)
+
 
 # =============================================================================
 # DEMO

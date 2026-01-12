@@ -39,6 +39,9 @@ __all__ = [
     'SectorRotationBacktester',
     'QualitySmallCapValueStrategy',
     'FactorMomentumStrategy',
+    # GP strategy loading
+    'load_live_gp_strategies',
+    'get_all_active_strategies',
 ]
 
 # Strategy registry for dynamic loading
@@ -60,3 +63,59 @@ def get_strategy(name: str) -> BaseStrategy:
     if name not in STRATEGY_REGISTRY:
         raise ValueError(f"Unknown strategy: {name}. Available: {list(STRATEGY_REGISTRY.keys())}")
     return STRATEGY_REGISTRY[name]()
+
+
+def load_live_gp_strategies() -> list:
+    """
+    Load LIVE GP-evolved strategies from the promotion pipeline.
+
+    These strategies were discovered by genetic programming, validated through
+    walk-forward testing, paper traded, and promoted to LIVE status.
+
+    Returns:
+        List of EvolvedStrategy instances ready for signal generation
+
+    Usage:
+        from strategies import load_live_gp_strategies
+
+        gp_strategies = load_live_gp_strategies()
+        for strat in gp_strategies:
+            signals = strat.generate_signals(data, current_positions)
+    """
+    try:
+        from research.discovery.promotion_pipeline import PromotionPipeline
+
+        pipeline = PromotionPipeline()
+        return pipeline.load_live_strategies()
+    except ImportError as e:
+        # DEAP or other dependencies not available
+        import logging
+        logging.getLogger(__name__).debug(f"GP strategies not available: {e}")
+        return []
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Failed to load GP strategies: {e}")
+        return []
+
+
+def get_all_active_strategies() -> list:
+    """
+    Get all active strategies: both hardcoded and GP-evolved LIVE strategies.
+
+    Returns:
+        List of all strategy instances (BaseStrategy and EvolvedStrategy)
+    """
+    strategies = []
+
+    # Add hardcoded strategies
+    for name in STRATEGY_REGISTRY:
+        try:
+            strategies.append(STRATEGY_REGISTRY[name]())
+        except Exception:
+            pass
+
+    # Add GP-evolved LIVE strategies
+    gp_strategies = load_live_gp_strategies()
+    strategies.extend(gp_strategies)
+
+    return strategies
