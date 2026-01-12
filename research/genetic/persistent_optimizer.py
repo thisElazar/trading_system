@@ -318,6 +318,7 @@ class PersistentGAOptimizer:
 
         # Cross-session stagnation tracking
         self.cross_session_stagnation = 0
+        self._hard_reset_done_this_session = False  # Only reset once per session
 
         # Adaptive mutation tracking
         self._current_mutation_rate = self.BASE_MUTATION_RATE
@@ -708,6 +709,10 @@ class PersistentGAOptimizer:
         Returns:
             True if reset was performed
         """
+        # Only reset once per session (DB history doesn't change mid-session)
+        if self._hard_reset_done_this_session:
+            return False
+
         # Check cross-session stagnation (not just within-session)
         cross_session_stuck = self._check_cross_session_stagnation()
 
@@ -742,6 +747,7 @@ class PersistentGAOptimizer:
         # Reset stagnation counters (give fresh population a chance)
         self.generations_without_improvement = 0
         self.cross_session_stagnation = 0
+        self._hard_reset_done_this_session = True  # Don't reset again this session
 
         # Reset mutation rate to base
         self._current_mutation_rate = self.BASE_MUTATION_RATE
