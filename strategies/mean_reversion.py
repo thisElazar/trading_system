@@ -34,6 +34,8 @@ import logging
 import pandas as pd
 import numpy as np
 
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
+
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -439,8 +441,7 @@ def backtest_mean_reversion():
     """Run backtest of mean reversion strategy."""
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
-    
+
     from data.cached_data_manager import CachedDataManager
     from research.backtester import Backtester
     from config import DIRS

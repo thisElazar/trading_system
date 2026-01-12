@@ -20,7 +20,7 @@ from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY,
     DIRS, HISTORICAL_YEARS, BATCH_SIZE
 )
-from utils.timezone import normalize_timestamp
+from utils.timezone import normalize_timestamp, normalize_dataframe
 
 logger = logging.getLogger(__name__)
 
@@ -251,20 +251,21 @@ class DailyBarsFetcher:
     def load_symbol(self, symbol: str) -> Optional[pd.DataFrame]:
         """
         Load cached data for a symbol.
-        
+
         Args:
             symbol: Stock symbol
-            
+
         Returns:
             DataFrame or None if not cached
         """
         parquet_path = self.get_parquet_path(symbol)
-        
+
         if not parquet_path.exists():
             return None
-        
+
         try:
-            return pd.read_parquet(parquet_path)
+            df = pd.read_parquet(parquet_path)
+            return normalize_dataframe(df)
         except Exception as e:
             logger.error(f"{symbol}: Failed to load - {e}")
             return None

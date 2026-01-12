@@ -30,6 +30,8 @@ import logging
 import pandas as pd
 import numpy as np
 
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
+
 # Import from parent
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -406,8 +408,7 @@ def compare_v1_vs_v2():
     """Compare V1 (current) vs V2 (research-aligned) implementations."""
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
-    
+
     from data.cached_data_manager import CachedDataManager
     from research.backtester import Backtester
     from strategies.vol_managed_momentum import VolManagedMomentumStrategy

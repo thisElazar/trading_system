@@ -171,9 +171,10 @@ class VIXFetcher:
         """Load cached VIX data."""
         if not self.parquet_path.exists():
             return None
-        
+
         try:
-            return pd.read_parquet(self.parquet_path)
+            df = pd.read_parquet(self.parquet_path)
+            return normalize_dataframe(df)
         except Exception as e:
             logger.error(f"Failed to load VIX data: {e}")
             return None

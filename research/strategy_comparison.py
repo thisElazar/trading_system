@@ -33,12 +33,13 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
+
 from config import STRATEGIES, VALIDATION, DIRS
 from research.backtester import Backtester, BacktestResult
 from data.cached_data_manager import CachedDataManager
 from data.storage.db_manager import get_db
 from strategies import (
-from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
     VolManagedMomentumStrategy,
     MeanReversionStrategy,
     VIXRegimeRotationStrategy,

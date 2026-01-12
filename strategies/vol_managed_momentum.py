@@ -25,6 +25,8 @@ import logging
 import pandas as pd
 import numpy as np
 
+from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
+
 # Import from parent
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -271,8 +273,7 @@ def optimize_parameters():
     """Grid search for optimal vol-managed momentum parameters."""
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
-    
+
     from data.cached_data_manager import CachedDataManager
     from research.backtester import Backtester
     from config import DIRS
