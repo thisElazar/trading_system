@@ -29,6 +29,7 @@ from dataclasses import dataclass
 import time
 import signal
 import os
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +174,7 @@ class PersistentWorkerPool:
         self._pool: Optional[Pool] = None
         self._started = False
 
-    def start(self, stagger_delay: float = 3.0):
+    def start(self, stagger_delay: float = 3.0, max_retries: int = 3):
         """
         Start the worker pool with staggered initialization.
 
@@ -181,6 +182,7 @@ class PersistentWorkerPool:
             stagger_delay: Seconds to wait between starting each worker (default 3s).
                           This prevents memory stampede from all workers importing
                           heavy libraries (numpy, pandas, sklearn) simultaneously.
+            max_retries: Number of retry attempts if pool creation fails (default 3).
         """
         if self._started:
             logger.warning("Pool already started")
@@ -192,12 +194,40 @@ class PersistentWorkerPool:
         from data.storage.db_manager import get_db
         get_db().close_thread_connections()
 
-        # Create pool with initializer
-        self._pool = Pool(
-            processes=self.n_workers,
-            initializer=_pool_initializer,
-            initargs=(self.shared_metadata,)
-        )
+        # Flush stdout/stderr before forking to prevent BrokenPipeError
+        # This is necessary because Python's multiprocessing calls _flush_std_streams()
+        # before forking, which can fail if the streams are in a bad state
+        for retry in range(max_retries):
+            try:
+                # Ensure streams are flushed and writable
+                try:
+                    sys.stdout.flush()
+                except (BrokenPipeError, OSError):
+                    pass  # Stream already closed/broken, ignore
+                try:
+                    sys.stderr.flush()
+                except (BrokenPipeError, OSError):
+                    pass  # Stream already closed/broken, ignore
+
+                # Small delay to let any pending I/O settle
+                time.sleep(0.1)
+
+                # Create pool with initializer
+                self._pool = Pool(
+                    processes=self.n_workers,
+                    initializer=_pool_initializer,
+                    initargs=(self.shared_metadata,)
+                )
+                break  # Success, exit retry loop
+
+            except (BrokenPipeError, OSError) as e:
+                if retry < max_retries - 1:
+                    wait_time = (retry + 1) * 2  # Exponential backoff: 2s, 4s, 6s
+                    logger.warning(f"Pool creation failed (attempt {retry + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Pool creation failed after {max_retries} attempts: {e}")
+                    raise RuntimeError(f"Failed to create worker pool after {max_retries} attempts: {e}") from e
 
         # Stagger worker initialization by sending warmup tasks one at a time
         # Each worker runs its initializer on first task, causing heavy imports

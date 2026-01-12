@@ -181,12 +181,14 @@ class MeanReversionStrategy(LongOnlyStrategy):
         More negative = bigger loser = higher reversal potential.
         Returns the 14-day return (negative for losers).
         """
-        if len(df) < self.lookback_period + 5:
+        # Ensure lookback_period is int for iloc indexing
+        lookback = int(self.lookback_period)
+        if len(df) < lookback + 5:
             return None
-        
+
         try:
             current_price = df['close'].iloc[-1]
-            past_price = df['close'].iloc[-(self.lookback_period + 1)]
+            past_price = df['close'].iloc[-(lookback + 1)]
             
             if past_price <= 0:
                 return None

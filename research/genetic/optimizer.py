@@ -54,8 +54,10 @@ class ParameterSpec:
     def random_value(self) -> float:
         if self.step:
             n_steps = int((self.max_val - self.min_val) / self.step) + 1
-            return self.min_val + random.randint(0, n_steps - 1) * self.step
-        return random.uniform(self.min_val, self.max_val)
+            value = self.min_val + random.randint(0, n_steps - 1) * self.step
+        else:
+            value = random.uniform(self.min_val, self.max_val)
+        return self.dtype(value)
     
     def mutate(self, value: float, strength: float = 0.2) -> float:
         """Mutate value within bounds."""

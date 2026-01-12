@@ -125,12 +125,14 @@ class SectorRotationStrategy(BaseStrategy):
         self.high_vix = high_vix_threshold if high_vix_threshold is not None else VIX_REGIMES['normal']
         self.rebalance_threshold = rebalance_threshold
         self.momentum_weight = momentum_weight
-        self.min_days_between_rebalance = min_days_between_rebalance
+        self.min_days_between_rebalance = int(min_days_between_rebalance)
 
         # BUG-003: GA-discovered optimal parameters
-        self.momentum_period = momentum_period
-        self.top_n_sectors = top_n_sectors
-        self.rebalance_days = rebalance_days
+        # Cast to int to prevent "Cannot index by location with non-integer key" errors
+        # GA optimizer can pass floats (e.g., 122.00) which fail with pandas iloc
+        self.momentum_period = int(momentum_period)
+        self.top_n_sectors = int(top_n_sectors)
+        self.rebalance_days = int(rebalance_days)
 
         self.data_mgr = CachedDataManager()
         self.current_regime = None

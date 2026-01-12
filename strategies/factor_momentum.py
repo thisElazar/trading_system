@@ -231,20 +231,27 @@ class FactorMomentumStrategy(LongOnlyStrategy):
                 continue
             
             try:
+                # Get period parameters (cast to int for iloc - GA can pass floats)
+                skip_period = int(getattr(self, 'skip_period', self.SKIP_PERIOD))
+                form_long = int(getattr(self, 'formation_period_long', self.FORMATION_PERIOD_LONG))
+                form_med = int(getattr(self, 'formation_period_med', self.FORMATION_PERIOD_MED))
+                form_short = int(self.FORMATION_PERIOD_SHORT)
+                vol_lookback = int(getattr(self, 'vol_lookback', self.VOL_LOOKBACK))
+
                 # Skip most recent month (avoid microstructure effects)
-                close_adj = close.iloc[:-self.SKIP_PERIOD] if self.SKIP_PERIOD > 0 else close
-                
-                if len(close_adj) < self.FORMATION_PERIOD_LONG:
+                close_adj = close.iloc[:-skip_period] if skip_period > 0 else close
+
+                if len(close_adj) < form_long:
                     continue
-                
+
                 # Calculate momentum (total return over period)
-                mom_12m = (close_adj.iloc[-1] / close_adj.iloc[-self.FORMATION_PERIOD_LONG]) - 1
-                mom_6m = (close_adj.iloc[-1] / close_adj.iloc[-self.FORMATION_PERIOD_MED]) - 1 if len(close_adj) >= self.FORMATION_PERIOD_MED else mom_12m
-                mom_1m = (close_adj.iloc[-1] / close_adj.iloc[-self.FORMATION_PERIOD_SHORT]) - 1 if len(close_adj) >= self.FORMATION_PERIOD_SHORT else 0
-                
+                mom_12m = (close_adj.iloc[-1] / close_adj.iloc[-form_long]) - 1
+                mom_6m = (close_adj.iloc[-1] / close_adj.iloc[-form_med]) - 1 if len(close_adj) >= form_med else mom_12m
+                mom_1m = (close_adj.iloc[-1] / close_adj.iloc[-form_short]) - 1 if len(close_adj) >= form_short else 0
+
                 # Calculate realized volatility
                 returns = close.pct_change().dropna()
-                vol = returns.iloc[-self.VOL_LOOKBACK:].std() * np.sqrt(252) if len(returns) >= self.VOL_LOOKBACK else returns.std() * np.sqrt(252)
+                vol = returns.iloc[-vol_lookback:].std() * np.sqrt(252) if len(returns) >= vol_lookback else returns.std() * np.sqrt(252)
                 
                 momentums_12m.append(mom_12m)
                 momentums_6m.append(mom_6m)
