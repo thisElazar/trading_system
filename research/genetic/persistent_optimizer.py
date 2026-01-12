@@ -662,7 +662,7 @@ class PersistentGAOptimizer:
         """
         try:
             # Use raw SQL for efficiency
-            conn = self.db._get_connection()
+            conn = self.db._get_connection('research')
             cursor = conn.cursor()
 
             # Get the best fitness ever and max generation
