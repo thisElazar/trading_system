@@ -487,7 +487,7 @@ class EvolutionEngine:
         # Validate genome for degenerate patterns
         is_valid, rejection_reason = self._validate_genome(genome)
         if not is_valid:
-            logger.debug(f"Genome {genome.genome_id} rejected: {rejection_reason}")
+            logger.info(f"Genome {genome.genome_id[:8]} REJECTED: {rejection_reason}")
             # Return poor fitness for rejected genomes
             fitness = FitnessVector(
                 sortino=-5.0, max_drawdown=-50.0, cvar_95=-0.1,
