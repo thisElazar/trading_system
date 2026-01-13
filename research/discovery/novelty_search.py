@@ -60,6 +60,26 @@ class BehaviorVector:
     profit_factor: float = 1.0      # Gross profit / gross loss (1.0 = breakeven)
     sharpe_ratio: float = 0.0       # Risk-adjusted return (-1 to 3 typical)
 
+    @classmethod
+    def default(cls) -> 'BehaviorVector':
+        """
+        Create a BehaviorVector with default values for rejected/failed genomes.
+
+        Returns a neutral behavior vector representing an inactive/failed strategy.
+        """
+        return cls(
+            trade_frequency=0.0,      # No trades
+            avg_hold_period=1.0,      # 1 day default
+            long_short_ratio=0.0,     # Neutral
+            return_autocorr=0.0,      # No pattern
+            drawdown_depth=0.5,       # Moderate default
+            benchmark_corr=0.0,       # No correlation
+            signal_variance=0.0,      # No variance
+            recovery_time=0.0,        # No recovery needed
+            profit_factor=1.0,        # Breakeven
+            sharpe_ratio=0.0          # No return
+        )
+
     def to_array(self) -> np.ndarray:
         """Convert to numpy array for distance calculations."""
         # Ensure all values are valid and clamped to expected ranges
@@ -90,7 +110,7 @@ class BehaviorVector:
             arr = np.concatenate([arr, np.array([0.0, 0.4, 0.25])])  # Default values
         return cls(
             trade_frequency=arr[0] * 10.0,
-            avg_hold_period=np.expm1(arr[1] * 3.0),
+            avg_hold_period=np.expm1(arr[1] * 5.0),
             long_short_ratio=arr[2] * 2 - 1,
             return_autocorr=arr[3] * 2 - 1,
             drawdown_depth=arr[4],
@@ -192,6 +212,70 @@ def extract_behavior_vector(result: BacktestResult,
     signal_var = returns.std() if len(returns) > 1 else 0.0
     signal_var = signal_var if not np.isnan(signal_var) else 0.0
 
+    # Recovery time: days to recover from max drawdown (GP-017)
+    recovery_time = 0.0
+    if len(drawdown) > 0 and dd_depth > 0:
+        try:
+            # Find the index of max drawdown
+            dd_min_idx = drawdown.idxmin() if hasattr(drawdown, 'idxmin') else drawdown.argmin()
+            # Find when we recovered (drawdown returns to 0 or near 0)
+            after_trough = drawdown.loc[dd_min_idx:] if hasattr(drawdown, 'loc') else drawdown[dd_min_idx:]
+            recovery_mask = after_trough >= -0.001  # Consider -0.1% as recovered
+            if recovery_mask.any():
+                recovery_idx = recovery_mask.idxmax() if hasattr(recovery_mask, 'idxmax') else np.argmax(recovery_mask)
+                # Calculate days between trough and recovery
+                if hasattr(drawdown.index, 'get_loc'):
+                    trough_pos = drawdown.index.get_loc(dd_min_idx)
+                    recovery_pos = drawdown.index.get_loc(recovery_idx)
+                    recovery_time = float(recovery_pos - trough_pos)
+                else:
+                    recovery_time = float(recovery_idx - dd_min_idx)
+            else:
+                # Never recovered - use remaining days as recovery time
+                recovery_time = float(len(after_trough))
+        except Exception as e:
+            logger.debug(f"Recovery time calculation failed: {e}")
+            recovery_time = 0.0
+
+    # Profit factor: gross profit / gross loss (GP-017)
+    profit_factor = 1.0
+    if trades:
+        try:
+            gross_profit = sum(
+                t.get('pnl', t.get('profit', 0))
+                for t in trades
+                if t.get('pnl', t.get('profit', 0)) > 0
+            )
+            gross_loss = abs(sum(
+                t.get('pnl', t.get('profit', 0))
+                for t in trades
+                if t.get('pnl', t.get('profit', 0)) < 0
+            ))
+            if gross_loss > 0:
+                profit_factor = gross_profit / gross_loss
+            elif gross_profit > 0:
+                profit_factor = 3.0  # Cap at 3.0 for no losses
+            else:
+                profit_factor = 1.0  # No profits or losses
+            # Clamp to reasonable range
+            profit_factor = max(0.1, min(5.0, profit_factor))
+        except Exception as e:
+            logger.debug(f"Profit factor calculation failed: {e}")
+            profit_factor = 1.0
+
+    # Sharpe ratio for behavior space (GP-017)
+    sharpe_ratio = 0.0
+    if len(returns) > 20:
+        try:
+            mean_ret = returns.mean()
+            std_ret = returns.std()
+            if std_ret > 1e-10:
+                sharpe_ratio = (mean_ret / std_ret) * np.sqrt(252)  # Annualized
+                sharpe_ratio = max(-2.0, min(5.0, sharpe_ratio))  # Clamp to reasonable range
+        except Exception as e:
+            logger.debug(f"Sharpe ratio calculation failed: {e}")
+            sharpe_ratio = 0.0
+
     return BehaviorVector(
         trade_frequency=trade_freq,
         avg_hold_period=avg_hold,
@@ -199,7 +283,10 @@ def extract_behavior_vector(result: BacktestResult,
         return_autocorr=autocorr,
         drawdown_depth=dd_depth,
         benchmark_corr=bench_corr,
-        signal_variance=signal_var
+        signal_variance=signal_var,
+        recovery_time=recovery_time,
+        profit_factor=profit_factor,
+        sharpe_ratio=sharpe_ratio
     )
 
 

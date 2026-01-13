@@ -769,9 +769,13 @@ class DailyOrchestrator:
 
             # 1. Add symbols from open positions (critical)
             try:
-                open_positions = self.execution_tracker.db.get_open_positions()
+                open_positions = self.execution_tracker.get_open_positions()
                 for pos in open_positions:
-                    symbols_to_refresh.add(pos.get('symbol', pos.get('ticker', '')))
+                    # Position is a dataclass, access symbol attribute directly
+                    if hasattr(pos, 'symbol'):
+                        symbols_to_refresh.add(pos.symbol)
+                    elif isinstance(pos, dict):
+                        symbols_to_refresh.add(pos.get('symbol', pos.get('ticker', '')))
                 logger.info(f"Added {len(open_positions)} symbols from open positions")
             except Exception as e:
                 logger.warning(f"Could not get open positions: {e}")
@@ -3417,8 +3421,8 @@ class DailyOrchestrator:
             for strategy_id in live_strategies:
                 try:
                     # Get metrics from execution tracker
-                    if self._tracker:
-                        metrics = self._tracker.get_strategy_performance(strategy_id)
+                    if self.execution_tracker:
+                        metrics = self.execution_tracker.get_strategy_performance(strategy_id)
                         if not metrics:
                             continue
 

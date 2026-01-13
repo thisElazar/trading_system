@@ -321,7 +321,7 @@ class EvolutionEngine:
         if len(self.pareto_front) > MAX_PARETO_FRONT_SIZE:
             self.pareto_front = sorted(
                 self.pareto_front,
-                key=lambda g: self.fitness_cache.get(g.genome_id, FitnessVector(0, 0, 0, 0, 0)).sortino,
+                key=lambda g: self.fitness_cache.get(g.genome_id, FitnessVector.default()).sortino,
                 reverse=True
             )[:MAX_PARETO_FRONT_SIZE]
 
@@ -494,7 +494,7 @@ class EvolutionEngine:
                 novelty=0.0, deflated_sharpe=0.0, trades=0,
                 win_rate=0.0, sharpe=0.0
             )
-            behavior = BehaviorVector()
+            behavior = BehaviorVector.default()
             self.fitness_cache[genome.genome_id] = fitness
             self.behavior_cache[genome.genome_id] = behavior
             return fitness, behavior
@@ -808,7 +808,7 @@ class EvolutionEngine:
             phenotype_diversity = calculate_population_diversity([b for b in behaviors if b])
             archive_diversity = self.novelty_archive.get_archive_diversity()
             best_fitness = max(
-                (self.fitness_cache.get(g.genome_id, FitnessVector(0, 0, 0, 0, 0)).sortino
+                (self.fitness_cache.get(g.genome_id, FitnessVector.default()).sortino
                  for g in self.population),
                 default=0.0
             )
@@ -834,7 +834,7 @@ class EvolutionEngine:
         # Elitism: keep best individuals
         elite = sorted(
             self.population,
-            key=lambda g: self.fitness_cache.get(g.genome_id, FitnessVector(0, 0, 0, 0, 0)).sortino,
+            key=lambda g: self.fitness_cache.get(g.genome_id, FitnessVector.default()).sortino,
             reverse=True
         )[:self.config.elitism]
         offspring.extend([copy.deepcopy(g) for g in elite])
@@ -905,7 +905,7 @@ class EvolutionEngine:
         fitness_weight = 1.0 - novelty_weight
 
         def weighted_score(genome):
-            fitness = self.fitness_cache.get(genome.genome_id, FitnessVector(0, 0, 0, 0, 0))
+            fitness = self.fitness_cache.get(genome.genome_id, FitnessVector.default())
             # Weighted combination of normalized sortino and novelty
             # Sortino normalized to roughly 0-1 range (typical good range: -2 to 5)
             normalized_sortino = max(0, min(1, (fitness.sortino + 2) / 7))
@@ -942,7 +942,7 @@ class EvolutionEngine:
             return
 
         fitnesses = [
-            self.fitness_cache.get(g.genome_id, FitnessVector(0, 0, 0, 0, 0))
+            self.fitness_cache.get(g.genome_id, FitnessVector.default())
             for g in self.population
         ]
 
@@ -993,7 +993,7 @@ class EvolutionEngine:
                 "best_sortino": round(best_sortino, 3),
                 "pareto_size": len(self.pareto_front),
                 "diversity": round(diversity, 3),
-                "discovered": len(getattr(self, '_discovered_count', 0) or 0),
+                "discovered": self.strategies_promoted,
                 "timestamp": datetime.now().isoformat(),
             }
             # Atomic write via temp file
@@ -1247,7 +1247,7 @@ class EvolutionEngine:
                                 max_drawdown=fitness.max_drawdown,
                                 trades=fitness.trades,
                                 deflated_sharpe=fitness.deflated_sharpe,
-                                genome_json=json.dumps(self.factory.serialize_genome(genome))
+                                genome_json=self.factory.serialize_genome(genome)
                             )
                         except Exception as pp_err:
                             logger.warning(f"Failed to register with promotion pipeline: {pp_err}")
@@ -1294,7 +1294,7 @@ class EvolutionEngine:
         # Sort by fitness and replace worst
         sorted_pop = sorted(
             self.population,
-            key=lambda g: self.fitness_cache.get(g.genome_id, FitnessVector(0, 0, 0, 0, 0)).sortino,
+            key=lambda g: self.fitness_cache.get(g.genome_id, FitnessVector.default()).sortino,
             reverse=True
         )
 
