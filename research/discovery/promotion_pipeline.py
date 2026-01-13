@@ -1582,7 +1582,7 @@ class PromotionPipeline:
                 if ready:
                     # Get validation metrics from the record
                     record = self.get_strategy_record(strategy_id)
-                    if record and record.walk_forward_efficiency > 0 and record.monte_carlo_confidence > 0:
+                    if record and record.walk_forward_efficiency is not None and record.walk_forward_efficiency > 0 and record.monte_carlo_confidence is not None and record.monte_carlo_confidence > 0:
                         result = self.promote_to_validated(
                             strategy_id,
                             walk_forward_efficiency=record.walk_forward_efficiency,

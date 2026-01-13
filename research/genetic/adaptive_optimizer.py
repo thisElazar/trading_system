@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from .market_periods import MarketPeriodLibrary, MarketPeriod, PeriodType
 from .rapid_backtester import RapidBacktester, RapidBacktestResult, MultiPeriodResult
 from .regime_matching import RegimeMatchingEngine, RegimeFingerprint
+from utils.timezone import is_research_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -758,6 +759,11 @@ class AdaptiveGAOptimizer:
         generations = generations or self.config.generations_per_island
 
         for gen in range(generations):
+            # Check research time boundary
+            if not is_research_allowed():
+                logger.warning("Research time boundary reached - stopping island evolution")
+                break
+
             # Evaluate population
             for ind in island.population:
                 if not ind.evaluated:  # Only evaluate unevaluated individuals
@@ -917,6 +923,11 @@ class AdaptiveGAOptimizer:
 
         # Main evolution loop
         for gen in range(generations):
+            # Check research time boundary (hard stop before market hours)
+            if not is_research_allowed():
+                logger.warning("Research time boundary reached - stopping to preserve system for trading")
+                break
+
             self.current_generation = gen
 
             # Evolve each island
@@ -1036,6 +1047,11 @@ class AdaptiveGAOptimizer:
         best_rapid = None
 
         for gen in range(n_generations):
+            # Check research time boundary
+            if not is_research_allowed():
+                logger.warning("Research time boundary reached - stopping rapid evolution")
+                break
+
             # Evaluate
             for ind in rapid_population:
                 if ind.fitness == 0:

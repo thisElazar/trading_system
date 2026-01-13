@@ -18,6 +18,7 @@ import copy
 import gc
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
+from utils.timezone import is_research_allowed
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -392,6 +393,83 @@ class EvolutionEngine:
         self._pool_initialized = True
         logger.info(f"Parallel pool ready: {self.config.n_workers} workers with shared memory")
 
+    def _validate_genome(self, genome: StrategyGenome) -> Tuple[bool, str]:
+        """
+        Validate genome for degenerate patterns before backtesting.
+
+        Checks:
+        1. Stop loss tree doesn't indicate "no stop" intent (> 50%)
+        2. Entry condition triggers on enough symbols (>= MIN_ENTRY_SYMBOLS)
+
+        Returns:
+            Tuple of (is_valid, rejection_reason)
+        """
+        from .gp_core import set_eval_data, clear_eval_data
+        from deap import gp
+
+        MIN_ENTRY_SYMBOLS = 10  # Minimum symbols entry must trigger on
+        MAX_STOP_LOSS_PCT = 0.50  # 50% - anything higher indicates "no stop" intent
+
+        # Check 1: Stop loss value
+        try:
+            # Get a sample dataframe for evaluation context
+            sample_symbol = next(iter(self._data.keys()))
+            sample_df = self._data[sample_symbol]
+
+            set_eval_data(sample_df)
+            stop_tree = genome.stop_loss_tree
+            stop_compiled = gp.compile(stop_tree, self.factory.float_pset)
+            raw_stop = stop_compiled() if callable(stop_compiled) else stop_compiled
+            clear_eval_data()
+
+            if raw_stop is not None and abs(float(raw_stop)) > MAX_STOP_LOSS_PCT:
+                return False, f"Stop loss {abs(float(raw_stop)):.0%} > {MAX_STOP_LOSS_PCT:.0%} (no-stop intent)"
+        except Exception as e:
+            logger.debug(f"Stop loss validation failed: {e}")
+
+        # Check 2: Entry condition symbol coverage
+        try:
+            entry_tree = genome.entry_tree
+
+            symbols_triggered = 0
+            symbols_checked = 0
+
+            for symbol, df in self._data.items():
+                if len(df) < 50:
+                    continue
+                symbols_checked += 1
+
+                # IMPORTANT: Must set data context BEFORE compiling!
+                # gp.compile() evaluates simple trees at compile time.
+                # Without data context, ind_open() returns 0.0, making
+                # conditions like gt(const_1, open()) always True.
+                set_eval_data(df)
+                try:
+                    entry_compiled = gp.compile(entry_tree, self.factory.bool_pset)
+                    result = entry_compiled() if callable(entry_compiled) else entry_compiled
+                    if result:
+                        symbols_triggered += 1
+                except:
+                    pass
+                finally:
+                    clear_eval_data()
+
+                # Early exit if we've found enough
+                if symbols_triggered >= MIN_ENTRY_SYMBOLS:
+                    break
+
+                # Only check first 100 symbols for efficiency
+                if symbols_checked >= 100:
+                    break
+
+            if symbols_triggered < MIN_ENTRY_SYMBOLS:
+                return False, f"Entry triggers on {symbols_triggered}/{symbols_checked} symbols (< {MIN_ENTRY_SYMBOLS} min)"
+
+        except Exception as e:
+            logger.debug(f"Entry validation failed: {e}")
+
+        return True, ""
+
     def evaluate_genome(self, genome: StrategyGenome) -> Tuple[FitnessVector, BehaviorVector]:
         """
         Evaluate a single genome.
@@ -405,6 +483,21 @@ class EvolutionEngine:
         # Check cache
         if genome.genome_id in self.fitness_cache:
             return self.fitness_cache[genome.genome_id], self.behavior_cache[genome.genome_id]
+
+        # Validate genome for degenerate patterns
+        is_valid, rejection_reason = self._validate_genome(genome)
+        if not is_valid:
+            logger.debug(f"Genome {genome.genome_id} rejected: {rejection_reason}")
+            # Return poor fitness for rejected genomes
+            fitness = FitnessVector(
+                sortino=-5.0, max_drawdown=-50.0, cvar_95=-0.1,
+                novelty=0.0, deflated_sharpe=0.0, trades=0,
+                win_rate=0.0, sharpe=0.0
+            )
+            behavior = BehaviorVector()
+            self.fitness_cache[genome.genome_id] = fitness
+            self.behavior_cache[genome.genome_id] = behavior
+            return fitness, behavior
 
         # Compile genome to strategy
         strategy = self.compiler.compile(genome)
@@ -939,6 +1032,11 @@ class EvolutionEngine:
             for gen in range(generations):
                 if self.shutdown_requested:
                     logger.warning("Shutdown requested, saving state...")
+                    break
+
+                # Check research time boundary (hard stop before market hours)
+                if not is_research_allowed():
+                    logger.warning("Research time boundary reached - stopping to preserve system for trading")
                     break
 
                 if end_time and datetime.now() >= end_time:

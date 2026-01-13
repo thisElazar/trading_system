@@ -71,6 +71,38 @@ signal.signal(signal.SIGTERM, _handle_shutdown_signal)
 signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
 # ============================================================================
+# RESEARCH TIME BOUNDARIES
+# ============================================================================
+# Research must self-enforce its allowed hours. The orchestrator may not be
+# responsive enough to kill us if we're consuming too many resources.
+#
+# Time boundaries are defined in utils/timezone.py:
+#   - Weekdays: 7:30 AM - 5:00 PM ET blocked (market hours + buffer)
+#   - Sunday: After 7:30 PM ET blocked (before Monday pre-market)
+#   - Saturday: Always allowed
+
+from utils.timezone import is_research_allowed as _is_research_allowed
+
+def _should_stop_research() -> bool:
+    """
+    Check if research should stop NOW.
+
+    Returns True if:
+    - Shutdown signal received (SIGTERM/SIGINT)
+    - Outside allowed research hours
+    """
+    if _shutdown_requested:
+        return True
+
+    if not _is_research_allowed():
+        logging.getLogger('nightly_research').warning(
+            "Research time boundary reached - stopping to preserve system for trading"
+        )
+        return True
+
+    return False
+
+# ============================================================================
 # PARALLEL FITNESS EVALUATION INFRASTRUCTURE
 # ============================================================================
 # Module-level globals for parallel fitness evaluation
@@ -805,7 +837,7 @@ def create_fitness_function(strategy_name: str, backtester: Backtester,
                 # Handle both DatetimeIndex and 'timestamp' column
                 if isinstance(df.index, pd.DatetimeIndex):
                     dates = df.index
-                    dates = normalize_timestamp(dates)
+                    dates = normalize_index(dates)
                     all_dates.update(dates.tolist())
                 elif 'timestamp' in df.columns:
                     dates = pd.to_datetime(df['timestamp'])
@@ -826,7 +858,7 @@ def create_fitness_function(strategy_name: str, backtester: Backtester,
                     # Handle both DatetimeIndex and 'timestamp' column
                     if isinstance(df.index, pd.DatetimeIndex):
                         idx = df.index
-                        idx = normalize_timestamp(idx)
+                        idx = normalize_index(idx)
                         train_data[sym] = df[idx <= split_date].copy()
                         test_data[sym] = df[idx > split_date].copy()
                     elif 'timestamp' in df.columns:
@@ -844,7 +876,7 @@ def create_fitness_function(strategy_name: str, backtester: Backtester,
             if vix_data is not None and len(vix_data) > 0:
                 if isinstance(vix_data.index, pd.DatetimeIndex):
                     idx = vix_data.index
-                    idx = normalize_timestamp(idx)
+                    idx = normalize_index(idx)
                     train_vix = vix_data[idx <= split_date].copy()
                     test_vix = vix_data[idx > split_date].copy()
                 elif 'timestamp' in vix_data.columns:
@@ -1876,9 +1908,9 @@ class NightlyResearchEngine:
         # ====================================================================
         # PHASE 1: Parameter Optimization (existing strategies)
         # ====================================================================
-        if _shutdown_requested:
-            logger.warning("Shutdown requested before Phase 1, exiting")
-            return {'success': False, 'error': 'Shutdown requested'}
+        if _should_stop_research():
+            logger.warning("Research stop triggered before Phase 1 (shutdown or time boundary)")
+            return {'success': False, 'error': 'Research stopped'}
 
         if not skip_param_optimization:
             logger.info("\n" + "-" * 50)
@@ -1944,9 +1976,9 @@ class NightlyResearchEngine:
         # ====================================================================
         # PHASE 2: Strategy Discovery (novel strategies via GP)
         # ====================================================================
-        if _shutdown_requested:
-            logger.warning("Shutdown requested before Phase 2, exiting")
-            return {'success': True, 'partial': True, 'error': 'Shutdown after Phase 1'}
+        if _should_stop_research():
+            logger.warning("Research stop triggered before Phase 2 (shutdown or time boundary)")
+            return {'success': True, 'partial': True, 'error': 'Research stopped after Phase 1'}
 
         if self.enable_discovery and not skip_discovery:
             logger.info("\n" + "-" * 50)
@@ -1986,9 +2018,9 @@ class NightlyResearchEngine:
         # ====================================================================
         # PHASE 3: Adaptive GA (regime-matched multi-scale testing)
         # ====================================================================
-        if _shutdown_requested:
-            logger.warning("Shutdown requested before Phase 3, exiting")
-            return {'success': True, 'partial': True, 'error': 'Shutdown after Phase 2'}
+        if _should_stop_research():
+            logger.warning("Research stop triggered before Phase 3 (shutdown or time boundary)")
+            return {'success': True, 'partial': True, 'error': 'Research stopped after Phase 2'}
 
         if self.enable_adaptive and not skip_adaptive:
             logger.info("\n" + "-" * 50)

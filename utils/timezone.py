@@ -352,3 +352,81 @@ def prepare_data_for_analysis(df: pd.DataFrame,
         df = df[df.index >= cutoff]
 
     return df
+
+
+# =============================================================================
+# Research Time Boundaries
+# =============================================================================
+# Research should NEVER run during or close to market hours.
+# These hard boundaries are enforced independent of the orchestrator.
+
+# Times in Eastern (ET)
+RESEARCH_STOP_TIME_WEEKDAY = (7, 30)   # 7:30 AM ET - hard stop on weekdays
+RESEARCH_START_TIME_WEEKDAY = (17, 0)  # 5:00 PM ET - earliest start on weekdays
+RESEARCH_STOP_TIME_SUNDAY = (19, 30)   # 7:30 PM ET - stop Sunday evening before futures open
+
+
+def is_research_allowed() -> bool:
+    """
+    Check if research is currently allowed based on time boundaries.
+
+    Research windows (all times in Eastern):
+    - Saturday: All day (00:00-23:59)
+    - Sunday: 00:00-19:30 (before futures open)
+    - Weekdays: 00:00-07:30 and 17:00-23:59 (before/after market +buffer)
+
+    Returns:
+        True if research is allowed now, False otherwise
+    """
+    now = now_eastern()
+    weekday = now.weekday()  # 0=Mon, 5=Sat, 6=Sun
+    hour, minute = now.hour, now.minute
+    current_minutes = hour * 60 + minute
+
+    # Saturday: always allowed
+    if weekday == 5:
+        return True
+
+    # Sunday: allowed until 7:30 PM ET (before futures open at 8 PM)
+    if weekday == 6:
+        stop_minutes = RESEARCH_STOP_TIME_SUNDAY[0] * 60 + RESEARCH_STOP_TIME_SUNDAY[1]
+        return current_minutes < stop_minutes
+
+    # Weekday (Mon-Fri):
+    # Allowed if before 7:30 AM OR after 5:00 PM
+    stop_minutes = RESEARCH_STOP_TIME_WEEKDAY[0] * 60 + RESEARCH_STOP_TIME_WEEKDAY[1]
+    start_minutes = RESEARCH_START_TIME_WEEKDAY[0] * 60 + RESEARCH_START_TIME_WEEKDAY[1]
+
+    return current_minutes < stop_minutes or current_minutes >= start_minutes
+
+
+def get_research_deadline() -> Optional[datetime]:
+    """
+    Get the next time when research must stop.
+
+    Returns:
+        Datetime when research must stop, or None if no deadline today
+    """
+    now = now_eastern()
+    weekday = now.weekday()
+
+    # Saturday: no deadline
+    if weekday == 5:
+        return None
+
+    # Sunday: deadline is 7:30 PM
+    if weekday == 6:
+        deadline = now.replace(
+            hour=RESEARCH_STOP_TIME_SUNDAY[0],
+            minute=RESEARCH_STOP_TIME_SUNDAY[1],
+            second=0, microsecond=0
+        )
+        return deadline if now < deadline else None
+
+    # Weekday: deadline is 7:30 AM (if we're in overnight session)
+    deadline = now.replace(
+        hour=RESEARCH_STOP_TIME_WEEKDAY[0],
+        minute=RESEARCH_STOP_TIME_WEEKDAY[1],
+        second=0, microsecond=0
+    )
+    return deadline if now < deadline else None

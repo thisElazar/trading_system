@@ -39,6 +39,7 @@ from research.genetic.optimizer import (
 )
 from research.genetic.fitness_utils import calculate_composite_fitness
 from data.storage.db_manager import get_db
+from utils.timezone import is_research_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -912,6 +913,11 @@ class PersistentGAOptimizer:
         
         # Evolve for specified generations
         for i in range(generations):
+            # Check research time boundary (hard stop before market hours)
+            if not is_research_allowed():
+                logger.warning("Research time boundary reached - stopping to preserve system for trading")
+                break
+
             self.current_generation += 1
 
             # Evolve one generation
