@@ -603,9 +603,25 @@ class AlpacaConnector:
                 signal_db.close_position(lp.id, exit_price, 'broker_sync')
                 closed_count += 1
             else:
-                # Update current price (unrealized P&L is calculated internally by update_position_price)
+                # Sync with broker data - use broker as source of truth
                 bp = broker_positions[lp.symbol]
-                signal_db.update_position_price(lp.id, bp.current_price)
+
+                # Check if entry price or quantity differs (broker is authoritative)
+                entry_diff = abs(lp.entry_price - bp.avg_entry_price) / bp.avg_entry_price if bp.avg_entry_price > 0 else 0
+                qty_diff = lp.quantity != int(bp.qty)
+
+                if entry_diff > 0.01 or qty_diff:
+                    # Use full sync to correct entry_price, quantity, and recalculate TP/SL
+                    signal_db.sync_position_with_broker(
+                        lp.id,
+                        entry_price=bp.avg_entry_price,
+                        quantity=int(bp.qty),
+                        current_price=bp.current_price,
+                        unrealized_pnl=bp.unrealized_pl
+                    )
+                else:
+                    # Just update current price
+                    signal_db.update_position_price(lp.id, bp.current_price)
                 updated_count += 1
         
         logger.info(f"Position sync: {new_count} new, {updated_count} updated, {closed_count} closed")

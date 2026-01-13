@@ -630,6 +630,75 @@ class SignalDatabase:
             if conn:
                 conn.close()
 
+    def sync_position_with_broker(
+        self,
+        position_id: int,
+        entry_price: float,
+        quantity: int,
+        current_price: float,
+        unrealized_pnl: float
+    ):
+        """
+        Sync position with authoritative broker data.
+        Updates entry_price, quantity, and recalculates TP/SL if entry changed.
+
+        Called during position reconciliation when broker data differs from DB.
+        """
+        conn = None
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+
+            # Get current position
+            cursor.execute("SELECT * FROM positions WHERE id = ?", (position_id,))
+            row = cursor.fetchone()
+
+            if row:
+                pos = Position(**dict(row))
+                old_entry = pos.entry_price
+
+                # Calculate new TP/SL preserving original percentage targets
+                if old_entry > 0 and pos.take_profit > 0:
+                    tp_pct = (pos.take_profit - old_entry) / old_entry
+                    new_tp = entry_price * (1 + tp_pct)
+                else:
+                    new_tp = pos.take_profit
+
+                if old_entry > 0 and pos.stop_loss > 0:
+                    sl_pct = (pos.stop_loss - old_entry) / old_entry
+                    new_sl = entry_price * (1 + sl_pct)
+                else:
+                    new_sl = pos.stop_loss
+
+                # Validate TP/SL (TP must be above entry for longs)
+                if pos.direction == 'long' and new_tp <= entry_price:
+                    new_tp = entry_price * 1.05  # Default 5% target
+                    logger.warning(f"Position {pos.symbol}: Invalid TP, reset to 5% above entry")
+
+                cursor.execute("""
+                    UPDATE positions SET
+                        entry_price = ?,
+                        quantity = ?,
+                        current_price = ?,
+                        unrealized_pnl = ?,
+                        take_profit = ?,
+                        stop_loss = ?
+                    WHERE id = ?
+                """, (entry_price, quantity, current_price, unrealized_pnl,
+                      new_tp, new_sl, position_id))
+                conn.commit()
+
+                if abs(old_entry - entry_price) > 0.01:
+                    logger.info(f"Position {pos.symbol} synced: entry ${old_entry:.2f}->${entry_price:.2f}, "
+                               f"qty {pos.quantity}->{quantity}, TP ${pos.take_profit:.2f}->${new_tp:.2f}")
+            else:
+                logger.warning(f"Position not found for broker sync: position_id={position_id}")
+        except sqlite3.Error as e:
+            logger.error(f"Failed to sync position with broker: position_id={position_id} - {e}")
+        finally:
+            if conn:
+                conn.close()
+
     def close_position(
         self,
         position_id: int,
