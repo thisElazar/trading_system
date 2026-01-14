@@ -58,6 +58,26 @@ class FitnessVector:
     win_rate: float = 0.0
     sharpe: float = 0.0
 
+    @classmethod
+    def default(cls) -> 'FitnessVector':
+        """
+        Create a FitnessVector with proper default values for failed/invalid evaluations.
+
+        Returns properly initialized defaults that represent a poor but valid fitness state,
+        rather than zeros which can cause issues in comparisons.
+        """
+        return cls(
+            sortino=-5.0,           # Very poor risk-adjusted return
+            max_drawdown=-50.0,     # 50% drawdown (very bad)
+            cvar_95=-0.10,          # -10% expected tail loss
+            novelty=0.0,            # No novelty
+            deflated_sharpe=0.0,    # No statistical significance
+            calmar=0.0,             # No calmar ratio
+            trades=0,               # No trades
+            win_rate=0.0,           # No win rate
+            sharpe=0.0              # No sharpe
+        )
+
     def to_tuple(self) -> Tuple[float, float, float, float]:
         """
         Convert to tuple for DEAP fitness.
@@ -87,7 +107,7 @@ class FitnessVector:
         comparisons = [
             (self.sortino, other.sortino),       # Maximize
             (self.max_drawdown, other.max_drawdown),  # Maximize (less negative)
-            (-self.cvar_95, -other.cvar_95),     # Minimize -> negate for comparison
+            (self.cvar_95, other.cvar_95),       # CVaR stored as negative; higher (less negative) is better
             (self.novelty, other.novelty)        # Maximize
         ]
 

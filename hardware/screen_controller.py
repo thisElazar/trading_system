@@ -462,7 +462,7 @@ class ScreenController:
         lines = [
             header,
             f"${pv:,.0f}",
-            f"Today: {pnl_sign}${pnl:,.0f} ({pct_sign}{pnl_pct:.1f}%)",
+            f"Unreal:{pnl_sign}${pnl:,.0f} ({pct_sign}{pnl_pct:.1f}%)",
             f"Pos: {positions}  Cash: {cash_pct:.0f}%"
         ]
         self._screen.write_all(lines)

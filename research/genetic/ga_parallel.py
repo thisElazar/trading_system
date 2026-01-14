@@ -344,10 +344,17 @@ class GAWorkerPool:
         self,
         strategy_factory: Callable,
         genes_list: List[Dict],
-        config: Dict = None
+        config: Dict = None,
+        timeout: int = 300
     ) -> List[Dict]:
         """
         Evaluate fitness for a batch of gene configurations.
+
+        Args:
+            strategy_factory: Factory function to create strategies
+            genes_list: List of gene dictionaries to evaluate
+            config: Configuration dictionary
+            timeout: Timeout in seconds for batch evaluation (default 5 minutes)
         """
         if not self._started:
             raise RuntimeError("Pool not started")
@@ -356,8 +363,13 @@ class GAWorkerPool:
         args_list = [(strategy_factory, genes, config) for genes in genes_list]
 
         try:
-            results = self._pool.map(_evaluate_fitness_worker, args_list)
-            return results
+            result = self._pool.map_async(_evaluate_fitness_worker, args_list)
+            try:
+                results = result.get(timeout=timeout)
+                return results
+            except TimeoutError:
+                logger.error(f"Batch fitness evaluation timed out after {timeout} seconds")
+                return [{'success': False, 'fitness': float('-inf'), 'error': 'Timeout'} for _ in genes_list]
         except Exception as e:
             logger.error(f"Batch fitness evaluation failed: {e}")
             return [{'success': False, 'fitness': float('-inf')} for _ in genes_list]
@@ -367,10 +379,18 @@ class GAWorkerPool:
         strategy_factory: Callable,
         genes: Dict,
         periods: List[Dict],
-        config: Dict = None
+        config: Dict = None,
+        timeout: int = 300
     ) -> List[Dict]:
         """
         Run period tests for a strategy configuration.
+
+        Args:
+            strategy_factory: Factory function to create strategies
+            genes: Gene dictionary for the strategy
+            periods: List of period dictionaries to test
+            config: Configuration dictionary
+            timeout: Timeout in seconds for batch evaluation (default 5 minutes)
         """
         if not self._started:
             raise RuntimeError("Pool not started")
@@ -379,8 +399,13 @@ class GAWorkerPool:
         args_list = [(strategy_factory, genes, period, config) for period in periods]
 
         try:
-            results = self._pool.map(_run_period_test_worker, args_list)
-            return results
+            result = self._pool.map_async(_run_period_test_worker, args_list)
+            try:
+                results = result.get(timeout=timeout)
+                return results
+            except TimeoutError:
+                logger.error(f"Batch period testing timed out after {timeout} seconds")
+                return [{'success': False, 'error': 'Timeout'} for _ in periods]
         except Exception as e:
             logger.error(f"Batch period testing failed: {e}")
             return [{'success': False, 'error': str(e)} for _ in periods]
@@ -409,3 +434,11 @@ class GAWorkerPool:
 
     def __exit__(self, *args):
         self.shutdown()
+
+    def __del__(self):
+        """Cleanup on deletion - ensures pool is shut down."""
+        if getattr(self, '_started', False):
+            try:
+                self.shutdown(wait=False)
+            except Exception:
+                pass

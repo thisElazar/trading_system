@@ -769,7 +769,7 @@ class DailyOrchestrator:
 
             # 1. Add symbols from open positions (critical)
             try:
-                open_positions = self.execution_tracker.get_open_positions()
+                open_positions = self.execution_tracker.db.get_open_positions()
                 for pos in open_positions:
                     # Position is a dataclass, access symbol attribute directly
                     if hasattr(pos, 'symbol'):
@@ -880,6 +880,11 @@ class DailyOrchestrator:
         This captures the complete day's trading data so overnight research
         and next day's pre-market scan have fresh EOD prices.
         """
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+        SYMBOL_TIMEOUT_SEC = 15  # Timeout per symbol fetch
+        OVERALL_TIMEOUT_SEC = 1800  # 30 min overall timeout
+
         logger.info("Fetching EOD data for full universe...")
         try:
             from data.fetchers.daily_bars import DailyBarsFetcher
@@ -894,25 +899,40 @@ class DailyOrchestrator:
                 # Fallback to cached symbols
                 all_symbols = self.data_manager.get_available_symbols()
 
-            logger.info(f"EOD refresh starting for {len(all_symbols)} symbols")
+            logger.info(f"EOD refresh starting for {len(all_symbols)} symbols (timeout: {OVERALL_TIMEOUT_SEC}s)")
 
             success_count = 0
             fail_count = 0
+            timeout_count = 0
 
             for i, symbol in enumerate(all_symbols):
+                # Check overall timeout
+                elapsed = time.time() - start
+                if elapsed > OVERALL_TIMEOUT_SEC:
+                    logger.warning(f"EOD refresh hit overall timeout at {i}/{len(all_symbols)} symbols")
+                    break
+
                 try:
-                    df = fetcher.fetch_symbol(symbol, force=True)
-                    if df is not None and not df.empty:
-                        success_count += 1
-                    else:
-                        fail_count += 1
+                    # Wrap fetch in timeout using ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(fetcher.fetch_symbol, symbol, force=True)
+                        try:
+                            df = future.result(timeout=SYMBOL_TIMEOUT_SEC)
+                            if df is not None and not df.empty:
+                                success_count += 1
+                            else:
+                                fail_count += 1
+                        except FuturesTimeoutError:
+                            timeout_count += 1
+                            logger.debug(f"{symbol}: Fetch timed out after {SYMBOL_TIMEOUT_SEC}s")
                 except Exception as e:
                     fail_count += 1
                     logger.debug(f"Failed to refresh {symbol}: {e}")
 
-                # Progress logging every 100 symbols
+                # Progress logging and memory cleanup every 100 symbols
                 if (i + 1) % 100 == 0:
-                    logger.info(f"EOD refresh progress: {i + 1}/{len(all_symbols)} ({success_count} success)")
+                    gc.collect()
+                    logger.info(f"EOD refresh progress: {i + 1}/{len(all_symbols)} ({success_count} success, {timeout_count} timeout)")
 
             # Refresh VIX data
             try:

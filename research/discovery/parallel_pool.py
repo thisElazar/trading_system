@@ -221,6 +221,14 @@ class PersistentWorkerPool:
                 break  # Success, exit retry loop
 
             except (BrokenPipeError, OSError) as e:
+                # Cleanup on failure
+                if self._pool:
+                    try:
+                        self._pool.terminate()
+                    except Exception:
+                        pass
+                    self._pool = None
+
                 if retry < max_retries - 1:
                     wait_time = (retry + 1) * 2  # Exponential backoff: 2s, 4s, 6s
                     logger.warning(f"Pool creation failed (attempt {retry + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
@@ -231,13 +239,25 @@ class PersistentWorkerPool:
 
         # Stagger worker initialization by sending warmup tasks one at a time
         # Each worker runs its initializer on first task, causing heavy imports
-        logger.info("Warming up workers with staggered initialization...")
-        for i in range(self.n_workers):
-            # Send one task to one worker and wait for it to complete
-            result = self._pool.apply(_pool_warmup_task, args=(i,))
-            logger.debug(f"Worker {i+1}/{self.n_workers} initialized")
-            if i < self.n_workers - 1:  # Don't sleep after the last worker
-                time.sleep(stagger_delay)
+        # Wrap warmup in try/except to cleanup pool on failure
+        try:
+            logger.info("Warming up workers with staggered initialization...")
+            for i in range(self.n_workers):
+                # Send one task to one worker and wait for it to complete
+                result = self._pool.apply(_pool_warmup_task, args=(i,))
+                logger.debug(f"Worker {i+1}/{self.n_workers} initialized")
+                if i < self.n_workers - 1:  # Don't sleep after the last worker
+                    time.sleep(stagger_delay)
+        except Exception as e:
+            # Cleanup pool on warmup failure
+            logger.error(f"Worker warmup failed: {e}")
+            if self._pool:
+                try:
+                    self._pool.terminate()
+                except Exception:
+                    pass
+                self._pool = None
+            raise RuntimeError(f"Failed to warm up workers: {e}") from e
 
         self._started = True
         logger.info("Worker pool started and initialized (all workers warmed up)")
@@ -245,7 +265,8 @@ class PersistentWorkerPool:
     def evaluate_batch(
         self,
         genome_data_list: List[Dict],
-        config_dict: Dict[str, Any]
+        config_dict: Dict[str, Any],
+        timeout: int = 300
     ) -> List[Dict[str, Any]]:
         """
         Evaluate a batch of genomes in parallel.
@@ -253,6 +274,7 @@ class PersistentWorkerPool:
         Args:
             genome_data_list: List of serialized genome dicts
             config_dict: Evolution config as dict
+            timeout: Timeout in seconds for batch evaluation (default 5 minutes)
 
         Returns:
             List of result dicts
@@ -263,10 +285,18 @@ class PersistentWorkerPool:
         # Prepare args - only genome data and config, not market data
         args_list = [(g, config_dict) for g in genome_data_list]
 
-        # Run in parallel
+        # Run in parallel with timeout
         try:
-            results = self._pool.map(_evaluate_genome_shared, args_list)
-            return results
+            result = self._pool.map_async(_evaluate_genome_shared, args_list)
+            try:
+                results = result.get(timeout=timeout)
+                return results
+            except TimeoutError:
+                logger.error(f"Batch evaluation timed out after {timeout} seconds")
+                return [
+                    {"success": False, "genome_id": g.get("genome_id", "?"), "error": "Timeout"}
+                    for g in genome_data_list
+                ]
         except Exception as e:
             logger.error(f"Batch evaluation failed: {e}")
             # Return failure results
@@ -336,6 +366,14 @@ class PersistentWorkerPool:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
         return False
+
+    def __del__(self):
+        """Cleanup on deletion - ensures pool is shut down."""
+        if getattr(self, '_started', False):
+            try:
+                self.shutdown(wait=False)
+            except Exception:
+                pass
 
 
 class AdaptiveWorkerPool(PersistentWorkerPool):

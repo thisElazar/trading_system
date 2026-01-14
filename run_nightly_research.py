@@ -1910,7 +1910,8 @@ class NightlyResearchEngine:
         # ====================================================================
         if _should_stop_research():
             logger.warning("Research stop triggered before Phase 1 (shutdown or time boundary)")
-            return {'success': False, 'error': 'Research stopped'}
+            # Time boundary stop is expected behavior, not a failure
+            return {'success': True, 'stopped_early': True, 'reason': 'time_boundary'}
 
         if not skip_param_optimization:
             logger.info("\n" + "-" * 50)

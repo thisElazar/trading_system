@@ -200,6 +200,9 @@ class SharedDataReader:
     Attaches to existing shared memory blocks created by SharedDataManager.
     """
 
+    # Maximum cache size for LRU eviction
+    MAX_CACHE_SIZE = 20
+
     def __init__(self, metadata: Dict[str, Any]):
         """
         Initialize reader with metadata from main process.
@@ -209,7 +212,7 @@ class SharedDataReader:
         """
         self._metadata = metadata
         self._shared_blocks: Dict[str, shared_memory.SharedMemory] = {}
-        self._data_cache: Dict[str, pd.DataFrame] = {}
+        self._data_cache: Dict[str, pd.DataFrame] = {}  # Acts as LRU cache
         self._attached = False
 
     def attach(self):
@@ -230,6 +233,8 @@ class SharedDataReader:
         """
         Reconstruct DataFrame from shared memory.
 
+        Uses LRU caching with MAX_CACHE_SIZE limit to prevent unbounded memory growth.
+
         Args:
             key: Symbol or "__VIX__" for VIX data
 
@@ -239,9 +244,12 @@ class SharedDataReader:
         if not self._attached:
             self.attach()
 
-        # Check cache first
+        # Check cache first (with LRU move-to-end)
         if key in self._data_cache:
-            return self._data_cache[key]
+            # Move to end for LRU ordering
+            df = self._data_cache.pop(key)
+            self._data_cache[key] = df
+            return df
 
         if key not in self._shared_blocks:
             return None
@@ -260,6 +268,12 @@ class SharedDataReader:
         if timestamp_col in df.columns:
             df[timestamp_col] = pd.to_datetime(df[timestamp_col], unit='s')
             df = df.set_index(timestamp_col)
+
+        # LRU eviction before adding new entry
+        if len(self._data_cache) >= self.MAX_CACHE_SIZE:
+            oldest = next(iter(self._data_cache))
+            del self._data_cache[oldest]
+            logger.debug(f"LRU eviction: removed {oldest} from cache")
 
         # Cache for reuse
         self._data_cache[key] = df
