@@ -53,6 +53,18 @@ Automated trading system on Raspberry Pi 5. Paper trading via Alpaca.
 | Orchestrator frozen | Memory pressure or deadlock | `sudo systemctl restart trading-orchestrator` |
 | LCD showing stale data | Orchestrator not updating | Check service status |
 | Research not running | Wrong phase or disabled | Check ENABLE_* flags in config.py |
+| Watchdog crash loop | Systemd `WatchdogSec` without `sd_notify` | Remove `WatchdogSec` from service file |
+| "Nightly research failed" | Time boundary stop (expected) | Check if `stopped_early: True` - not a real failure |
+| "Could not get open positions" | Wrong method call | Use `execution_tracker.db.get_open_positions()` |
+| EOD refresh hangs | Slow/failed network | Timeouts added (15s/symbol, 30min overall) |
+| System reboot overnight | Memory pressure during research | LRU cache limits added, monitor with `free -h` |
+
+## Recent Fixes (Jan 14)
+
+- **Watchdog service**: Removed `WatchdogSec=120` (script doesn't use sd_notify)
+- **Research exit codes**: Time boundary stop now returns success=True
+- **EOD refresh**: Added per-symbol and overall timeouts
+- **Memory management**: LRU cache in shared_data.py, gc.collect() in EOD refresh
 
 ## Skills Available
 
