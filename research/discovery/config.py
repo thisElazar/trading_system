@@ -76,7 +76,7 @@ class EvolutionConfig:
 
     # Parallel evaluation
     # Now safe to enable: batched evaluation with GC between batches (evolution_engine.py)
-    n_workers: int = 4                # Use all cores
+    n_workers: int = 2                # Reduced from 4 - prevents memory pressure on 4GB Pi
     parallel_enabled: bool = True     # Safe with batched evaluation
 
     # Validation

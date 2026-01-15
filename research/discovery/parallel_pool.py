@@ -38,15 +38,31 @@ logger = logging.getLogger(__name__)
 _worker_initialized = False
 _worker_data = None
 _worker_vix = None
+_worker_factory = None
+_worker_compiler = None
+_worker_backtester = None
 
 
 def _pool_warmup_task(worker_idx: int) -> bool:
     """
-    Dummy task to trigger worker initialization.
+    Warmup task that triggers full worker initialization including imports.
 
     Must be module-level (not local) to be picklable for multiprocessing.
+    Imports the heavy modules here so any import errors happen during warmup.
     """
-    return True
+    try:
+        # Pre-import the heavy modules that will be used in _evaluate_genome_shared
+        # This catches any import errors during warmup rather than task execution
+        from research.discovery.config import EvolutionConfig
+        from research.discovery.strategy_genome import GenomeFactory
+        from research.discovery.strategy_compiler import StrategyCompiler
+        from research.discovery.multi_objective import calculate_fitness_vector
+        from research.discovery.novelty_search import extract_behavior_vector
+        from research.backtester import Backtester, BacktestResult
+        return True
+    except Exception as e:
+        logger.error(f"Worker warmup imports failed: {e}")
+        return False
 
 
 def _pool_initializer(shared_metadata: Dict[str, Any]):
@@ -80,19 +96,48 @@ def _pool_initializer(shared_metadata: Dict[str, Any]):
         raise
 
 
+def _get_genome_id_from_data(genome_data) -> str:
+    """Extract genome_id from genome data (string or dict)."""
+    if isinstance(genome_data, dict):
+        return genome_data.get("genome_id", "unknown")
+    elif isinstance(genome_data, str):
+        try:
+            import json
+            return json.loads(genome_data).get("genome_id", "unknown")
+        except Exception:
+            return "unknown"
+    return "unknown"
+
+
 def _evaluate_genome_shared(args: Tuple) -> Dict[str, Any]:
     """
     Evaluate a genome using shared memory data.
 
     This is the worker function that runs in the pool.
     Data is accessed from shared memory, not passed as argument.
+    Objects (factory, compiler, backtester) are cached per-worker for efficiency.
     """
-    global _worker_data, _worker_vix
+    global _worker_data, _worker_vix, _worker_factory, _worker_compiler, _worker_backtester, _worker_initialized
 
     genome_data, config_dict = args
+    genome_id = _get_genome_id_from_data(genome_data)
+    pid = os.getpid()
 
     try:
-        # Import here to avoid circular imports
+        logger.info(f"Worker {pid}: Starting evaluation for {genome_id}")
+
+        # Check worker is properly initialized
+        if not _worker_initialized or _worker_data is None:
+            logger.warning(f"Worker {pid}: Not initialized! _worker_initialized={_worker_initialized}, _worker_data is None={_worker_data is None}")
+            return {
+                "success": False,
+                "genome_id": genome_id,
+                "error": "Worker not initialized - shared memory not loaded"
+            }
+
+        logger.debug(f"Worker {pid}: Worker initialized, have {len(_worker_data) if _worker_data else 0} symbols")
+
+        # Import here to avoid circular imports (imports are cached by Python)
         from research.discovery.config import EvolutionConfig
         from research.discovery.strategy_genome import GenomeFactory
         from research.discovery.strategy_compiler import StrategyCompiler
@@ -100,25 +145,37 @@ def _evaluate_genome_shared(args: Tuple) -> Dict[str, Any]:
         from research.discovery.novelty_search import extract_behavior_vector
         from research.backtester import Backtester, BacktestResult
 
-        config = EvolutionConfig(**config_dict)
-        factory = GenomeFactory(config)
-        compiler = StrategyCompiler(config)
-        backtester = Backtester(initial_capital=100000, cost_model="conservative")
+        # Initialize worker objects once (cached for efficiency)
+        if _worker_factory is None:
+            logger.info(f"Worker {pid}: First task - initializing factory/compiler/backtester...")
+            config = EvolutionConfig(**config_dict)
+            logger.debug(f"Worker {pid}: Config created")
+            _worker_factory = GenomeFactory(config)
+            logger.debug(f"Worker {pid}: GenomeFactory created")
+            _worker_compiler = StrategyCompiler(config)
+            logger.debug(f"Worker {pid}: StrategyCompiler created")
+            _worker_backtester = Backtester(initial_capital=100000, cost_model="conservative")
+            logger.info(f"Worker {pid}: Initialization complete")
 
         # Deserialize genome
-        genome = factory.deserialize_genome(genome_data)
+        logger.debug(f"Worker {pid}: Deserializing genome {genome_id}")
+        genome = _worker_factory.deserialize_genome(genome_data)
 
         # Compile strategy
-        strategy = compiler.compile(genome)
+        logger.debug(f"Worker {pid}: Compiling strategy for {genome_id}")
+        strategy = _worker_compiler.compile(genome)
 
         # Run backtest using shared data
+        logger.debug(f"Worker {pid}: Running backtest for {genome_id}")
         try:
-            result = backtester.run(
+            result = _worker_backtester.run(
                 strategy=strategy,
                 data=_worker_data,
                 vix_data=_worker_vix
             )
+            logger.debug(f"Worker {pid}: Backtest complete for {genome_id}")
         except Exception as e:
+            logger.debug(f"Worker {pid}: Backtest failed for {genome.genome_id}: {e}")
             result = BacktestResult(
                 run_id=genome.genome_id,
                 strategy=strategy.name if strategy else "unknown",
@@ -127,7 +184,9 @@ def _evaluate_genome_shared(args: Tuple) -> Dict[str, Any]:
             )
 
         # Extract behavior vector
+        logger.debug(f"Worker {pid}: Extracting behavior for {genome_id}")
         behavior = extract_behavior_vector(result)
+        logger.info(f"Worker {pid}: Evaluation complete for {genome_id}")
 
         return {
             "success": True,
@@ -137,7 +196,6 @@ def _evaluate_genome_shared(args: Tuple) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        genome_id = genome_data.get("genome_id", "unknown") if isinstance(genome_data, dict) else "unknown"
         logger.warning(f"Evaluation failed for {genome_id}: {e}")
         return {
             "success": False,
@@ -266,7 +324,7 @@ class PersistentWorkerPool:
         self,
         genome_data_list: List[Dict],
         config_dict: Dict[str, Any],
-        timeout: int = 300
+        timeout: int = 600
     ) -> List[Dict[str, Any]]:
         """
         Evaluate a batch of genomes in parallel.
@@ -285,6 +343,19 @@ class PersistentWorkerPool:
         # Prepare args - only genome data and config, not market data
         args_list = [(g, config_dict) for g in genome_data_list]
 
+        # Helper to extract genome_id from string or dict
+        def get_genome_id(g, idx: int) -> str:
+            if isinstance(g, dict):
+                return g.get("genome_id", f"unknown-{idx}")
+            elif isinstance(g, str):
+                # genome_data is a JSON string, extract genome_id
+                try:
+                    import json
+                    return json.loads(g).get("genome_id", f"unknown-{idx}")
+                except Exception:
+                    return f"unknown-{idx}"
+            return f"unknown-{idx}"
+
         # Run in parallel with timeout
         try:
             result = self._pool.map_async(_evaluate_genome_shared, args_list)
@@ -294,15 +365,15 @@ class PersistentWorkerPool:
             except TimeoutError:
                 logger.error(f"Batch evaluation timed out after {timeout} seconds")
                 return [
-                    {"success": False, "genome_id": g.get("genome_id", "?"), "error": "Timeout"}
-                    for g in genome_data_list
+                    {"success": False, "genome_id": get_genome_id(g, i), "error": "Timeout"}
+                    for i, g in enumerate(genome_data_list)
                 ]
         except Exception as e:
-            logger.error(f"Batch evaluation failed: {e}")
+            logger.error(f"Batch evaluation failed: {e}", exc_info=True)
             # Return failure results
             return [
-                {"success": False, "genome_id": g.get("genome_id", "?"), "error": str(e)}
-                for g in genome_data_list
+                {"success": False, "genome_id": get_genome_id(g, i), "error": str(e)}
+                for i, g in enumerate(genome_data_list)
             ]
 
     def evaluate_batch_async(

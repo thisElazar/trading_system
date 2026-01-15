@@ -884,6 +884,7 @@ class DailyOrchestrator:
 
         SYMBOL_TIMEOUT_SEC = 15  # Timeout per symbol fetch
         OVERALL_TIMEOUT_SEC = 1800  # 30 min overall timeout
+        MAX_WORKERS = 4  # Parallel fetches
 
         logger.info("Fetching EOD data for full universe...")
         try:
@@ -905,17 +906,70 @@ class DailyOrchestrator:
             fail_count = 0
             timeout_count = 0
 
-            for i, symbol in enumerate(all_symbols):
-                # Check overall timeout
-                elapsed = time.time() - start
-                if elapsed > OVERALL_TIMEOUT_SEC:
-                    logger.warning(f"EOD refresh hit overall timeout at {i}/{len(all_symbols)} symbols")
-                    break
+            # Use a single executor for all symbols - don't create one per symbol!
+            # This avoids the shutdown hang where executor.shutdown(wait=True) blocks
+            # waiting for threads that timed out but are still running.
+            executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+            pending_futures = {}  # future -> symbol mapping
 
-                try:
-                    # Wrap fetch in timeout using ThreadPoolExecutor
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(fetcher.fetch_symbol, symbol, force=True)
+            hit_overall_timeout = False
+            try:
+                for i, symbol in enumerate(all_symbols):
+                    # Check overall timeout
+                    elapsed = time.time() - start
+                    if elapsed > OVERALL_TIMEOUT_SEC:
+                        logger.warning(f"EOD refresh hit overall timeout at {i}/{len(all_symbols)} symbols")
+                        hit_overall_timeout = True
+                        break
+
+                    # Submit fetch task
+                    future = executor.submit(fetcher.fetch_symbol, symbol, force=True)
+                    pending_futures[future] = symbol
+
+                    # Process completed futures to avoid accumulating too many
+                    if len(pending_futures) >= MAX_WORKERS * 2:
+                        completed = []
+                        for f, sym in list(pending_futures.items()):
+                            if f.done():
+                                completed.append((f, sym))
+
+                        for f, sym in completed:
+                            try:
+                                df = f.result(timeout=0)  # Already done, won't block
+                                if df is not None and not df.empty:
+                                    success_count += 1
+                                else:
+                                    fail_count += 1
+                            except Exception:
+                                fail_count += 1
+                            del pending_futures[f]
+
+                    # Progress logging and memory cleanup every 100 symbols
+                    if (i + 1) % 100 == 0:
+                        gc.collect()
+                        logger.info(f"EOD refresh progress: {i + 1}/{len(all_symbols)} ({success_count} success, {timeout_count} timeout)")
+
+                # Process remaining futures - but skip if we hit overall timeout
+                # (waiting for each future individually would take too long)
+                if hit_overall_timeout:
+                    # Only collect already-completed futures
+                    logger.info(f"Skipping {len(pending_futures)} pending futures due to overall timeout")
+                    for future, symbol in list(pending_futures.items()):
+                        if future.done():
+                            try:
+                                df = future.result(timeout=0)
+                                if df is not None and not df.empty:
+                                    success_count += 1
+                                else:
+                                    fail_count += 1
+                            except Exception:
+                                fail_count += 1
+                        else:
+                            future.cancel()
+                            timeout_count += 1
+                else:
+                    # Normal processing - wait for each remaining future
+                    for future, symbol in pending_futures.items():
                         try:
                             df = future.result(timeout=SYMBOL_TIMEOUT_SEC)
                             if df is not None and not df.empty:
@@ -924,15 +978,16 @@ class DailyOrchestrator:
                                 fail_count += 1
                         except FuturesTimeoutError:
                             timeout_count += 1
+                            future.cancel()  # Mark for cancellation (won't stop running thread)
                             logger.debug(f"{symbol}: Fetch timed out after {SYMBOL_TIMEOUT_SEC}s")
-                except Exception as e:
-                    fail_count += 1
-                    logger.debug(f"Failed to refresh {symbol}: {e}")
+                        except Exception as e:
+                            fail_count += 1
+                            logger.debug(f"Failed to refresh {symbol}: {e}")
 
-                # Progress logging and memory cleanup every 100 symbols
-                if (i + 1) % 100 == 0:
-                    gc.collect()
-                    logger.info(f"EOD refresh progress: {i + 1}/{len(all_symbols)} ({success_count} success, {timeout_count} timeout)")
+            finally:
+                # Shutdown executor WITHOUT waiting for threads to finish
+                # This prevents hanging on slow/stuck API calls
+                executor.shutdown(wait=False, cancel_futures=True)
 
             # Refresh VIX data
             try:
@@ -3341,16 +3396,22 @@ class DailyOrchestrator:
     # =========================================================================
 
     def _task_run_promotion_pipeline(self) -> bool:
-        """Run strategy promotion pipeline to advance strategies through lifecycle."""
+        """Run strategy promotion pipeline to advance strategies through lifecycle.
+
+        NOTE: Heavy validation (walk-forward, Monte Carlo) is skipped during POST_MARKET
+        to prevent memory exhaustion and watchdog-triggered reboots. Heavy validation
+        runs during OVERNIGHT as part of nightly research instead.
+        """
         if not HAS_PROMOTION_PIPELINE or self.promotion_pipeline is None:
             logger.debug("Promotion pipeline not available")
             return True
 
         try:
-            logger.info("Running strategy promotion pipeline...")
+            logger.info("Running strategy promotion pipeline (light mode - no heavy validation)...")
 
             # Process promotions for strategies at each stage
-            results = self.promotion_pipeline.process_all_promotions()
+            # Skip heavy validation (WF/MC tests) to prevent OOM during POST_MARKET
+            results = self.promotion_pipeline.process_all_promotions(skip_heavy_validation=True)
 
             promoted = results.get('promoted', 0)
             retired = results.get('retired', 0)

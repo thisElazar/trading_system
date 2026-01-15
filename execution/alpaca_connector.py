@@ -617,7 +617,7 @@ class AlpacaConnector:
                         entry_price=bp.avg_entry_price,
                         quantity=int(bp.qty),
                         current_price=bp.current_price,
-                        unrealized_pnl=bp.unrealized_pl
+                        unrealized_pnl=bp.unrealized_pnl
                     )
                 else:
                     # Just update current price

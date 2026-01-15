@@ -3220,6 +3220,16 @@ app.layout = dbc.Container([
                 dbc.Button([html.I(className="fas fa-database me-1"), "Cleanup DBs"],
                           id="btn-cleanup-dbs", color="secondary", size="sm", outline=True),
             ], className="me-3"),
+            dbc.ButtonGroup([
+                dbc.Button([html.I(className="fas fa-chart-line me-1"), "Backtest Tool"],
+                          id="btn-backtest-tool", color="primary", size="sm", outline=True,
+                          title="Start Backtest Visualizer and open in new tab"),
+                dbc.Button([html.I(className="fas fa-power-off", id="backtest-power-icon")],
+                          id="btn-backtest-toggle", color="secondary", size="sm", outline=True,
+                          title="Toggle Backtest Tool on/off"),
+            ], className="me-3"),
+            # Hidden link to open backtest tool in new tab
+            html.A(id="backtest-tool-link", href="http://192.168.1.2:5001", target="_blank", style={"display": "none"}),
             html.Span(id="io-status", className="ms-3 text-muted small"),
         ], width=9),
         dbc.Col([
@@ -3270,6 +3280,15 @@ app.layout = dbc.Container([
                                   id="btn-view-logs-mobile", color="info", size="sm", outline=True),
                         dbc.Button([html.I(className="fas fa-database me-1"), "Cleanup"],
                                   id="btn-cleanup-dbs-mobile", color="secondary", size="sm", outline=True),
+                    ], className="w-100 mb-2"),
+
+                    # Tools
+                    html.Div("Tools", className="text-muted small mb-1"),
+                    dbc.ButtonGroup([
+                        dbc.Button([html.I(className="fas fa-chart-line me-1"), "Backtest"],
+                                  id="btn-backtest-tool-mobile", color="primary", size="sm", outline=True),
+                        dbc.Button([html.I(className="fas fa-power-off", id="backtest-power-icon-mobile")],
+                                  id="btn-backtest-toggle-mobile", color="secondary", size="sm", outline=True),
                     ], className="w-100 mb-2"),
 
                     # Emergency controls
@@ -5825,6 +5844,180 @@ def handle_io_buttons(quick_test, stop_research, cleanup_dbs, quick_test_m, stop
             return msg, msg
 
     return "", ""
+
+
+# Backtest Tool - Check if running
+def is_backtest_running():
+    """Check if the backtest tool is running."""
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request('http://192.168.1.2:5001/api/status', method='GET')
+        response = urllib.request.urlopen(req, timeout=2)
+        return response.status == 200
+    except:
+        return False
+
+
+# Backtest Tool - Start the app
+def start_backtest_app():
+    """Start the backtest visualizer app."""
+    import subprocess
+    subprocess.Popen(
+        [str(PROJECT_ROOT / "venv" / "bin" / "python"), "-m", "tools.backtest_app.app"],
+        cwd=str(PROJECT_ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+# Backtest Tool - Stop the app
+def stop_backtest_app():
+    """Stop the backtest visualizer app."""
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request('http://192.168.1.2:5001/api/shutdown', method='POST')
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except:
+        return False
+
+
+# Backtest Tool - Update button state based on running status
+@app.callback(
+    [
+        Output('btn-backtest-toggle', 'color'),
+        Output('btn-backtest-toggle', 'outline'),
+        Output('btn-backtest-toggle', 'title'),
+        Output('btn-backtest-toggle-mobile', 'color'),
+        Output('btn-backtest-toggle-mobile', 'outline'),
+    ],
+    Input('interval-component', 'n_intervals'),
+)
+def update_backtest_button_state(n_intervals):
+    """Update the power button appearance based on backtest app status."""
+    running = is_backtest_running()
+    if running:
+        # Lit state - solid green button
+        return "success", False, "Backtest Tool running - click to stop", "success", False
+    else:
+        # Unlit state - outline secondary button
+        return "secondary", True, "Backtest Tool stopped - click to start", "secondary", True
+
+
+# Backtest Tool - Handle "Backtest Tool" button (start and open)
+@app.callback(
+    [
+        Output('io-status', 'children', allow_duplicate=True),
+        Output('io-status-mobile', 'children', allow_duplicate=True),
+    ],
+    [
+        Input('btn-backtest-tool', 'n_clicks'),
+        Input('btn-backtest-tool-mobile', 'n_clicks'),
+    ],
+    prevent_initial_call=True,
+)
+def handle_backtest_tool_button(n_clicks, n_clicks_mobile):
+    """Start backtest app if not running and open in browser."""
+    from dash import ctx
+    import time
+    from datetime import datetime
+    import webbrowser
+
+    timestamp = datetime.now().strftime("%H:%M:%S")
+
+    if n_clicks is None and n_clicks_mobile is None:
+        return no_update, no_update
+
+    running = is_backtest_running()
+
+    if not running:
+        # Start the app
+        start_backtest_app()
+        # Wait for it to come up
+        for _ in range(10):
+            time.sleep(0.5)
+            if is_backtest_running():
+                break
+        msg = f"[{timestamp}] Backtest tool started"
+    else:
+        msg = f"[{timestamp}] Backtest tool already running"
+
+    # Open in browser (this opens server-side, we'll use JS for client-side)
+    return msg, msg
+
+
+# Backtest Tool - Handle toggle button (start/stop)
+@app.callback(
+    [
+        Output('io-status', 'children', allow_duplicate=True),
+        Output('io-status-mobile', 'children', allow_duplicate=True),
+    ],
+    [
+        Input('btn-backtest-toggle', 'n_clicks'),
+        Input('btn-backtest-toggle-mobile', 'n_clicks'),
+    ],
+    prevent_initial_call=True,
+)
+def handle_backtest_toggle(n_clicks, n_clicks_mobile):
+    """Toggle the backtest tool on/off."""
+    import time
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%H:%M:%S")
+
+    if n_clicks is None and n_clicks_mobile is None:
+        return no_update, no_update
+
+    running = is_backtest_running()
+
+    if running:
+        # Stop the app
+        stop_backtest_app()
+        msg = f"[{timestamp}] Backtest tool stopped"
+    else:
+        # Start the app
+        start_backtest_app()
+        # Wait for it to come up
+        for _ in range(10):
+            time.sleep(0.5)
+            if is_backtest_running():
+                break
+        msg = f"[{timestamp}] Backtest tool started"
+
+    return msg, msg
+
+
+# Clientside callback to open backtest tool in new tab
+app.clientside_callback(
+    """
+    function(n_clicks) {
+        if (n_clicks) {
+            window.open('http://192.168.1.2:5001', '_blank');
+        }
+        return '';
+    }
+    """,
+    Output('backtest-tool-link', 'children'),
+    Input('btn-backtest-tool', 'n_clicks'),
+    prevent_initial_call=True,
+)
+
+app.clientside_callback(
+    """
+    function(n_clicks) {
+        if (n_clicks) {
+            window.open('http://192.168.1.2:5001', '_blank');
+        }
+        return '';
+    }
+    """,
+    Output('io-status-mobile', 'title'),  # Dummy output
+    Input('btn-backtest-tool-mobile', 'n_clicks'),
+    prevent_initial_call=True,
+)
 
 
 # GA Control callbacks - Per-row Resume/Pause via Action column click

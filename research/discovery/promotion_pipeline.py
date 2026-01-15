@@ -1614,7 +1614,7 @@ class PromotionPipeline:
             logger.error(f"Full validation failed for {strategy_id}: {e}", exc_info=True)
             return False, 0.0, 0.0, {'error': str(e)}
 
-    def process_all_promotions(self) -> Dict[str, int]:
+    def process_all_promotions(self, skip_heavy_validation: bool = False) -> Dict[str, int]:
         """
         Process all strategies through the promotion pipeline.
 
@@ -1627,6 +1627,11 @@ class PromotionPipeline:
         2. PAPER -> Check for promotion to LIVE or retirement (paper failure)
         3. VALIDATED -> Check for promotion to PAPER
         4. CANDIDATE -> Check for promotion to VALIDATED (if validation metrics exist)
+
+        Args:
+            skip_heavy_validation: If True, skip memory-intensive validation (WF/MC tests).
+                                   Use during POST_MARKET to prevent OOM crashes.
+                                   Heavy validation should run during OVERNIGHT instead.
 
         Returns:
             Dict with keys:
@@ -1691,8 +1696,10 @@ class PromotionPipeline:
 
         # Stage 3: Check VALIDATED strategies for promotion to PAPER
         # Run actual validation for strategies with placeholder metrics (0.5)
+        # NOTE: Heavy validation (WF/MC tests) is skipped during POST_MARKET to prevent OOM
         validated_strategies = self.get_strategies_by_status(StrategyStatus.VALIDATED)
         revalidation_count = 0
+        skipped_validation_count = 0
         max_revalidations_per_run = 5  # Limit to avoid long runs
 
         for strategy_id in validated_strategies:
@@ -1707,6 +1714,11 @@ class PromotionPipeline:
                 )
 
                 if has_placeholder_metrics and revalidation_count < max_revalidations_per_run:
+                    if skip_heavy_validation:
+                        # Skip heavy validation during POST_MARKET - will run during OVERNIGHT
+                        skipped_validation_count += 1
+                        continue
+
                     logger.info(f"Re-validating {strategy_id} with real WF/MC tests (had placeholder metrics)")
                     passed, wf_eff, mc_conf, val_metrics = self.validate_gp_strategy_full(strategy_id)
                     revalidation_count += 1
@@ -1725,19 +1737,22 @@ class PromotionPipeline:
                         logger.info(f"{strategy_id} failed real validation, staying at VALIDATED")
                         continue
 
-                # Check if ready for paper trading
-                ready, message, metrics = self.check_validated_for_paper(strategy_id)
-                if ready:
-                    result = self.promote_to_paper(strategy_id)
-                    if result.success:
-                        promoted_count += 1
-                        logger.info(f"Promoted {strategy_id} to PAPER trading")
+                # Check if ready for paper trading (only if not skipped)
+                if not (has_placeholder_metrics and skip_heavy_validation):
+                    ready, message, metrics = self.check_validated_for_paper(strategy_id)
+                    if ready:
+                        result = self.promote_to_paper(strategy_id)
+                        if result.success:
+                            promoted_count += 1
+                            logger.info(f"Promoted {strategy_id} to PAPER trading")
             except Exception as e:
                 logger.error(f"Failed to process VALIDATED strategy {strategy_id}: {e}", exc_info=True)
                 failed_count += 1
 
         if revalidation_count > 0:
             logger.info(f"Re-validated {revalidation_count} strategies with real WF/MC tests")
+        if skipped_validation_count > 0:
+            logger.info(f"Skipped {skipped_validation_count} heavy validations (will run during OVERNIGHT)")
 
         # Stage 4: Check CANDIDATE strategies for promotion to VALIDATED
         # Note: This now supports auto-validation for high-quality candidates
