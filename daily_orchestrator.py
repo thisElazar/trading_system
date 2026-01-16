@@ -1215,6 +1215,20 @@ class DailyOrchestrator:
             logger.info("=" * 60)
             if recovery_success:
                 logger.info("STARTUP RECOVERY COMPLETE - System ready")
+                # Send Telegram notification on restart
+                try:
+                    acct_equity = float(account.equity) if account else 0
+                    num_positions = len(broker_symbols) if broker_symbols else 0
+                    self.alert_manager.send_alert(
+                        f"🔄 System Restarted\n"
+                        f"  Phase: {self.get_current_phase().name}\n"
+                        f"  Equity: ${acct_equity:,.2f}\n"
+                        f"  Positions: {num_positions}",
+                        level="warning",
+                        title="Orchestrator Started"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not send startup alert: {e}")
             else:
                 logger.error("STARTUP RECOVERY COMPLETED WITH ERRORS - Review above")
             logger.info("=" * 60)
@@ -1599,6 +1613,15 @@ class DailyOrchestrator:
                         )
                         if exit_result:
                             exits_executed.append(exit_result)
+                            pnl = (current_price - entry_price) * qty
+                            self.alert_manager.send_alert(
+                                f"🎯 TAKE PROFIT {symbol}\n"
+                                f"  Sold: {qty} shares @ ${current_price:.2f}\n"
+                                f"  Gain: +{gain_pct:.1%}\n"
+                                f"  P&L: ${pnl:+,.2f}",
+                                level="warning",
+                                title="Position Closed"
+                            )
 
                     # Check stop-loss
                     elif gain_pct <= -sl_pct:
@@ -1613,6 +1636,15 @@ class DailyOrchestrator:
                         )
                         if exit_result:
                             exits_executed.append(exit_result)
+                            pnl = (current_price - entry_price) * qty
+                            self.alert_manager.send_alert(
+                                f"🛑 STOP LOSS {symbol}\n"
+                                f"  Sold: {qty} shares @ ${current_price:.2f}\n"
+                                f"  Loss: {gain_pct:.1%}\n"
+                                f"  P&L: ${pnl:+,.2f}",
+                                level="warning",
+                                title="Position Closed"
+                            )
 
             # Send summary alert if any exits
             if exits_executed:
@@ -2208,7 +2240,14 @@ class DailyOrchestrator:
                 f"  Errors: {len(self.state.errors_today)}"
             )
 
+            # Send to console/file at INFO level
             self.alert_manager.send_alert(message, level="info")
+            # Also send to Telegram at WARNING level (so it actually gets delivered)
+            self.alert_manager.send_alert(
+                f"📊 Daily Summary\n{message}",
+                level="warning",
+                title="End of Day Report"
+            )
             logger.info("Daily alert sent")
             return True
 
@@ -2981,6 +3020,20 @@ class DailyOrchestrator:
                 logger.debug("No pending signals to process")
                 return True
 
+            # Alert on new signals received
+            signal_summary = {}
+            for sig in pending_signals:
+                key = f"{sig.direction} {sig.symbol}"
+                signal_summary[key] = sig.strategy_name
+
+            signals_list = "\n".join([f"  • {k} ({v})" for k, v in list(signal_summary.items())[:5]])
+            extra = f"\n  ... and {len(pending_signals) - 5} more" if len(pending_signals) > 5 else ""
+            self.alert_manager.send_alert(
+                f"📡 {len(pending_signals)} New Signals\n{signals_list}{extra}",
+                level="warning",
+                title="Signals Received"
+            )
+
             approved_count = 0
             rejected_count = 0
             executed_count = 0
@@ -3016,14 +3069,17 @@ class DailyOrchestrator:
                             # Store the execution route
                             self._update_signal_route(signal.id, decision.route)
 
-                            # Send alert for live trades
-                            if decision.route == 'live':
-                                self.alert_manager.signal(
-                                    symbol=signal.symbol,
-                                    direction=signal.direction,
-                                    price=signal.price,
-                                    strategy=signal.strategy_name
-                                )
+                            # Send Telegram alert for executed trades
+                            route_emoji = "🟢" if decision.route == 'live' else "📝"
+                            self.alert_manager.send_alert(
+                                f"{route_emoji} {signal.direction.upper()} {signal.symbol}\n"
+                                f"  Shares: {decision.final_shares}\n"
+                                f"  Price: ${signal.price:.2f}\n"
+                                f"  Strategy: {signal.strategy_name}\n"
+                                f"  Route: {decision.route}",
+                                level="warning",
+                                title="Position Opened"
+                            )
 
                             # Alert on overrides
                             if decision.override_applied:

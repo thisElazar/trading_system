@@ -646,9 +646,9 @@ PERFORMANCE_PROFILES = {
         'max_years': 3,
         'walk_forward': True,  # Validated stable on Pi
         
-        # Parallelism (4 workers = all cores)
+        # Parallelism (2 workers - prevents OOM on 4GB Pi)
         'parallel_enabled': True,
-        'n_workers': 4,
+        'n_workers': 2,
         'use_persistent_pool': True,
         
         # GA settings (deeper exploration)
@@ -673,9 +673,9 @@ PERFORMANCE_PROFILES = {
         'max_symbols': 75,
         'max_years': 2,
         
-        # Parallelism (minimal)
+        # Parallelism (2 workers - prevents OOM on 4GB Pi)
         'parallel_enabled': True,
-        'n_workers': 4,
+        'n_workers': 2,
         'use_persistent_pool': True,
         
         # GA settings (moderate)
