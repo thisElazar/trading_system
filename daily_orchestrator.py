@@ -414,6 +414,7 @@ class DailyOrchestrator:
             "update_paper_metrics": self._task_update_paper_metrics,
             "update_live_metrics": self._task_update_live_metrics,
             "load_live_strategies": self._task_load_live_strategies,
+            "validate_candidates": self._task_validate_candidates,
 
             # Weekend tasks
             "run_weekend_schedule": self._task_run_weekend_schedule,
@@ -3658,6 +3659,58 @@ class DailyOrchestrator:
 
         except Exception as e:
             logger.error(f"Strategy loading failed: {e}")
+            return False
+
+    def _task_validate_candidates(self) -> bool:
+        """Run heavy validation on CANDIDATE strategies during off-hours.
+
+        This is an opportunistic task that runs during OVERNIGHT/WEEKEND when:
+        1. Core research has completed
+        2. There's sufficient memory available
+        3. Time window allows for extended validation
+
+        Heavy validation includes:
+        - Walk-forward analysis (4+ periods)
+        - Monte Carlo permutation tests (1000+ iterations)
+        - Out-of-sample verification
+
+        Strategies passing validation are promoted to VALIDATED status.
+        """
+        if not HAS_PROMOTION_PIPELINE or self.promotion_pipeline is None:
+            logger.debug("Promotion pipeline not available")
+            return True
+
+        try:
+            # Check memory availability before heavy validation
+            mem = psutil.virtual_memory()
+            available_mb = mem.available // (1024 * 1024)
+
+            if available_mb < 1500:
+                logger.info(f"Skipping candidate validation - insufficient memory ({available_mb}MB available)")
+                return True
+
+            logger.info("Running heavy validation on candidate strategies...")
+
+            # Process promotions with heavy validation enabled
+            results = self.promotion_pipeline.process_all_promotions(skip_heavy_validation=False)
+
+            validated = results.get('validated', 0)
+            failed = results.get('validation_failed', 0)
+            promoted = results.get('promoted', 0)
+
+            if validated > 0 or failed > 0:
+                logger.info(f"Candidate validation: {validated} validated, {failed} failed")
+            if promoted > 0:
+                logger.info(f"Promotion pipeline: {promoted} promoted")
+
+            # Force garbage collection after heavy validation
+            gc.collect()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Candidate validation failed: {e}")
+            logger.error(traceback.format_exc())
             return False
 
     def _task_calculate_position_scalars(self) -> bool:
