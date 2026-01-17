@@ -1071,3 +1071,76 @@ class TaskScheduler:
         if phase in self.state.phase_completions:
             self.state.phase_completions[phase].clear()
         logger.debug(f"TaskScheduler phase state reset for {phase}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Get scheduler status for dashboard/monitoring.
+
+        Returns:
+            Dict with current scheduler state for display.
+        """
+        window = self.get_current_window()
+
+        # Calculate utilization
+        ready_count = len(self.get_ready_tasks())
+        running_count = len(self.state.running_tasks)
+
+        # Get phase progress
+        phase_completed = self.state.phase_completions.get(window.phase, set())
+        phase_total = len([s for s in self._task_specs.values()
+                         if not s.phases or window.phase in s.phases])
+
+        # Calculate today's stats
+        tasks_today = sum(self.state.run_counts_today.values())
+        success_count = sum(1 for r in self.state.success_rates.values()
+                           if r.get('success', 0) > 0)
+
+        return {
+            'enabled': True,
+            'window': {
+                'phase': window.phase,
+                'start': window.start.isoformat(),
+                'end': window.end.isoformat(),
+                'duration_minutes': window.duration_minutes,
+                'is_holiday': window.is_holiday,
+                'is_extended': window.is_extended,
+            },
+            'tasks': {
+                'ready': ready_count,
+                'running': running_count,
+                'running_names': list(self.state.running_tasks),
+                'completed_today': tasks_today,
+                'phase_completed': len(phase_completed),
+                'phase_total': phase_total,
+            },
+            'resources': {
+                'available_memory_mb': self._get_available_memory(),
+                'estimated_memory_used_mb': self.state.estimated_memory_used,
+                'cpu_percent': psutil.cpu_percent(interval=0.1),
+            },
+            'health': {
+                'tasks_tracked': len(self._task_specs),
+                'success_rate_known': success_count,
+                'duration_estimates': len(self.state.avg_durations),
+            },
+        }
+
+    def log_execution_metrics(self) -> str:
+        """
+        Generate a metrics summary string for logging.
+
+        Returns:
+            Formatted string suitable for log output.
+        """
+        status = self.get_status()
+        window = status['window']
+        tasks = status['tasks']
+        resources = status['resources']
+
+        return (
+            f"TaskScheduler: phase={window['phase']}, "
+            f"ready={tasks['ready']}, running={tasks['running']}, "
+            f"completed_today={tasks['completed_today']}, "
+            f"mem={resources['available_memory_mb']}MB, "
+            f"cpu={resources['cpu_percent']:.0f}%"
+        )
