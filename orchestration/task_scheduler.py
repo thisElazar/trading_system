@@ -509,6 +509,7 @@ class TaskScheduler:
     def _check_alpaca_calendar(self, check_date: date) -> bool:
         """Query Alpaca API for market calendar."""
         from alpaca.trading.client import TradingClient
+        from alpaca.trading.requests import GetCalendarRequest
 
         api_key = os.environ.get('ALPACA_API_KEY')
         api_secret = os.environ.get('ALPACA_SECRET_KEY')
@@ -517,10 +518,8 @@ class TaskScheduler:
             raise ValueError("Alpaca credentials not configured")
 
         client = TradingClient(api_key, api_secret, paper=True)
-        calendar = client.get_calendar(
-            start=check_date.isoformat(),
-            end=check_date.isoformat()
-        )
+        request = GetCalendarRequest(start=check_date, end=check_date)
+        calendar = client.get_calendar(request)
 
         # Empty calendar means market closed (holiday)
         return len(calendar) == 0
@@ -528,6 +527,7 @@ class TaskScheduler:
     def _check_alpaca_early_close(self, check_date: date) -> bool:
         """Query Alpaca API for early close status."""
         from alpaca.trading.client import TradingClient
+        from alpaca.trading.requests import GetCalendarRequest
 
         api_key = os.environ.get('ALPACA_API_KEY')
         api_secret = os.environ.get('ALPACA_SECRET_KEY')
@@ -536,10 +536,8 @@ class TaskScheduler:
             raise ValueError("Alpaca credentials not configured")
 
         client = TradingClient(api_key, api_secret, paper=True)
-        calendar = client.get_calendar(
-            start=check_date.isoformat(),
-            end=check_date.isoformat()
-        )
+        request = GetCalendarRequest(start=check_date, end=check_date)
+        calendar = client.get_calendar(request)
 
         if calendar:
             close_time = calendar[0].close
