@@ -1782,6 +1782,80 @@ def get_orchestrator_status() -> Dict[str, Any]:
     return status
 
 
+def get_scheduler_status() -> Dict[str, Any]:
+    """Get TaskScheduler status from database and environment."""
+    import sqlite3
+    import os
+    from pathlib import Path
+
+    status = {
+        'enabled': os.environ.get('USE_TASK_SCHEDULER', 'false').lower() == 'true',
+        'debug': os.environ.get('TASK_SCHEDULER_DEBUG', 'false').lower() == 'true',
+        'tasks_tracked': 0,
+        'duration_estimates': 0,
+        'success_rates': 0,
+        'phase_completions': {},
+        'last_updated': None,
+    }
+
+    if not status['enabled']:
+        return status
+
+    # Read from database
+    db_path = Path(__file__).parent.parent.parent / "db" / "research.db"
+    if not db_path.exists():
+        return status
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+
+        # Check if table exists
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='task_scheduler_state'
+        """)
+        if not cursor.fetchone():
+            conn.close()
+            return status
+
+        # Get duration estimates count
+        cursor.execute("""
+            SELECT COUNT(*) FROM task_scheduler_state
+            WHERE key LIKE 'avg_duration_%'
+        """)
+        status['duration_estimates'] = cursor.fetchone()[0]
+
+        # Get success rates count
+        cursor.execute("""
+            SELECT COUNT(*) FROM task_scheduler_state
+            WHERE key LIKE 'success_rate_%'
+        """)
+        status['success_rates'] = cursor.fetchone()[0]
+
+        # Get last update time
+        cursor.execute("""
+            SELECT MAX(updated_at) FROM task_scheduler_state
+        """)
+        row = cursor.fetchone()
+        if row and row[0]:
+            status['last_updated'] = row[0]
+
+        # Try to count total task specs (from Python import)
+        try:
+            from orchestration.task_specs import TASK_SPECS
+            status['tasks_tracked'] = len(TASK_SPECS)
+        except ImportError:
+            status['tasks_tracked'] = 45  # Known count
+
+        conn.close()
+
+    except Exception as e:
+        logger.warning(f"Error getting scheduler status: {e}")
+
+    return status
+
+
 def get_weekend_status() -> Dict[str, Any]:
     """Get weekend phase status from orchestrator log and coordinator state."""
     import re
@@ -4514,6 +4588,41 @@ def update_dashboard(n_intervals, n_clicks, startup_intervals):
     # System Process Monitor
     processes = get_system_processes()
     logger.info(f"System processes check: {[(p['name'], p['is_running'], p['pid']) for p in processes]}")
+
+    def _build_scheduler_status_section():
+        """Build the TaskScheduler status section for the orchestrator panel."""
+        sched_status = get_scheduler_status()
+
+        if not sched_status['enabled']:
+            return html.Div([
+                html.Hr(className="my-2"),
+                html.Div([
+                    html.I(className="fas fa-calendar-alt text-muted me-2"),
+                    html.Strong("TaskScheduler:", className="small text-muted me-2"),
+                    html.Span("Disabled", className="badge bg-secondary"),
+                ], className="d-flex align-items-center"),
+            ], className="mt-2")
+
+        # Scheduler is enabled
+        return html.Div([
+            html.Hr(className="my-2"),
+            html.Div([
+                html.I(className="fas fa-calendar-check text-success me-2"),
+                html.Strong("TaskScheduler:", className="small text-muted me-2"),
+                html.Span("Active", className="badge bg-success me-2"),
+                html.Span(f"{sched_status['tasks_tracked']} tasks", className="badge bg-info me-1"),
+            ], className="d-flex align-items-center mb-2"),
+            html.Div([
+                html.Span("Stats: ", className="text-muted small"),
+                html.Span(f"{sched_status['duration_estimates']} durations", className="small me-2"),
+                html.Span(f"{sched_status['success_rates']} rates", className="small"),
+            ]) if sched_status['duration_estimates'] > 0 else None,
+            html.Div([
+                html.Span("Debug: ", className="text-muted small"),
+                html.Span("ON", className="badge bg-warning text-dark"),
+            ], className="mt-1") if sched_status['debug'] else None,
+        ], className="mt-2")
+
     if processes:
         proc_rows = []
         for p in processes:
@@ -4621,6 +4730,8 @@ def update_dashboard(n_intervals, n_clicks, startup_intervals):
                     ]) for err in orch_status['recent_errors'][:3]
                 ])
             ]) if orch_status['recent_errors'] else None,
+            # TaskScheduler status
+            _build_scheduler_status_section(),
         ])
     else:
         orchestrator_status_content = html.Div([
