@@ -48,7 +48,11 @@ from execution.signal_tracker import ExecutionTracker
 from execution.alpaca_connector import AlpacaConnector
 from execution.alerts import AlertManager, TelegramHandler, ConsoleHandler, FileHandler, AlertLevel
 from execution.circuit_breaker import CircuitBreakerManager, CircuitBreakerConfig
-from config import CIRCUIT_BREAKER, WEEKEND_CONFIG, ALPACA_API_KEY, ALPACA_SECRET_KEY, DATABASES, INTRADAY_EXIT_CONFIG, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import (
+    CIRCUIT_BREAKER, WEEKEND_CONFIG, ALPACA_API_KEY, ALPACA_SECRET_KEY,
+    DATABASES, INTRADAY_EXIT_CONFIG, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    USE_TASK_SCHEDULER, TASK_SCHEDULER_DEBUG
+)
 
 # Intelligence modules
 try:
@@ -136,6 +140,16 @@ except ImportError:
     get_hardware_status = None
     HardwareStatus = None
     HAS_HARDWARE = False
+
+# Task scheduler (optional - new orchestration system)
+try:
+    from orchestration.task_scheduler import TaskScheduler
+    from orchestration.task_specs import TASK_SPECS
+    HAS_TASK_SCHEDULER = True
+except ImportError:
+    TaskScheduler = None
+    TASK_SPECS = None
+    HAS_TASK_SCHEDULER = False
 
 # Setup logging
 LOG_DIR = Path(__file__).parent / "logs"
@@ -260,7 +274,8 @@ class DailyOrchestrator:
         MarketPhase.MARKET_OPEN: PhaseConfig(
             start_hour=9, start_minute=30,
             end_hour=16, end_minute=0,
-            tasks=["run_scheduler", "monitor_positions", "check_risk_limits", "score_pending_signals", "process_shadow_trades"],
+            # monitor_positions FIRST - TP/SL checks should never be blocked by slow scheduler
+            tasks=["monitor_positions", "run_scheduler", "check_risk_limits", "score_pending_signals", "process_shadow_trades"],
             check_interval_seconds=30
         ),
         MarketPhase.POST_MARKET: PhaseConfig(
@@ -338,6 +353,15 @@ class DailyOrchestrator:
                 logger.info("Hardware status interface initialized")
             except Exception as e:
                 logger.warning(f"Hardware initialization failed: {e}")
+
+        # Task scheduler (Option C - intelligent task queue)
+        self._task_scheduler: Optional[TaskScheduler] = None
+        if USE_TASK_SCHEDULER and HAS_TASK_SCHEDULER:
+            try:
+                self._task_scheduler = TaskScheduler(orchestrator=self)
+                logger.info(f"TaskScheduler initialized with {len(TASK_SPECS)} task specs")
+            except Exception as e:
+                logger.warning(f"TaskScheduler initialization failed: {e}")
 
         # Task registry
         self._task_registry: Dict[str, Callable] = {
@@ -1525,6 +1549,10 @@ class DailyOrchestrator:
             missed = self.scheduler.run_missed_strategies()
             if missed:
                 logger.info(f"Ran {len(missed)} missed strategies on startup: {missed}")
+
+            # Free memory after heavy strategy computations (universe_scan can use 500MB+)
+            gc.collect()
+            logger.debug("GC completed after scheduler setup")
 
             def scheduler_loop():
                 while not self.shutdown_event.is_set() and MarketHours.is_market_open():
@@ -4661,16 +4689,33 @@ class DailyOrchestrator:
     # Tasks that should only run ONCE per phase (initialization tasks)
     # All other tasks run repeatedly based on check_interval_seconds
     ONCE_PER_PHASE_TASKS = {
+        # Pre-market
         "run_scheduler",           # Start scheduler thread once
-        "start_intraday_stream",   # Start stream once at market open
-        "stop_intraday_stream",    # Stop stream once
-        "detect_gaps",             # Detect gaps once at open
-        "run_nightly_research",    # Run research once per night
-        "train_ml_regime_model",   # Train once per night
         "load_live_strategies",    # Load strategies once at pre-market
         "refresh_data",            # Refresh data once per phase
         "refresh_premarket_data",  # Refresh premarket data once
+        # Intraday
+        "start_intraday_stream",   # Start stream once at market open
+        "stop_intraday_stream",    # Stop stream once
+        "detect_gaps",             # Detect gaps once at open
+        # Post-market (all should run once per day!)
+        "reconcile_positions",     # Reconcile once at EOD
+        "calculate_pnl",           # Calculate P&L once
+        "generate_daily_report",   # Generate report once
+        "send_alerts",             # Send daily summary once (NOT every minute!)
+        "update_ensemble_correlations",  # Update once
+        "update_paper_metrics",    # Update once
+        "update_live_metrics",     # Update once
+        "run_promotion_pipeline",  # Run promotions once
+        # Evening
         "refresh_eod_data",        # Refresh EOD data once
+        "cleanup_logs",            # Cleanup once
+        "backup_databases",        # Backup once
+        "cleanup_databases",       # Cleanup once
+        # Overnight
+        "run_nightly_research",    # Run research once per night
+        "train_ml_regime_model",   # Train once per night
+        # Weekend
         "run_weekend_schedule",    # Weekend tasks dispatched once
     }
 
@@ -4718,6 +4763,83 @@ class DailyOrchestrator:
             # Only mark once-per-phase tasks as completed
             if result and is_once_per_phase:
                 self.state.phase_tasks_completed[phase_key].add(task_name)
+
+        return results
+
+    def _run_scheduler_tasks(self, phase: MarketPhase) -> Dict[str, bool]:
+        """
+        Run tasks using the TaskScheduler (Option C implementation).
+
+        Uses priority-based scheduling with dependency resolution and
+        conflict detection. Falls back to legacy execution if scheduler fails.
+
+        Args:
+            phase: The market phase to run tasks for
+
+        Returns:
+            Dict mapping task names to success status
+        """
+        results = {}
+        phase_key = phase.value
+
+        try:
+            # Initialize phase completion tracking if needed
+            if phase_key not in self.state.phase_tasks_completed:
+                self.state.phase_tasks_completed[phase_key] = set()
+
+            # Update scheduler's time window
+            time_window = self._task_scheduler.get_current_window()
+            if TASK_SCHEDULER_DEBUG:
+                logger.debug(f"Time window: {time_window}")
+
+            # Plan tasks for current phase
+            planned_tasks = self._task_scheduler.plan_phase()
+
+            if TASK_SCHEDULER_DEBUG:
+                logger.debug(f"Planned {len(planned_tasks)} tasks for {phase_key}")
+
+            # Execute each ready task
+            for task_spec in planned_tasks:
+                task_name = task_spec.name
+
+                # Check if once-per-phase task already ran
+                if task_spec.once_per_phase and task_name in self.state.phase_tasks_completed[phase_key]:
+                    if TASK_SCHEDULER_DEBUG:
+                        logger.debug(f"Skipping {task_name}, already completed this phase")
+                    results[task_name] = True
+                    continue
+
+                # Check interval for recurring tasks
+                last_run = self.state.last_task_run.get(task_name)
+                if last_run and not task_spec.once_per_phase:
+                    seconds_since = (datetime.now(self.tz) - last_run).total_seconds()
+                    min_interval = task_spec.estimated_minutes * 60 * 0.5  # 50% of estimated time
+                    if seconds_since < min_interval:
+                        if TASK_SCHEDULER_DEBUG:
+                            logger.debug(f"Skipping {task_name}, ran {seconds_since:.0f}s ago")
+                        results[task_name] = True
+                        continue
+
+                # Execute the task
+                result = self.run_task(task_name)
+                results[task_name] = result
+
+                # Track execution in scheduler
+                self._task_scheduler.record_execution(
+                    task_name=task_name,
+                    success=result,
+                    phase=phase_key
+                )
+
+                # Mark once-per-phase tasks as completed
+                if result and task_spec.once_per_phase:
+                    self.state.phase_tasks_completed[phase_key].add(task_name)
+
+        except Exception as e:
+            logger.error(f"TaskScheduler execution failed: {e}, falling back to legacy")
+            logger.error(traceback.format_exc())
+            # Fall back to legacy execution
+            return self.run_phase_tasks(phase)
 
         return results
 
@@ -4859,8 +4981,15 @@ class DailyOrchestrator:
                 elif mem_status['level'] == 'warning':
                     logger.warning(f"Memory warning: {mem_status['available_mb']:.0f}MB available ({mem_status['percent_used']:.0f}% used)")
 
-                # Run phase tasks
-                results = self.run_phase_tasks(current_phase)
+                # Run phase tasks (using TaskScheduler if enabled, otherwise legacy)
+                if self._task_scheduler is not None and USE_TASK_SCHEDULER:
+                    # TaskScheduler execution path (Phase 2+)
+                    if TASK_SCHEDULER_DEBUG:
+                        logger.debug(f"TaskScheduler: Planning tasks for {current_phase.value}")
+                    results = self._run_scheduler_tasks(current_phase)
+                else:
+                    # Legacy execution path
+                    results = self.run_phase_tasks(current_phase)
 
                 # Log results summary
                 passed = sum(results.values())

@@ -4,6 +4,7 @@ Orchestration Module
 Central coordination for the trading system.
 
 Components:
+- TaskScheduler: Time-aware task scheduling with priorities and dependencies
 - InterventionManager: Human oversight and approval system
 - StrategyScheduler: Strategy execution scheduling
 - ExecutionTracker: Signal and position tracking
@@ -33,15 +34,34 @@ from orchestration.intervention import (
     InterventionResult,
     CheckpointPriority,
 )
+from orchestration.task_scheduler import (
+    TaskScheduler,
+    TaskSpec,
+    TaskResult,
+    TaskPriority,
+    TaskCategory,
+    TimeWindow,
+    SchedulerState,
+)
+from orchestration.task_specs import TASK_SPECS
 
 __all__ = [
+    # Task Scheduler (Option C)
+    'TaskScheduler',
+    'TaskSpec',
+    'TaskResult',
+    'TaskPriority',
+    'TaskCategory',
+    'TimeWindow',
+    'SchedulerState',
+    'TASK_SPECS',
     # Intervention
     'InterventionManager',
     'InterventionConfig',
     'InterventionMode',
     'InterventionResult',
     'CheckpointPriority',
-    # Scheduler
+    # Strategy Scheduler
     'StrategyScheduler',
     'MarketHours',
     'create_default_scheduler',

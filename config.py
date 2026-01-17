@@ -753,3 +753,15 @@ def set_perf_profile(profile_name: str):
     PERF = PERFORMANCE_PROFILES[profile_name]
     PERF_PROFILE_NAME = profile_name
 
+
+# ============================================================================
+# FEATURE FLAGS
+# ============================================================================
+
+# TaskScheduler (Option C) - Time-aware task scheduling with priorities
+# Set to True to enable new scheduler, False for legacy phase-based execution
+USE_TASK_SCHEDULER = os.environ.get('USE_TASK_SCHEDULER', 'false').lower() == 'true'
+
+# When True, logs detailed scheduler decisions (ready tasks, blocking reasons)
+TASK_SCHEDULER_DEBUG = os.environ.get('TASK_SCHEDULER_DEBUG', 'false').lower() == 'true'
+
