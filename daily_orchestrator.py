@@ -5008,6 +5008,10 @@ class DailyOrchestrator:
                     # Run weekend schedule (handles sub-phases internally)
                     self._task_run_weekend_schedule()
 
+                    # Log scheduler status (scheduler is dormant during weekend but still tracking)
+                    if self._task_scheduler is not None:
+                        _ = self._task_scheduler.get_current_window()  # Logs to scheduler.log
+
                     # Update hardware display after weekend tasks
                     if self._hardware:
                         self._update_hardware_display(current_phase)

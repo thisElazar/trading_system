@@ -23,11 +23,42 @@ from datetime import datetime, timedelta, date
 import logging
 import os
 import psutil
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
 
 if TYPE_CHECKING:
     from daily_orchestrator import TradingOrchestrator
 
-logger = logging.getLogger(__name__)
+# Set up dedicated scheduler logger with file output
+logger = logging.getLogger('task_scheduler')
+logger.setLevel(logging.DEBUG)
+logger.propagate = False  # Don't double-log to root logger
+
+# Only add handlers if not already configured
+if not logger.handlers:
+    # File handler - dedicated scheduler log
+    log_dir = Path(__file__).parent.parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / "scheduler.log"
+
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=5_000_000,  # 5MB per file
+        backupCount=3
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s | %(levelname)s | %(message)s'
+    ))
+    logger.addHandler(file_handler)
+
+    # Console handler for important messages only
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter(
+        '%(asctime)s | %(levelname)s | scheduler | %(message)s'
+    ))
+    logger.addHandler(console_handler)
 
 
 # =============================================================================
@@ -294,11 +325,17 @@ class TaskScheduler:
         self._holiday_cache: Dict[date, bool] = {}
         self._early_close_cache: Dict[date, bool] = {}
 
+        logger.info("=" * 60)
+        logger.info("TaskScheduler initializing...")
+
         # Load task specs (will be populated by task_specs.py)
         self._load_task_specs()
 
         # Load persisted state
         self._load_state()
+
+        logger.info(f"TaskScheduler ready: {len(self._task_specs)} tasks registered")
+        logger.info("=" * 60)
 
     def _load_task_specs(self):
         """Load task specifications from registry."""
@@ -332,7 +369,7 @@ class TaskScheduler:
         # Calculate window end based on phase
         end = self._calculate_window_end(now, phase, is_holiday)
 
-        return TimeWindow(
+        window = TimeWindow(
             start=now,
             end=end,
             phase=phase.value,
@@ -340,6 +377,15 @@ class TaskScheduler:
             is_holiday=is_holiday,
             is_early_close=is_early_close,
         )
+
+        # Log window details
+        if window.phase == 'weekend':
+            logger.info(f"Window: WEEKEND mode (TaskScheduler dormant), duration={window.duration_minutes:.0f}min")
+        else:
+            logger.debug(f"Window: phase={window.phase}, duration={window.duration_minutes:.0f}min, "
+                        f"holiday={is_holiday}, extended={window.is_extended}")
+
+        return window
 
     def _calculate_window_end(self, now: datetime, phase, is_holiday: bool) -> datetime:
         """Calculate when current scheduling window ends."""
@@ -716,8 +762,14 @@ class TaskScheduler:
                 planned_set.add(spec.name)
                 estimated_time += est
 
+        # Log the plan details
         logger.info(f"Phase plan: {len(plan)} tasks, ~{estimated_time:.0f}min "
                    f"of {available:.0f}min available")
+        if plan:
+            task_summary = ", ".join([f"{t.name}({t.priority.name[0]})" for t in plan[:5]])
+            if len(plan) > 5:
+                task_summary += f"... +{len(plan)-5} more"
+            logger.debug(f"Planned tasks: {task_summary}")
 
         return plan
 
@@ -910,7 +962,12 @@ class TaskScheduler:
             success: Whether the task succeeded.
             phase: Current phase name.
         """
+        import pytz
         now = datetime.now(pytz.timezone('US/Eastern'))
+
+        # Log execution
+        status = "SUCCESS" if success else "FAILED"
+        logger.info(f"Task executed: {task_name} [{status}] in phase {phase}")
 
         # Update last run timestamp
         self.state.last_run[task_name] = now
@@ -1080,6 +1137,9 @@ class TaskScheduler:
             Dict with current scheduler state for display.
         """
         window = self.get_current_window()
+
+        # Log status query
+        logger.debug(f"Status query: phase={window.phase}, duration={window.duration_minutes:.0f}min")
 
         # Calculate utilization
         ready_count = len(self.get_ready_tasks())

@@ -3553,6 +3553,30 @@ app.layout = dbc.Container([
         ),
     ], id="orch-logs-modal", size="xl", is_open=False),
 
+    # Scheduler Logs Modal
+    dbc.Modal([
+        dbc.ModalHeader([
+            dbc.ModalTitle("TaskScheduler Logs"),
+            html.Small(" (auto-refreshes every 10s)", className="text-muted ms-2"),
+        ]),
+        dbc.ModalBody([
+            html.Pre(id="scheduler-logs-content", style={
+                'backgroundColor': '#1a1a1a',
+                'color': '#ffcc00',
+                'padding': '15px',
+                'borderRadius': '5px',
+                'maxHeight': '500px',
+                'overflowY': 'auto',
+                'fontSize': '12px',
+                'fontFamily': 'monospace',
+            }),
+            dcc.Interval(id='scheduler-logs-interval', interval=10000, n_intervals=0, disabled=True),
+        ]),
+        dbc.ModalFooter(
+            dbc.Button("Close", id="scheduler-logs-modal-close", className="ms-auto", n_clicks=0)
+        ),
+    ], id="scheduler-logs-modal", size="xl", is_open=False),
+
     # Quick Status Bar - always visible at top
     create_quick_status_bar(),
 
@@ -4601,9 +4625,9 @@ def update_dashboard(n_intervals, n_clicks, startup_intervals):
                     html.Strong("TaskScheduler:", className="small text-muted me-2"),
                     html.Span("Disabled", className="badge bg-secondary"),
                 ], className="d-flex align-items-center"),
-            ], className="mt-2")
+            ], className="mt-2", id="scheduler-section", n_clicks=0)
 
-        # Scheduler is enabled
+        # Scheduler is enabled - make clickable
         return html.Div([
             html.Hr(className="my-2"),
             html.Div([
@@ -4611,6 +4635,7 @@ def update_dashboard(n_intervals, n_clicks, startup_intervals):
                 html.Strong("TaskScheduler:", className="small text-muted me-2"),
                 html.Span("Active", className="badge bg-success me-2"),
                 html.Span(f"{sched_status['tasks_tracked']} tasks", className="badge bg-info me-1"),
+                html.Small("(click for logs)", className="text-muted ms-2", style={"fontSize": "9px"}),
             ], className="d-flex align-items-center mb-2"),
             html.Div([
                 html.Span("Stats: ", className="text-muted small"),
@@ -4621,7 +4646,7 @@ def update_dashboard(n_intervals, n_clicks, startup_intervals):
                 html.Span("Debug: ", className="text-muted small"),
                 html.Span("ON", className="badge bg-warning text-dark"),
             ], className="mt-1") if sched_status['debug'] else None,
-        ], className="mt-2")
+        ], className="mt-2", id="scheduler-section", n_clicks=0, style={"cursor": "pointer"})
 
     if processes:
         proc_rows = []
@@ -5496,6 +5521,65 @@ def update_orch_logs_content(n_intervals, is_open):
         return "Orchestrator log file not found at " + str(log_file)
     except Exception as e:
         return f"Error reading orchestrator logs: {e}"
+
+
+# Scheduler logs modal toggle callback
+@app.callback(
+    [
+        Output('scheduler-logs-modal', 'is_open'),
+        Output('scheduler-logs-interval', 'disabled'),
+    ],
+    [
+        Input('scheduler-section', 'n_clicks'),
+        Input('scheduler-logs-modal-close', 'n_clicks'),
+    ],
+    State('scheduler-logs-modal', 'is_open'),
+    prevent_initial_call=True,
+)
+def toggle_scheduler_logs_modal(section_clicks, close_clicks, is_open):
+    """Toggle scheduler logs modal."""
+    from dash import ctx
+    from dash.exceptions import PreventUpdate
+
+    if ctx.triggered_id == 'scheduler-logs-modal-close':
+        return False, True  # Close modal, disable interval
+
+    if ctx.triggered_id == 'scheduler-section':
+        # Only open if actually clicked (not just rendered with n_clicks=0)
+        if section_clicks and section_clicks > 0:
+            return True, False  # Open modal, enable interval
+        raise PreventUpdate
+
+    return is_open, True
+
+
+# Scheduler logs content update callback
+@app.callback(
+    Output('scheduler-logs-content', 'children'),
+    [
+        Input('scheduler-logs-interval', 'n_intervals'),
+        Input('scheduler-logs-modal', 'is_open'),
+    ],
+    prevent_initial_call=True,
+)
+def update_scheduler_logs_content(n_intervals, is_open):
+    """Update scheduler log content when modal is open."""
+    import subprocess
+
+    if not is_open:
+        return ""
+
+    try:
+        log_file = PROJECT_ROOT / "logs" / "scheduler.log"
+        if log_file.exists():
+            result = subprocess.run(
+                ["tail", "-100", str(log_file)],
+                capture_output=True, text=True, timeout=5
+            )
+            return result.stdout or "No log content (scheduler log is empty)"
+        return "Scheduler log file not found. TaskScheduler may not have run yet."
+    except Exception as e:
+        return f"Error reading scheduler logs: {e}"
 
 
 def render_system_monitor(processes):
