@@ -628,6 +628,14 @@ class TaskScheduler:
                         f"only {available_memory}MB available")
             return False
 
+        # Resource check - CPU load for heavy tasks
+        if spec.memory_mb > 500:  # Heavy task threshold
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            if cpu_percent > 85:
+                logger.debug(f"Task {spec.name} blocked: CPU at {cpu_percent}%, "
+                            f"waiting for load to decrease")
+                return False
+
         return True
 
     def _is_market_open(self) -> bool:
@@ -964,14 +972,93 @@ class TaskScheduler:
 
     def _load_state(self):
         """Load scheduler state from database."""
-        # TODO: Implement database persistence
-        # For now, state starts fresh each run
-        pass
+        import sqlite3
+        from config import DATABASES
+
+        db_path = DATABASES.get('research', 'db/research.db')
+
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
+            # Create table if not exists
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS task_scheduler_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # Load average durations
+            cursor.execute('''
+                SELECT key, value FROM task_scheduler_state
+                WHERE key LIKE 'avg_duration_%'
+            ''')
+            for key, value in cursor.fetchall():
+                task_name = key.replace('avg_duration_', '')
+                self.state.avg_durations[task_name] = float(value)
+
+            # Load success rates
+            cursor.execute('''
+                SELECT key, value FROM task_scheduler_state
+                WHERE key LIKE 'success_rate_%'
+            ''')
+            for key, value in cursor.fetchall():
+                task_name = key.replace('success_rate_', '')
+                parts = value.split('/')
+                if len(parts) == 2:
+                    self.state.success_rates[task_name] = {
+                        'success': int(parts[0]),
+                        'total': int(parts[1])
+                    }
+
+            conn.close()
+            logger.debug(f"Loaded {len(self.state.avg_durations)} task duration averages")
+
+        except Exception as e:
+            logger.debug(f"Could not load scheduler state: {e}")
 
     def _save_state(self):
         """Save scheduler state to database."""
-        # TODO: Implement database persistence
-        pass
+        import sqlite3
+        from config import DATABASES
+
+        db_path = DATABASES.get('research', 'db/research.db')
+
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
+            # Create table if not exists
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS task_scheduler_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # Save average durations
+            for task_name, duration in self.state.avg_durations.items():
+                cursor.execute('''
+                    INSERT OR REPLACE INTO task_scheduler_state (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                ''', (f'avg_duration_{task_name}', str(duration)))
+
+            # Save success rates
+            for task_name, rates in self.state.success_rates.items():
+                value = f"{rates.get('success', 0)}/{rates.get('total', 0)}"
+                cursor.execute('''
+                    INSERT OR REPLACE INTO task_scheduler_state (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                ''', (f'success_rate_{task_name}', value))
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            logger.debug(f"Could not save scheduler state: {e}")
 
     def reset_daily(self):
         """Reset daily tracking. Called at PRE_MARKET start."""
