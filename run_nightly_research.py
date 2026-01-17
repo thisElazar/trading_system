@@ -1178,9 +1178,11 @@ def run_strategy_discovery(data: dict, vix_data=None, config: dict = None,
         duration = (end_time - start_time).total_seconds()
 
         # Process promotions after discovery completes
-        logger.info("Processing strategy promotions...")
+        # Skip heavy validation (walk-forward + Monte Carlo) to prevent OOM crashes
+        # Heavy validation should be run separately via scripts/validate_strategies_subprocess.py
+        logger.info("Processing strategy promotions (skipping heavy validation)...")
         try:
-            promotion_results = promotion_pipeline.process_all_promotions()
+            promotion_results = promotion_pipeline.process_all_promotions(skip_heavy_validation=True)
             logger.info(f"Promotion results: promoted={promotion_results.get('promoted', 0)}, "
                        f"retired={promotion_results.get('retired', 0)}, "
                        f"failed={promotion_results.get('failed', 0)}")

@@ -28,6 +28,7 @@ Usage:
 import logging
 import sqlite3
 import json
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Any, Union
@@ -1392,6 +1393,116 @@ class PromotionPipeline:
                 live_days, trades, pnl, sharpe, max_drawdown,
                 datetime.now().isoformat(), strategy_id
             ))
+
+    def update_validation_metrics(
+        self,
+        strategy_id: str,
+        walk_forward_efficiency: float,
+        monte_carlo_confidence: float
+    ):
+        """
+        Update validation metrics for a strategy.
+
+        Called by the standalone validation subprocess to record results.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE strategy_lifecycle
+                SET walk_forward_efficiency = ?,
+                    monte_carlo_confidence = ?,
+                    updated_at = ?
+                WHERE strategy_id = ?
+            """, (
+                walk_forward_efficiency, monte_carlo_confidence,
+                datetime.now().isoformat(), strategy_id
+            ))
+        logger.info(f"Updated validation metrics for {strategy_id}: WF={walk_forward_efficiency:.2f}, MC={monte_carlo_confidence:.2f}")
+
+    def run_validation_subprocess(
+        self,
+        strategy_id: Optional[str] = None,
+        all_candidates: bool = False,
+        memory_limit_mb: int = 1500,
+        timeout_seconds: int = 600
+    ) -> Tuple[bool, Dict]:
+        """
+        Run heavy validation in a separate subprocess.
+
+        This isolates memory-intensive validation (walk-forward + Monte Carlo)
+        from the main process to prevent OOM crashes.
+
+        Args:
+            strategy_id: Specific strategy to validate
+            all_candidates: Validate all CANDIDATE strategies
+            memory_limit_mb: Memory limit for subprocess
+            timeout_seconds: Timeout for subprocess (default 10 minutes)
+
+        Returns:
+            Tuple of (success, result_dict)
+        """
+        script_path = Path(__file__).parent.parent.parent / 'scripts' / 'validate_strategies_subprocess.py'
+
+        if not script_path.exists():
+            logger.error(f"Validation script not found: {script_path}")
+            return False, {'error': 'Validation script not found'}
+
+        # Build command
+        cmd = [
+            sys.executable,
+            str(script_path),
+            '--memory-limit', str(memory_limit_mb)
+        ]
+
+        if strategy_id:
+            cmd.extend(['--strategy-id', strategy_id])
+        elif all_candidates:
+            cmd.append('--all-candidates')
+        else:
+            return False, {'error': 'Must specify strategy_id or all_candidates'}
+
+        logger.info(f"Launching validation subprocess: {' '.join(cmd)}")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                cwd=str(Path(__file__).parent.parent.parent)
+            )
+
+            # Parse output
+            output_lines = result.stdout.strip().split('\n') if result.stdout else []
+            stderr = result.stderr.strip() if result.stderr else ''
+
+            # Try to parse JSON results from stdout
+            results = []
+            for line in output_lines:
+                if line.startswith('{'):
+                    try:
+                        results.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+
+            if result.returncode == 0:
+                logger.info(f"Validation subprocess completed successfully")
+                return True, {'results': results, 'exit_code': 0}
+            elif result.returncode == 1:
+                logger.warning(f"Validation subprocess: all strategies failed validation")
+                return False, {'results': results, 'exit_code': 1}
+            elif result.returncode == 2:
+                logger.error(f"Validation subprocess: memory limit exceeded")
+                return False, {'error': 'Memory limit exceeded', 'exit_code': 2, 'stderr': stderr}
+            else:
+                logger.error(f"Validation subprocess error (exit {result.returncode}): {stderr}")
+                return False, {'error': stderr, 'exit_code': result.returncode}
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"Validation subprocess timed out after {timeout_seconds}s")
+            return False, {'error': f'Timeout after {timeout_seconds}s'}
+        except Exception as e:
+            logger.error(f"Failed to run validation subprocess: {e}", exc_info=True)
+            return False, {'error': str(e)}
 
     def validate_with_cpcv(
         self,
