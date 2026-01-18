@@ -5,7 +5,7 @@ Scans the entire stock universe in memory-safe batches to find trading signals.
 
 Two-phase approach:
 1. Phase 1 (Broad Scan): Run strategies on all symbols in batches of ~256
-   - Collect all signals with confidence > threshold
+   - Collect all signals with strength > threshold
    - Memory-safe: only one batch loaded at a time
 
 2. Phase 2 (Validation): Re-run strategies on Phase 1 candidates
@@ -25,6 +25,12 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import gc
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from core.types import Side
 
 logger = logging.getLogger(__name__)
 
@@ -33,28 +39,56 @@ logger = logging.getLogger(__name__)
 class ScanConfig:
     """Configuration for universe scanning."""
     batch_size: int = 128  # Reduced from 256 for Pi 4GB safety (~300MB per batch)
-    confidence_threshold: float = 0.6
+    confidence_threshold: float = 0.6  # DEPRECATED: Use strength_threshold
     phase2_enabled: bool = True
     max_candidates: int = 200  # Max candidates to pass to Phase 2
     log_progress: bool = True
     aggressive_gc: bool = True  # Force garbage collection between batches
 
+    @property
+    def strength_threshold(self) -> float:
+        """Canonical name for confidence_threshold."""
+        return self.confidence_threshold
+
 
 @dataclass
 class CandidateSignal:
-    """Signal candidate from Phase 1 scan."""
+    """
+    Signal candidate from Phase 1 scan.
+
+    Uses old field names for backward compatibility.
+    New code should use canonical names via properties.
+    """
     symbol: str
-    strategy: str
-    direction: str  # 'long' or 'short'
-    confidence: float
+    strategy: str                       # DEPRECATED: Use strategy_id
+    direction: str                      # 'long' or 'short'
+    confidence: float                   # DEPRECATED: Use strength
     price: float
     stop_loss: float = 0.0
-    take_profit: float = 0.0
+    take_profit: float = 0.0            # DEPRECATED: Use target_price
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Phase 2 validation
     phase2_confidence: Optional[float] = None
     validated: bool = False
+
+    # Canonical property aliases
+    @property
+    def strategy_id(self) -> str:
+        return self.strategy
+
+    @property
+    def strength(self) -> float:
+        return self.confidence
+
+    @property
+    def target_price(self) -> float:
+        return self.take_profit
+
+    @property
+    def side(self) -> Side:
+        dir_map = {'long': 'BUY', 'short': 'SELL'}
+        return Side(dir_map.get(self.direction.lower(), self.direction.upper()))
 
 
 class UniverseScanner:

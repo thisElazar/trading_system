@@ -15,12 +15,12 @@ Usage:
     scorer = SignalScorer()
 
     # Record outcomes
-    scorer.record_outcome(signal, profit_pct=2.5, hold_days=3)
+    scorer.record_outcome(signal, pnl_pct=2.5, hold_days=3)
 
     # Score new signals
     score = scorer.score_signal(signal)
     if score.conviction >= 0.6:
-        size_multiplier = score.suggested_size_multiplier
+        size_multiplier = score.size_multiplier
         execute_trade(signal, size=base_size * size_multiplier)
 """
 
@@ -40,6 +40,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import DATABASES, DIRS
+from core.types import Signal, Side
 
 logger = logging.getLogger(__name__)
 
@@ -58,29 +59,34 @@ class SignalOutcome(Enum):
 
 @dataclass
 class SignalRecord:
-    """Historical record of a signal and its outcome."""
+    """
+    Historical record of a signal and its outcome.
+
+    Uses old field names for database compatibility.
+    New code should use canonical names via properties.
+    """
     id: Optional[int] = None
     signal_id: str = ""
     symbol: str = ""
-    strategy: str = ""
-    signal_type: str = ""  # buy, sell
+    strategy: str = ""              # DEPRECATED: Use strategy_id
+    signal_type: str = ""           # DEPRECATED: Use side (buy/sell -> BUY/SELL)
 
     # Signal characteristics
-    signal_strength: float = 0.0  # Original signal strength if provided
-    volatility_regime: str = ""  # low, normal, high
-    trend_alignment: str = ""  # with_trend, counter_trend, neutral
+    signal_strength: float = 0.0    # DEPRECATED: Use strength
+    volatility_regime: str = ""     # low, normal, high
+    trend_alignment: str = ""       # with_trend, counter_trend, neutral
     volume_confirmation: bool = False
-    time_of_day: str = ""  # morning, midday, afternoon, close
-    day_of_week: int = 0  # 0=Monday, 4=Friday
+    time_of_day: str = ""           # morning, midday, afternoon, close
+    day_of_week: int = 0            # 0=Monday, 4=Friday
 
     # Market context at signal time
     vix_level: float = 0.0
     sector_momentum: float = 0.0
-    market_trend: str = ""  # bull, bear, sideways
+    market_trend: str = ""          # bull, bear, sideways
 
     # Outcome
     outcome: str = "pending"
-    profit_pct: float = 0.0
+    profit_pct: float = 0.0         # DEPRECATED: Use pnl_pct
     hold_days: int = 0
     max_drawdown_pct: float = 0.0
     max_profit_pct: float = 0.0
@@ -93,36 +99,64 @@ class SignalRecord:
         if not self.signal_time:
             self.signal_time = datetime.now().isoformat()
 
+    # Canonical property aliases
+    @property
+    def strategy_id(self) -> str:
+        return self.strategy
+
+    @property
+    def strength(self) -> float:
+        return self.signal_strength
+
+    @property
+    def side(self) -> Side:
+        sig_map = {'buy': 'BUY', 'sell': 'SELL'}
+        return Side(sig_map.get(self.signal_type.lower(), 'BUY'))
+
+    @property
+    def pnl_pct(self) -> float:
+        return self.profit_pct
+
 
 @dataclass
 class SignalScore:
-    """Score for an incoming signal."""
-    conviction: float  # 0.0 to 1.0
-    win_probability: float  # Historical win rate for similar signals
-    expected_return: float  # Average return for similar signals
-    expected_risk: float  # Average max drawdown for similar signals
-    risk_reward_ratio: float  # expected_return / expected_risk
+    """
+    Score for an incoming signal.
+
+    Note: conviction is the primary score (0.0-1.0).
+    """
+    conviction: float                           # 0.0-1.0 overall score
+    win_probability: float                      # Historical win rate
+    expected_return: float                      # Average return for similar
+    expected_risk: float                        # Average max drawdown
+    risk_reward_ratio: float                    # expected_return / expected_risk
 
     # Sizing recommendation
-    suggested_size_multiplier: float  # 0.0 to 2.0
-    confidence_interval: Tuple[float, float]  # 95% CI for returns
+    suggested_size_multiplier: float            # DEPRECATED: Use size_multiplier
+    confidence_interval: Tuple[float, float]    # 95% CI for returns
 
     # Contributing factors
     factors: Dict[str, float] = field(default_factory=dict)
     sample_size: int = 0
     similar_signals_count: int = 0
 
+    @property
+    def size_multiplier(self) -> float:
+        """Canonical name for suggested_size_multiplier."""
+        return self.suggested_size_multiplier
+
     def __str__(self):
         return (
             f"SignalScore(conviction={self.conviction:.2f}, "
             f"win_prob={self.win_probability:.1%}, "
             f"exp_return={self.expected_return:.2%}, "
-            f"size_mult={self.suggested_size_multiplier:.2f})"
+            f"size_mult={self.size_multiplier:.2f})"
         )
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
         result['confidence_interval'] = list(self.confidence_interval)
+        result['size_multiplier'] = self.size_multiplier
         return result
 
 

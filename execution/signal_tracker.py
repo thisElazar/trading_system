@@ -32,12 +32,17 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import DATABASES
-from strategies.base import Signal as StrategySignal, SignalType
+from core.types import Signal, Side, SignalStatus as CoreSignalStatus
+
+# Backward compatibility aliases
+StrategySignal = Signal
+SignalType = Side
 
 logger = logging.getLogger(__name__)
 
 
 class SignalStatus(Enum):
+    """Signal lifecycle status - mirrors core.types.SignalStatus."""
     PENDING = "pending"
     SUBMITTED = "submitted"
     EXECUTED = "executed"
@@ -55,53 +60,85 @@ class PositionStatus(Enum):
 
 @dataclass
 class StoredSignal:
-    """Trading signal for database persistence."""
+    """
+    Trading signal for database persistence.
+
+    DEPRECATED: This class adapts between core.types.Signal and the database schema.
+    New code should use Signal directly where possible.
+
+    Maps:
+    - strategy_name -> Signal.strategy_id
+    - confidence -> Signal.strength
+    - take_profit -> Signal.target_price
+    - direction/signal_type -> Signal.side
+    """
     id: Optional[int] = None
-    strategy_name: str = ""
+    strategy_name: str = ""          # Maps to Signal.strategy_id
     symbol: str = ""
-    direction: str = ""  # 'long' or 'short'
-    signal_type: str = ""  # 'entry' or 'exit'
+    direction: str = ""              # 'long' or 'short'
+    signal_type: str = ""            # 'entry' or 'exit' (legacy, use side)
     price: float = 0.0
     stop_loss: float = 0.0
-    take_profit: float = 0.0
+    take_profit: float = 0.0         # Maps to Signal.target_price
     quantity: int = 0
-    confidence: float = 0.0
-    metadata: str = "{}"  # JSON string
+    confidence: float = 0.0          # Maps to Signal.strength
+    metadata: str = "{}"             # JSON string
     status: str = SignalStatus.PENDING.value
     created_at: str = ""
     expires_at: str = ""
     executed_at: Optional[str] = None
-    execution_id: Optional[int] = None  # Links to executions table
+    execution_id: Optional[int] = None
 
     @classmethod
-    def from_strategy_signal(cls, signal: 'StrategySignal', direction: str = 'long', quantity: int = 0) -> 'StoredSignal':
-        """Convert a strategy Signal to StoredSignal for database storage."""
+    def from_strategy_signal(cls, signal: Signal, direction: str = 'long', quantity: int = 0) -> 'StoredSignal':
+        """Convert a Signal to StoredSignal for database storage."""
+        # Map Side enum to direction and signal_type strings
+        side = signal.side
+        if side == Side.BUY:
+            sig_type = 'entry'
+            dir_val = direction  # Use provided direction (default 'long')
+        elif side == Side.SELL:
+            sig_type = 'exit'
+            dir_val = 'short' if direction == 'short' else direction
+        else:  # CLOSE or HOLD
+            sig_type = 'exit'
+            dir_val = direction
+
         return cls(
-            strategy_name=signal.strategy,
+            strategy_name=signal.strategy_id,
             symbol=signal.symbol,
-            direction=direction,
-            signal_type='entry' if signal.signal_type.value == 'BUY' else 'exit',
+            direction=dir_val,
+            signal_type=sig_type,
             price=signal.price,
             stop_loss=signal.stop_loss or 0.0,
             take_profit=signal.target_price or 0.0,
             quantity=quantity,
             confidence=signal.strength,
             metadata=json.dumps(signal.metadata) if signal.metadata else "{}",
-            created_at=signal.timestamp.isoformat() if hasattr(signal.timestamp, 'isoformat') else str(signal.timestamp),
+            created_at=signal.signal_time.isoformat() if signal.signal_time else datetime.now().isoformat(),
         )
 
-    def to_strategy_signal(self) -> 'StrategySignal':
-        """Convert StoredSignal back to strategy Signal."""
-        return StrategySignal(
-            timestamp=datetime.fromisoformat(self.created_at) if self.created_at else datetime.now(),
+    def to_strategy_signal(self) -> Signal:
+        """Convert StoredSignal back to Signal."""
+        # Map signal_type/direction to Side enum
+        if self.signal_type == 'entry':
+            side = Side.BUY
+        elif self.direction == 'short' and self.signal_type == 'exit':
+            side = Side.SELL  # Closing short = buying back, but signal was to sell
+        else:
+            side = Side.CLOSE
+
+        return Signal(
+            signal_time=datetime.fromisoformat(self.created_at) if self.created_at else datetime.now(),
             symbol=self.symbol,
-            strategy=self.strategy_name,
-            signal_type=SignalType.BUY if self.signal_type == 'entry' else SignalType.CLOSE,
+            strategy_id=self.strategy_name,
+            side=side,
             strength=self.confidence,
             price=self.price,
             stop_loss=self.stop_loss if self.stop_loss > 0 else None,
             target_price=self.take_profit if self.take_profit > 0 else None,
             metadata=json.loads(self.metadata) if self.metadata else {},
+            status=self.status,
         )
 
 

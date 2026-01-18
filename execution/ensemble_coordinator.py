@@ -23,7 +23,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import STRATEGIES, VALIDATION, VIX_REGIMES, TOTAL_CAPITAL
-from strategies.base import Signal, SignalType
+from core.types import Signal, Side, EnsembleResult
+
+# Backward compatibility aliases
+SignalType = Side
 from strategies.vol_managed_momentum import VolManagedMomentumStrategy
 from strategies.vix_regime_rotation import VIXRegimeRotationStrategy
 from strategies.sector_rotation import SectorRotationStrategy
@@ -40,7 +43,7 @@ class StrategyAllocation:
     regime_multiplier: float = 1.0
     performance_multiplier: float = 1.0
     enabled: bool = True
-    
+
     @property
     def effective_weight(self) -> float:
         if not self.enabled:
@@ -50,15 +53,30 @@ class StrategyAllocation:
 
 @dataclass
 class EnsembleSignal:
-    """Aggregated signal from ensemble."""
+    """
+    DEPRECATED: Use EnsembleResult from core.types instead.
+
+    Aggregated signal from ensemble.
+    Kept for backward compatibility.
+    """
     symbol: str
     direction: str  # 'BUY', 'SELL', 'CLOSE'
     combined_strength: float
     contributing_strategies: List[str]
     position_size_pct: float
     stop_loss: Optional[float] = None
-    target: Optional[float] = None
+    target: Optional[float] = None  # DEPRECATED: Use target_price
     metadata: Dict = field(default_factory=dict)
+
+    @property
+    def target_price(self) -> Optional[float]:
+        """Canonical name for target."""
+        return self.target
+
+    @property
+    def side(self) -> Side:
+        """Canonical name for direction."""
+        return Side(self.direction.upper())
 
 
 class EnsembleCoordinator:

@@ -24,7 +24,10 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from strategies.base import Signal, SignalType
+from core.types import Signal, Side
+
+# Backward compatibility alias
+SignalType = Side
 from config import MAX_DAILY_LOSS_PCT, MAX_DRAWDOWN_PCT, MAX_POSITION_PCT, TOTAL_CAPITAL
 
 logger = logging.getLogger(__name__)
@@ -40,24 +43,44 @@ class AllocationMethod(Enum):
 @dataclass
 class StrategyAllocation:
     """Capital allocation for a strategy."""
-    strategy_name: str
-    weight: float           # 0.0 - 1.0
-    capital: float          # Dollar amount
-    max_positions: int      # Position limit for this strategy
+    strategy_name: str         # DEPRECATED: Use strategy_id
+    weight: float              # 0.0 - 1.0
+    capital: float             # Dollar amount
+    max_positions: int         # Position limit for this strategy
     current_positions: int = 0
     realized_pnl: float = 0.0
     sharpe_30d: float = 0.0
 
+    @property
+    def strategy_id(self) -> str:
+        """Canonical name for strategy_name."""
+        return self.strategy_name
+
 
 @dataclass
 class AggregatedSignal:
-    """Signal after ensemble aggregation."""
+    """
+    DEPRECATED: Use EnsembleResult from core.types instead.
+
+    Signal after ensemble aggregation.
+    """
     symbol: str
-    direction: str          # 'long', 'short', 'close'
-    strength: float         # Combined confidence 0-1
-    sources: List[str]      # Contributing strategies
+    direction: str              # 'long', 'short', 'close'
+    strength: float             # Combined confidence 0-1
+    sources: List[str]          # Contributing strategies
     capital_allocation: float
-    conflicts: List[str] = field(default_factory=list)  # Conflicting strategies
+    conflicts: List[str] = field(default_factory=list)
+
+    @property
+    def side(self) -> Side:
+        """Canonical name for direction."""
+        dir_map = {'long': 'BUY', 'short': 'SELL', 'close': 'CLOSE'}
+        return Side(dir_map.get(self.direction.lower(), self.direction.upper()))
+
+    @property
+    def contributing_strategies(self) -> List[str]:
+        """Alias for sources (matches EnsembleResult)."""
+        return self.sources
 
 
 class ConflictResolver:
