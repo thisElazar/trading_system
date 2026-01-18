@@ -183,7 +183,7 @@ class DatabaseManager:
                     peak_price REAL,
                     trough_price REAL,
                     pnl REAL,
-                    pnl_percent REAL,
+                    pnl_pct REAL,
                     status TEXT DEFAULT 'OPEN',  -- OPEN, CLOSED, CANCELLED
                     exit_reason TEXT,
                     commission REAL DEFAULT 0,
@@ -787,20 +787,20 @@ class DatabaseManager:
         # Calculate P&L
         if side == 'BUY':
             pnl = (exit_price - entry_price) * quantity
-            pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
         else:
             pnl = (entry_price - exit_price) * quantity
-            pnl_percent = ((entry_price - exit_price) / entry_price) * 100
+            pnl_pct = ((entry_price - exit_price) / entry_price) * 100
         
         self.execute(
             "trades",
             """
             UPDATE trades 
-            SET exit_price = ?, exit_timestamp = ?, pnl = ?, pnl_percent = ?,
+            SET exit_price = ?, exit_timestamp = ?, pnl = ?, pnl_pct = ?,
                 status = 'CLOSED', exit_reason = ?, updated_at = ?
             WHERE id = ?
             """,
-            (exit_price, datetime.now().isoformat(), pnl, pnl_percent,
+            (exit_price, datetime.now().isoformat(), pnl, pnl_pct,
              exit_reason, datetime.now().isoformat(), trade_id)
         )
     
@@ -830,7 +830,7 @@ class DatabaseManager:
         trades = self.fetchall(
             "trades",
             """
-            SELECT pnl, pnl_percent, timestamp, exit_timestamp
+            SELECT pnl, pnl_pct, timestamp, exit_timestamp
             FROM trades 
             WHERE strategy = ? AND status = 'CLOSED'
             """,
@@ -844,7 +844,7 @@ class DatabaseManager:
         winners = sum(1 for t in trades if t['pnl'] > 0)
         total_pnl = sum(t['pnl'] for t in trades)
         avg_pnl = total_pnl / total if total > 0 else 0
-        avg_pnl_pct = sum(t['pnl_percent'] for t in trades) / total if total > 0 else 0
+        avg_pnl_pct = sum(t['pnl_pct'] for t in trades) / total if total > 0 else 0
         win_rate = winners / total if total > 0 else 0
         
         self.execute(
@@ -1292,6 +1292,6 @@ if __name__ == "__main__":
     
     # Verify
     trade = db.fetchone("trades", "SELECT * FROM trades WHERE id = ?", (trade_id,))
-    print(f"  Trade P&L: ${trade['pnl']:.2f} ({trade['pnl_percent']:.2f}%)")
+    print(f"  Trade P&L: ${trade['pnl']:.2f} ({trade['pnl_pct']:.2f}%)")
     
     print("\n✓ All database operations working")

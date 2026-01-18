@@ -338,7 +338,7 @@ class RapidGainScaler:
             cursor = conn.cursor()
 
             now = datetime.now().isoformat()
-            pnl_percent = gain_pct * 100
+            pnl_pct = gain_pct * 100
 
             # Look up original strategy from positions table
             cursor.execute("""
@@ -353,13 +353,13 @@ class RapidGainScaler:
                 INSERT INTO trades (
                     timestamp, symbol, strategy, side, quantity,
                     entry_price, exit_price, exit_timestamp,
-                    pnl, pnl_percent, status, exit_reason,
+                    pnl, pnl_pct, status, exit_reason,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 now, symbol, original_strategy, 'SELL', shares_trimmed,
                 entry_price, exit_price, now,
-                profit_locked, pnl_percent, 'CLOSED', 'rapid_gain_trim',
+                profit_locked, pnl_pct, 'CLOSED', 'rapid_gain_trim',
                 now, now
             ))
 

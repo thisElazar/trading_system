@@ -1089,7 +1089,7 @@ def get_trade_history(limit: int = 20) -> List[Dict[str, Any]]:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql_query(
             f"""SELECT timestamp, symbol, strategy, side, quantity,
-                       entry_price, exit_price, pnl, pnl_percent, status, exit_reason
+                       entry_price, exit_price, pnl, pnl_pct, status, exit_reason
                 FROM trades
                 ORDER BY timestamp DESC
                 LIMIT {limit}""",
@@ -1116,7 +1116,7 @@ def get_trade_history(limit: int = 20) -> List[Dict[str, Any]]:
                 "entry": f"${row['entry_price']:.2f}" if row['entry_price'] else "-",
                 "exit": f"${exit_price:.2f}" if exit_price else "-",
                 "pnl": f"${pnl_val:+.2f}" if pnl_val else "$0.00",
-                "pnl_pct": f"{row['pnl_percent']:+.1f}%" if row['pnl_percent'] else "-",
+                "pnl_pct": f"{row['pnl_pct']:+.1f}%" if row['pnl_pct'] else "-",
                 "status": row['status'],
                 "exit_reason": row['exit_reason'] if row['exit_reason'] else "-",
             })

@@ -1822,7 +1822,7 @@ class DailyOrchestrator:
                 INSERT OR IGNORE INTO trades (
                     timestamp, symbol, strategy, side, quantity,
                     entry_price, exit_price, exit_timestamp,
-                    pnl, pnl_percent, status, exit_reason,
+                    pnl, pnl_pct, status, exit_reason,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
@@ -2064,7 +2064,7 @@ class DailyOrchestrator:
                 # Get today's closed trades
                 cursor.execute("""
                     SELECT symbol, strategy, side, quantity, entry_price, exit_price,
-                           pnl, pnl_percent, exit_reason, timestamp
+                           pnl, pnl_pct, exit_reason, timestamp
                     FROM trades
                     WHERE date(timestamp) = date('now', 'localtime')
                       AND status = 'CLOSED'
@@ -2173,7 +2173,7 @@ class DailyOrchestrator:
                 if trades_today:
                     for t in trades_today:
                         pnl = t.get('pnl') or 0
-                        pnl_pct = t.get('pnl_percent') or 0
+                        pnl_pct = t.get('pnl_pct') or 0
                         icon = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
                         f.write(f"  {icon} {t['symbol']:6} | {t['strategy']:25} | "
                                f"${pnl:>+8.2f} ({pnl_pct:>+5.1f}%) | {t.get('exit_reason', '-')}\n")

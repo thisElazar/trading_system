@@ -245,9 +245,9 @@ class SignalScorer:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 signal_id TEXT UNIQUE NOT NULL,
                 symbol TEXT NOT NULL,
-                strategy TEXT NOT NULL,
-                signal_type TEXT NOT NULL,
-                signal_strength REAL DEFAULT 0,
+                strategy_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                strength REAL DEFAULT 0,
                 volatility_regime TEXT DEFAULT '',
                 trend_alignment TEXT DEFAULT '',
                 volume_confirmation INTEGER DEFAULT 0,
@@ -268,8 +268,8 @@ class SignalScorer:
 
         # Indexes for fast lookups
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_signal_hist_strategy
-            ON signal_history(strategy)
+            CREATE INDEX IF NOT EXISTS idx_signal_hist_strategy_id
+            ON signal_history(strategy_id)
         """)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_signal_hist_outcome
@@ -435,8 +435,8 @@ class SignalScorer:
         try:
             cursor.execute("""
                 INSERT OR REPLACE INTO signal_history (
-                    signal_id, symbol, strategy, signal_type,
-                    signal_strength, volatility_regime, trend_alignment,
+                    signal_id, symbol, strategy_id, side,
+                    strength, volatility_regime, trend_alignment,
                     volume_confirmation, time_of_day, day_of_week,
                     vix_level, sector_momentum, market_trend,
                     outcome, profit_pct, hold_days, max_drawdown_pct,
@@ -605,8 +605,8 @@ class SignalScorer:
         try:
             # Try exact match first
             conditions = [
-                "strategy = ?",
-                "signal_type = ?",
+                "strategy_id = ?",
+                "side = ?",
                 "outcome != 'pending'",
                 "signal_time >= ?"
             ]
@@ -638,11 +638,11 @@ class SignalScorer:
 
             # If not enough samples, broaden the search
             if len(df) < self.config.min_samples:
-                # Try strategy + signal_type only
+                # Try strategy + side only
                 df = pd.read_sql_query("""
                     SELECT outcome, profit_pct, max_drawdown_pct
                     FROM signal_history
-                    WHERE strategy = ? AND signal_type = ?
+                    WHERE strategy_id = ? AND side = ?
                     AND outcome != 'pending' AND signal_time >= ?
                 """, conn, params=[strategy, signal_type, cutoff])
 
@@ -726,7 +726,7 @@ class SignalScorer:
         try:
             df = pd.read_sql_query("""
                 SELECT * FROM signal_history
-                WHERE strategy = ? AND outcome != 'pending'
+                WHERE strategy_id = ? AND outcome != 'pending'
                 AND signal_time >= ?
             """, conn, params=[strategy, cutoff])
 
@@ -781,7 +781,7 @@ class SignalScorer:
                        volume_confirmation, market_trend,
                        outcome, profit_pct
                 FROM signal_history
-                WHERE strategy = ? AND outcome != 'pending'
+                WHERE strategy_id = ? AND outcome != 'pending'
                 AND signal_time >= ?
             """, conn, params=[strategy, cutoff])
 
@@ -875,8 +875,8 @@ class SignalScorer:
                 strategies = [strategy]
             else:
                 cursor = conn.cursor()
-                cursor.execute("SELECT DISTINCT strategy FROM signal_history WHERE outcome != 'pending'")
-                strategies = [row['strategy'] for row in cursor.fetchall()]
+                cursor.execute("SELECT DISTINCT strategy_id FROM signal_history WHERE outcome != 'pending'")
+                strategies = [row['strategy_id'] for row in cursor.fetchall()]
 
             print("\n" + "=" * 70)
             print("SIGNAL SCORING REPORT")
