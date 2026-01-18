@@ -66,7 +66,29 @@ Automated trading system on Raspberry Pi 5. Paper trading via Alpaca.
 - **EOD refresh**: Added per-symbol and overall timeouts
 - **Memory management**: LRU cache in shared_data.py, gc.collect() in EOD refresh
 
+## Variable Naming Standards
+
+Canonical types defined in `core/types.py` - import from there:
+```python
+from core.types import Signal, Side, SignalScore, EnsembleResult
+```
+
+**Key field names** (see `.claude/skills/variable-standards.md` for full reference):
+| Concept | Use | NOT |
+|---------|-----|-----|
+| Strategy ID | `strategy_id` | strategy_name, strategy |
+| Confidence | `strength` | confidence, conviction |
+| Direction | `side` (Side enum) | signal_type, direction |
+| P&L % | `pnl_pct` | pnl_percent, profit_pct |
+| Share count | `quantity` | shares, qty |
+| Target | `target_price` | take_profit, target |
+
+**Backward compat**: Signal class accepts both old and new names in constructor.
+
 ## Skills Available
 
 Detailed reference in `~/.claude/skills/tradebot-*/`:
 - system-map, diagnostics, hardware, trading, research-pipeline, execution-flow
+
+Project-level skills in `.claude/skills/`:
+- variable-standards: Canonical naming conventions for signals, trades, positions

@@ -1,5 +1,27 @@
 # Variable Naming Standardization - Refactoring Plan
 
+## Status: ✅ COMPLETE (January 2026)
+
+| Phase | Status | Commits |
+|-------|--------|---------|
+| Phase 0: Setup | ✅ Done | - |
+| Phase 1: Schema Definition | ✅ Done | `6988aff` |
+| Phase 2: Signal Unification | ✅ Done | `395140e` |
+| Phase 3: Database Migration | ✅ Done | `8660f33` |
+| Phase 4: Strategy ID Docs | ✅ Done | In core/types.py |
+| Phase 5: Python Variables | ⏭️ Deferred | Backward compat handles it |
+| Phase 6: Verification | ✅ Done | All tests pass |
+
+**What was migrated:**
+- `signal_history` tables: strategy→strategy_id, signal_type→side, signal_strength→strength
+- `trades` table: pnl_percent→pnl_pct
+- Created `core/types.py` with canonical Signal, Side, SignalScore, EnsembleResult
+
+**What was NOT migrated (intentional):**
+- `signals` table: Uses signal_type='entry'/'exit' (different semantics)
+
+---
+
 ## Executive Summary
 
 This plan addresses variable naming inconsistencies across the trading system identified through deep audit. The goal is to establish canonical naming patterns and unify 7 Signal-related classes, standardize strategy identifiers, and align database schemas with Python code.
