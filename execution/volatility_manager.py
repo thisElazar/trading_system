@@ -175,7 +175,8 @@ class VolatilityManager:
             db_path: Path to database for persistence
         """
         self.config = config or VolatilityConfig()
-        self.db_path = db_path or Path(__file__).parent.parent / "data" / "volatility.db"
+        from config import DATABASES
+        self.db_path = db_path or DATABASES.get("volatility", Path(__file__).parent.parent / "db" / "volatility.db")
 
         # Cache for volatility states
         self._state_cache: Dict[str, VolatilityState] = {}

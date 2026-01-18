@@ -494,7 +494,8 @@ class PromotionPipeline:
         self.criteria = criteria or PromotionCriteria()
         self._on_promotion_callback = on_promotion
         self._on_retirement_callback = on_retirement
-        self.db_path = db_path or Path(__file__).parent.parent.parent / "data" / "promotion_pipeline.db"
+        from config import DATABASES
+        self.db_path = db_path or DATABASES.get("promotion", Path(__file__).parent.parent.parent / "db" / "promotion_pipeline.db")
         self.db = get_db()
 
         # GP-016: Alpha decay monitor

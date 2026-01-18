@@ -88,10 +88,15 @@ DIRS = {
 }
 
 DATABASES = {
-    "trades":        DIRS["db"] / "trades.db",
-    "performance":   DIRS["db"] / "performance.db",
-    "research":      DIRS["db"] / "research.db",
-    "pairs":         DIRS["db"] / "pairs.db",
+    "trades":            DIRS["db"] / "trades.db",
+    "performance":       DIRS["db"] / "performance.db",
+    "research":          DIRS["db"] / "research.db",
+    "pairs":             DIRS["db"] / "pairs.db",
+    # Consolidated from data/
+    "promotion":         DIRS["db"] / "promotion_pipeline.db",
+    "portfolio_fitness": DIRS["db"] / "portfolio_fitness.db",
+    "volatility":        DIRS["db"] / "volatility.db",
+    "signal_scores":     DIRS["db"] / "signal_scores.db",
 }
 
 # ============================================================================

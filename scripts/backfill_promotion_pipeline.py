@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Paths
 TRADING_SYSTEM = Path(__file__).parent.parent
 RESEARCH_DB = TRADING_SYSTEM / "db" / "research.db"
-PIPELINE_DB = TRADING_SYSTEM / "data" / "promotion_pipeline.db"
+PIPELINE_DB = TRADING_SYSTEM / "db" / "promotion_pipeline.db"
 
 
 def backfill_strategies():

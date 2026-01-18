@@ -498,7 +498,8 @@ class DailyOrchestrator:
     def signal_scorer(self):
         """Signal scoring for trade filtering."""
         if self._signal_scorer is None and HAS_SIGNAL_SCORER:
-            db_path = Path(__file__).parent / "data" / "signal_scores.db"
+            from config import DATABASES
+            db_path = DATABASES.get("signal_scores", Path(__file__).parent / "db" / "signal_scores.db")
             self._signal_scorer = SignalScorer(db_path=db_path)
             logger.info("Signal scorer initialized")
         return self._signal_scorer

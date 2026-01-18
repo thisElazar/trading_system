@@ -177,7 +177,8 @@ class PortfolioFitnessEvaluator:
             weights: Custom fitness weights
             risk_free_rate: Annual risk-free rate for Sharpe calculations
         """
-        self.db_path = db_path or Path(__file__).parent.parent.parent / "data" / "portfolio_fitness.db"
+        from config import DATABASES
+        self.db_path = db_path or DATABASES.get("portfolio_fitness", Path(__file__).parent.parent.parent / "db" / "portfolio_fitness.db")
         self.weights = weights or FitnessWeights()
         self.risk_free_rate = risk_free_rate
         self.daily_rf = (1 + risk_free_rate) ** (1/252) - 1
