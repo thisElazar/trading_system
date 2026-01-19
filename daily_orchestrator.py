@@ -4994,7 +4994,7 @@ class DailyOrchestrator:
                 task_name = task_spec.name
 
                 # Check if once-per-phase task already ran
-                if task_spec.once_per_phase and task_name in self.state.phase_tasks_completed[phase_key]:
+                if task_spec.run_once_per_phase and task_name in self.state.phase_tasks_completed[phase_key]:
                     if TASK_SCHEDULER_DEBUG:
                         logger.debug(f"Skipping {task_name}, already completed this phase")
                     results[task_name] = True
@@ -5002,7 +5002,7 @@ class DailyOrchestrator:
 
                 # Check interval for recurring tasks
                 last_run = self.state.last_task_run.get(task_name)
-                if last_run and not task_spec.once_per_phase:
+                if last_run and not task_spec.run_once_per_phase:
                     seconds_since = (datetime.now(self.tz) - last_run).total_seconds()
                     min_interval = task_spec.estimated_minutes * 60 * 0.5  # 50% of estimated time
                     if seconds_since < min_interval:
@@ -5023,7 +5023,7 @@ class DailyOrchestrator:
                 )
 
                 # Mark once-per-phase tasks as completed
-                if result and task_spec.once_per_phase:
+                if result and task_spec.run_once_per_phase:
                     self.state.phase_tasks_completed[phase_key].add(task_name)
 
         except Exception as e:
