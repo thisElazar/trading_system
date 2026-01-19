@@ -51,7 +51,7 @@ from execution.circuit_breaker import CircuitBreakerManager, CircuitBreakerConfi
 from config import (
     CIRCUIT_BREAKER, WEEKEND_CONFIG, ALPACA_API_KEY, ALPACA_SECRET_KEY,
     DATABASES, INTRADAY_EXIT_CONFIG, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    USE_TASK_SCHEDULER, TASK_SCHEDULER_DEBUG
+    USE_TASK_SCHEDULER, TASK_SCHEDULER_DEBUG, USE_UNIFIED_SCHEDULER
 )
 
 # Intelligence modules
@@ -143,11 +143,12 @@ except ImportError:
 
 # Task scheduler (optional - new orchestration system)
 try:
-    from orchestration.task_scheduler import TaskScheduler
+    from orchestration.task_scheduler import TaskScheduler, OperatingMode
     from orchestration.task_specs import TASK_SPECS
     HAS_TASK_SCHEDULER = True
 except ImportError:
     TaskScheduler = None
+    OperatingMode = None
     TASK_SPECS = None
     HAS_TASK_SCHEDULER = False
 
@@ -616,6 +617,10 @@ class DailyOrchestrator:
 
         Note: Intraday phases (INTRADAY_OPEN, INTRADAY_ACTIVE) take precedence
         over MARKET_OPEN during their specific time windows.
+
+        When USE_UNIFIED_SCHEDULER is enabled, this method still returns the
+        time-based MarketPhase for compatibility, but the orchestrator will
+        use TaskScheduler.get_operating_mode() for actual scheduling decisions.
         """
         now = datetime.now(self.tz)
         weekday = now.weekday()
@@ -656,6 +661,45 @@ class DailyOrchestrator:
 
         # If not in any defined phase, it's overnight
         return MarketPhase.OVERNIGHT
+
+    def _get_operating_mode_phase(self) -> MarketPhase:
+        """
+        Map TaskScheduler's OperatingMode back to MarketPhase for compatibility.
+
+        This enables gradual migration: orchestrator still uses MarketPhase
+        internally, but decisions are driven by the unified scheduler.
+
+        Returns:
+            MarketPhase that best corresponds to the current OperatingMode.
+        """
+        if not self._task_scheduler or not USE_UNIFIED_SCHEDULER:
+            return self.get_current_phase()
+
+        try:
+            mode = self._task_scheduler.get_operating_mode()
+
+            if mode == OperatingMode.TRADING:
+                # Return the specific trading phase (intraday detection still uses time)
+                return self.get_current_phase()
+
+            elif mode == OperatingMode.RESEARCH:
+                # Research mode - could be weekend, overnight, or holiday
+                time_phase = self.get_current_phase()
+                if time_phase in (MarketPhase.WEEKEND, MarketPhase.OVERNIGHT, MarketPhase.EVENING):
+                    return time_phase
+                return MarketPhase.OVERNIGHT  # Default for research mode
+
+            elif mode == OperatingMode.PREP:
+                # Prep mode - pre-market or post-market
+                time_phase = self.get_current_phase()
+                if time_phase in (MarketPhase.PRE_MARKET, MarketPhase.POST_MARKET):
+                    return time_phase
+                return MarketPhase.PRE_MARKET  # Default for prep mode
+
+        except Exception as e:
+            logger.warning(f"OperatingMode lookup failed, using time-based: {e}")
+
+        return self.get_current_phase()
 
     def get_phase_config(self, phase: MarketPhase) -> PhaseConfig:
         """Get configuration for a phase."""
@@ -3881,6 +3925,99 @@ class DailyOrchestrator:
 
         return False
 
+    # =========================================================================
+    # Unified Scheduler Extended Window Handling
+    # =========================================================================
+
+    def _run_unified_extended_window(self, phase: MarketPhase, once: bool = False) -> None:
+        """
+        Run extended window tasks using the unified scheduler.
+
+        This replaces the WeekendSubPhase state machine with dynamic
+        budget-aware task selection. Works for weekends, overnight
+        with holidays, and any extended non-trading window.
+
+        Args:
+            phase: Current MarketPhase (WEEKEND, OVERNIGHT, etc.)
+            once: If True, run one iteration only
+        """
+        mode_info = self._task_scheduler.get_current_mode()
+        mode = mode_info.get("mode", "prep")
+
+        # Log mode info for dashboard visibility
+        if mode == "research":
+            budget = mode_info.get("budget", {})
+            budget_type = budget.get("budget_type", "unknown")
+            hours_remaining = budget.get("research_hours", 0)
+            pct_remaining = budget.get("pct_remaining", 0) * 100
+            logger.info(f"Extended window: mode={mode}, type={budget_type}, "
+                       f"{hours_remaining:.1f}h remaining ({pct_remaining:.0f}%)")
+        else:
+            logger.info(f"Extended window: mode={mode}")
+
+        # Get budget-aware task list
+        tasks = mode_info.get("tasks", [])
+
+        if not tasks:
+            # No tasks to run (could be paused or window complete)
+            calendar = mode_info.get("calendar", {})
+            hours_until = calendar.get("hours_until_trading", 0)
+            if hours_until < 1.5:
+                # Almost pre-market, short sleep
+                logger.info("Near pre-market - ready for trading")
+                self._interruptible_sleep(300)  # 5 min
+            else:
+                # Long wait, longer sleep
+                logger.info(f"No tasks ready - {hours_until:.1f}h until trading")
+                self._interruptible_sleep(min(1800, hours_until * 3600 / 4))
+            return
+
+        # Run each task
+        all_succeeded = True
+        for task_name in tasks:
+            # Special handling for research - check if already running
+            if task_name == "run_weekend_research":
+                if self._is_research_running():
+                    logger.debug("Research still running")
+                    continue
+                elif self.state.weekend_research_progress.get('status') == 'completed':
+                    logger.debug("Research already completed")
+                    continue
+
+            # Skip if already completed this window
+            if task_name in self.state.weekend_tasks_completed:
+                continue
+
+            # Run the task
+            result = self.run_task(task_name)
+            if result:
+                self.state.weekend_tasks_completed.append(task_name)
+                logger.info(f"Extended window task completed: {task_name}")
+            else:
+                all_succeeded = False
+                logger.warning(f"Extended window task failed: {task_name}")
+
+        # Update hardware display
+        if self._hardware:
+            self._update_hardware_display(phase)
+
+            # Set operating mode on LEDs if available
+            if hasattr(self._hardware, 'set_operating_mode'):
+                self._hardware.set_operating_mode(mode)
+
+        # Determine sleep duration based on what we're doing
+        if mode == "research":
+            budget = mode_info.get("budget", {})
+            if budget.get("pct_remaining", 0) > 0.20:
+                # Active research phase - check frequently
+                self._interruptible_sleep(300)  # 5 min
+            else:
+                # Late in window - check less often
+                self._interruptible_sleep(600)  # 10 min
+        else:
+            # Prep mode - less frequent checks
+            self._interruptible_sleep(600)  # 10 min
+
     def _task_run_weekend_schedule(self) -> bool:
         """Master dispatcher for weekend sub-phases."""
         now = datetime.now(self.tz)
@@ -4987,46 +5124,55 @@ class DailyOrchestrator:
                             self.state.weekend_research_progress = {}
                             logger.info("Weekend phase completed - reset for next week")
 
-                # Handle weekend - run weekend schedule instead of sleeping
+                # Handle extended windows (weekend, overnight with holiday, etc.)
+                # When USE_UNIFIED_SCHEDULER is enabled, use budget-aware task selection
                 if current_phase == MarketPhase.WEEKEND:
-                    sub_phase = self.state.weekend_sub_phase or WeekendSubPhase.FRIDAY_CLEANUP
-
-                    # Count weekend tasks for dashboard display
-                    completed = len(self.state.weekend_tasks_completed)
-                    research_running = self._is_research_running()
-                    # Total tasks: cleanup(3) + research(1) + refresh(3) + prep(3) = 10
-                    total = 10
-                    if research_running:
-                        completed = max(completed, 4)  # Show progress during research
-                    logger.info(f"Phase weekend: {completed}/{total} tasks succeeded")
-                    logger.info(f"Weekend phase active - sub-phase: {sub_phase.value}")
-
-                    if once:
-                        # Run one iteration of weekend tasks
-                        self._task_run_weekend_schedule()
-                        break
-
-                    # Run weekend schedule (handles sub-phases internally)
-                    self._task_run_weekend_schedule()
-
-                    # Log scheduler status (scheduler is dormant during weekend but still tracking)
-                    if self._task_scheduler is not None:
-                        _ = self._task_scheduler.get_current_window()  # Logs to scheduler.log
-
-                    # Update hardware display after weekend tasks
-                    if self._hardware:
-                        self._update_hardware_display(current_phase)
-
-                    # If weekend is complete, sleep until Monday
-                    if self.state.weekend_sub_phase == WeekendSubPhase.COMPLETE:
-                        time_to_next = self.time_until_next_phase()
-                        logger.info(f"Weekend tasks complete - ready for Monday ({time_to_next})")
-                        sleep_seconds = min(time_to_next.total_seconds(), 3600)
-                        self._interruptible_sleep(sleep_seconds)
+                    if USE_UNIFIED_SCHEDULER and self._task_scheduler is not None:
+                        # Unified scheduler path - budget-aware task selection
+                        self._run_unified_extended_window(current_phase, once)
+                        if once:
+                            break
+                        continue
                     else:
-                        # Sleep between weekend task checks (5 min)
-                        self._interruptible_sleep(300)
-                    continue
+                        # Legacy path - WeekendSubPhase state machine
+                        sub_phase = self.state.weekend_sub_phase or WeekendSubPhase.FRIDAY_CLEANUP
+
+                        # Count weekend tasks for dashboard display
+                        completed = len(self.state.weekend_tasks_completed)
+                        research_running = self._is_research_running()
+                        # Total tasks: cleanup(3) + research(1) + refresh(3) + prep(3) = 10
+                        total = 10
+                        if research_running:
+                            completed = max(completed, 4)  # Show progress during research
+                        logger.info(f"Phase weekend: {completed}/{total} tasks succeeded")
+                        logger.info(f"Weekend phase active - sub-phase: {sub_phase.value}")
+
+                        if once:
+                            # Run one iteration of weekend tasks
+                            self._task_run_weekend_schedule()
+                            break
+
+                        # Run weekend schedule (handles sub-phases internally)
+                        self._task_run_weekend_schedule()
+
+                        # Log scheduler status (scheduler is dormant during weekend but still tracking)
+                        if self._task_scheduler is not None:
+                            _ = self._task_scheduler.get_current_window()  # Logs to scheduler.log
+
+                        # Update hardware display after weekend tasks
+                        if self._hardware:
+                            self._update_hardware_display(current_phase)
+
+                        # If weekend is complete, sleep until Monday
+                        if self.state.weekend_sub_phase == WeekendSubPhase.COMPLETE:
+                            time_to_next = self.time_until_next_phase()
+                            logger.info(f"Weekend tasks complete - ready for Monday ({time_to_next})")
+                            sleep_seconds = min(time_to_next.total_seconds(), 3600)
+                            self._interruptible_sleep(sleep_seconds)
+                        else:
+                            # Sleep between weekend task checks (5 min)
+                            self._interruptible_sleep(300)
+                        continue
 
                 # Check memory before running tasks
                 mem_status = self._check_memory_status()

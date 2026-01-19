@@ -1036,3 +1036,149 @@ All code should be added to:
 ## Appendix: Complete Task Spec Reference
 
 See the `TASK_SPECS` dictionary above for the complete 44-task registry with all specifications.
+
+---
+
+## Unified Scheduler Extension (January 2026)
+
+### Overview
+
+The Unified Scheduler extends the TaskScheduler to become the **single authority** for market status and operating mode. It replaces rigid weekend sub-phases with dynamic, budget-aware task selection that works for any extended research window (overnight, weekend, holiday).
+
+**Key Insight:** Mid-week holidays are NOT weekends. A Wednesday holiday provides ~22 hours of research time, not 56+. The system now calculates actual time available rather than assuming based on phase name.
+
+### New Concepts
+
+#### OperatingMode Enum
+
+Replaces high-level phase decisions with market-aware modes:
+
+```python
+class OperatingMode(Enum):
+    TRADING = "trading"    # Market hours - execution priority
+    RESEARCH = "research"  # Extended window - research priority
+    PREP = "prep"          # Pre-market/pre-week - preparation
+```
+
+#### MarketCalendar Dataclass
+
+Single source of truth for market status:
+
+```python
+@dataclass
+class MarketCalendar:
+    is_trading_day: bool       # True if market is open today
+    is_early_close: bool       # True if market closes early (1 PM)
+    next_trading_day: date     # Next day the market is open
+    hours_until_trading: float # Hours until next market open
+
+    @property
+    def is_market_open(self) -> bool:
+        """True if market is currently open (trading hours)."""
+        return self.is_trading_day and self.hours_until_trading <= 0
+```
+
+#### ResearchBudget Dataclass
+
+Dynamic research time allocation:
+
+```python
+@dataclass
+class ResearchBudget:
+    total_hours: float
+    research_hours: float      # After subtracting prep time
+    budget_type: str           # "overnight" | "weekend" | "holiday" | "holiday_weekend"
+    is_extended: bool          # True if > 12 hours available
+
+    @property
+    def budget_pct_remaining(self) -> float:
+        """Percentage of research budget remaining (0.0 - 1.0)."""
+```
+
+### Architecture Change
+
+```
+BEFORE:
+  Orchestrator.get_current_phase()  →  time-based  →  WEEKEND/OVERNIGHT
+  TaskScheduler                     →  advisory only
+
+AFTER:
+  TaskScheduler.get_operating_mode()  →  market-aware  →  TRADING/RESEARCH/PREP
+  TaskScheduler.calculate_research_budget()  →  actual hours available
+  Orchestrator  →  executor only, queries scheduler for decisions
+```
+
+### New TaskScheduler Methods
+
+| Method | Purpose |
+|--------|---------|
+| `get_market_calendar()` | Returns MarketCalendar with all timing info |
+| `get_operating_mode()` | Returns TRADING/RESEARCH/PREP based on calendar |
+| `calculate_research_budget()` | Returns ResearchBudget with actual hours |
+| `get_extended_window_tasks()` | Budget-aware task selection |
+| `get_current_mode()` | Dict interface for orchestrator consumption |
+
+### Budget-Aware Task Selection
+
+Tasks are selected based on remaining research budget, not arbitrary sub-phases:
+
+| Budget Remaining | Tasks Selected |
+|------------------|----------------|
+| > 80% of total | Cleanup: weekly report, backup, vacuum |
+| 20%-80% | Research: GA/GP optimization |
+| 1.5h - 20% | Data refresh: index constituents, fundamentals |
+| < 1.5h | Prep: validate strategies, verify readiness |
+
+This logic works identically for weekends, overnight, and holidays.
+
+### Configuration Flag
+
+```python
+# config.py
+USE_UNIFIED_SCHEDULER = os.environ.get('USE_UNIFIED_SCHEDULER', 'false').lower() == 'true'
+```
+
+**Migration Strategy:**
+- Week 1: Deploy with `USE_UNIFIED_SCHEDULER=false` (verify no regressions)
+- Week 2: Enable Friday evening for weekend testing
+- Week 3: Enable for overnight testing
+- Week 4: Full enablement
+
+**Rollback:** `export USE_UNIFIED_SCHEDULER=false`
+
+### Hardware Integration
+
+New operating mode LED mappings:
+
+```python
+OPERATING_MODE_LED_MAP = {
+    'trading': {'system': 'healthy', 'trading': 'active'},
+    'research': {'system': 'healthy', 'research': 'evolving'},
+    'prep': {'system': 'healthy', 'trading': 'pending'},
+}
+```
+
+### Expected Budget Calculations
+
+| Window Type | Total Hours | Research Hours | Budget Type |
+|-------------|-------------|----------------|-------------|
+| Regular overnight | ~10.5h | ~9h | overnight |
+| Weekend | ~56h | ~52.5h | weekend |
+| Mid-week holiday | ~22h | ~20h | holiday |
+| Holiday + weekend | ~80h | ~76h | holiday_weekend |
+
+### Dashboard Control
+
+The existing `/logs/weekend_control.json` mechanism is preserved and works with the new architecture:
+
+- `{"action": "pause"}` - Pause research tasks
+- `{"action": "skip"}` - Skip current task
+- `{"action": "stop"}` - Stop research, jump to prep
+
+### Benefits
+
+1. **Dynamic Budget Calculation**: Actual hours available, not assumptions
+2. **Unified Logic**: Same code path for weekend, overnight, holiday
+3. **No State Machine**: Simpler architecture, fewer bugs
+4. **Holiday Awareness**: Mid-week holidays get proportional research time
+5. **Dashboard Clarity**: Shows actual time remaining, not phase names

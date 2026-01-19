@@ -2,7 +2,7 @@
 
 Complete reference for the daily operational cycle of the autonomous trading system.
 
-**Last Updated:** 2026-01-09
+**Last Updated:** 2026-01-18
 
 ---
 
@@ -126,6 +126,8 @@ Research and optimization.
 2. **Strategy Discovery** - GP-based discovery of novel strategy genomes
 3. **Adaptive GA** - Regime-matched multi-scale testing
 
+**Unified Scheduler Mode:** When `USE_UNIFIED_SCHEDULER=true`, overnight uses the same budget-aware task selection as weekends. Research budget is ~9 hours (10.5h total minus 1.5h prep reserve). If the next day is a holiday, the overnight window extends automatically.
+
 ---
 
 ### WEEKEND (Fri 16:00 - Sun 20:00 ET)
@@ -141,6 +143,28 @@ Extended research window.
 - Extended parameter optimization (more generations)
 - Deep strategy discovery runs
 - Full backtest validation of promoted strategies
+
+#### Unified Scheduler Mode (when `USE_UNIFIED_SCHEDULER=true`)
+
+When enabled, the Unified Scheduler replaces the rigid `WeekendSubPhase` state machine with dynamic budget-aware task selection:
+
+| Budget Remaining | Tasks |
+|------------------|-------|
+| > 80% | Cleanup: weekly report, backup, vacuum |
+| 20%-80% | Research: GA/GP optimization |
+| 1.5h - 20% | Data refresh: index constituents, fundamentals |
+| < 1.5h | Prep: validate strategies, verify readiness |
+
+**Key Benefits:**
+- Same logic works for weekends, overnight, and holidays
+- Mid-week holidays get proportional research time (~22h, not 56h)
+- Dashboard shows actual hours remaining instead of phase names
+
+**Configuration:**
+```bash
+export USE_UNIFIED_SCHEDULER=true  # Enable
+export USE_UNIFIED_SCHEDULER=false # Disable (rollback)
+```
 
 ---
 
@@ -333,3 +357,5 @@ MAX_LOAD_AVG = 8.0           # Load average threshold
 - [AUTONOMOUS_RESEARCH_ENGINE.md](AUTONOMOUS_RESEARCH_ENGINE.md) - Research system details
 - [STRATEGY_PORTFOLIO_OVERVIEW.md](STRATEGY_PORTFOLIO_OVERVIEW.md) - Strategy descriptions
 - [TRADEBOT_RD_OVERVIEW.md](TRADEBOT_RD_OVERVIEW.md) - R&D architecture
+- [TASKSCHEDULER_DESIGN.md](TASKSCHEDULER_DESIGN.md) - TaskScheduler architecture and Unified Scheduler
+- [TASKSCHEDULER_IMPLEMENTATION.md](TASKSCHEDULER_IMPLEMENTATION.md) - Implementation phases and commits

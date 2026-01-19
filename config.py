@@ -770,3 +770,18 @@ USE_TASK_SCHEDULER = os.environ.get('USE_TASK_SCHEDULER', 'false').lower() == 't
 # When True, logs detailed scheduler decisions (ready tasks, blocking reasons)
 TASK_SCHEDULER_DEBUG = os.environ.get('TASK_SCHEDULER_DEBUG', 'false').lower() == 'true'
 
+# Unified Scheduler - Makes TaskScheduler the single authority for market status
+# and operating mode. When True:
+# - TaskScheduler determines operating mode (TRADING/RESEARCH/PREP)
+# - Weekend/overnight/holiday handling uses dynamic budget-based task selection
+# - get_current_phase() delegates to TaskScheduler for mode-aware decisions
+#
+# Migration strategy:
+# - Week 1: Deploy with 'false' to verify no regressions
+# - Week 2: Enable Friday evening for weekend testing
+# - Week 3: Enable for overnight testing
+# - Week 4: Full enablement
+#
+# Rollback: export USE_UNIFIED_SCHEDULER=false
+USE_UNIFIED_SCHEDULER = os.environ.get('USE_UNIFIED_SCHEDULER', 'false').lower() == 'true'
+

@@ -87,9 +87,75 @@ class TaskCategory(Enum):
     MONITORING = auto()   # Health checks, alerts, status updates
 
 
+class OperatingMode(Enum):
+    """
+    High-level operating modes based on market status.
+
+    Replaces phase-based decisions with market-aware modes:
+    - TRADING: Market hours, execution priority
+    - RESEARCH: Extended window (overnight/weekend/holiday), research priority
+    - PREP: Pre-market or pre-week preparation
+    """
+    TRADING = "trading"    # Market hours - execution priority
+    RESEARCH = "research"  # Extended window - research priority
+    PREP = "prep"          # Pre-market/pre-week - preparation
+
+
 # =============================================================================
 # DATACLASSES
 # =============================================================================
+
+@dataclass
+class MarketCalendar:
+    """
+    Single source of truth for market status and timing.
+
+    Captures all market-related information needed for scheduling decisions.
+    Replaces scattered weekend/holiday checks throughout the codebase.
+    """
+    is_trading_day: bool       # True if market is open today
+    is_early_close: bool       # True if market closes early (1 PM)
+    next_trading_day: date     # Next day the market is open
+    hours_until_trading: float # Hours until next market open
+
+    @property
+    def is_market_open(self) -> bool:
+        """True if market is currently open (trading hours)."""
+        return self.is_trading_day and self.hours_until_trading <= 0
+
+
+@dataclass
+class ResearchBudget:
+    """
+    Dynamic research time allocation based on actual hours available.
+
+    Key insight: Mid-week holidays are NOT weekends. A Wednesday holiday
+    gives ~22 hours of research, not 56+. The system calculates actual
+    time available, not assumptions based on phase name.
+
+    Attributes:
+        total_hours: Total hours in the extended window
+        research_hours: Hours available for research (after prep time)
+        budget_type: "overnight" | "weekend" | "holiday" | "holiday_weekend"
+        is_extended: True if window > 12 hours (allows deeper research)
+    """
+    total_hours: float
+    research_hours: float      # After subtracting prep time (~2h)
+    budget_type: str           # overnight, weekend, holiday, holiday_weekend
+    is_extended: bool          # True if > 12 hours available
+
+    @property
+    def hours_remaining(self) -> float:
+        """Alias for research_hours for dashboard display."""
+        return self.research_hours
+
+    @property
+    def budget_pct_remaining(self) -> float:
+        """Percentage of research budget remaining (0.0 - 1.0)."""
+        if self.total_hours <= 0:
+            return 0.0
+        return min(1.0, max(0.0, self.research_hours / self.total_hours))
+
 
 @dataclass
 class TaskSpec:
@@ -507,6 +573,306 @@ class TaskScheduler:
 
         # Normal overnight: 9:30 PM
         return now.replace(hour=21, minute=30, second=0, microsecond=0)
+
+    # =========================================================================
+    # UNIFIED SCHEDULER (Market-Aware Mode Management)
+    # =========================================================================
+
+    def get_market_calendar(self) -> MarketCalendar:
+        """
+        Get complete market status information.
+
+        Returns a MarketCalendar with all timing info needed for scheduling
+        decisions. This is the single source of truth for market status.
+
+        Returns:
+            MarketCalendar with trading day status, next open, hours remaining.
+        """
+        now = datetime.now(self.orchestrator.tz)
+        today = now.date()
+
+        # Check if today is a trading day
+        is_weekend = now.weekday() >= 5
+        is_holiday = self._is_holiday(today)
+        is_trading_day = not is_weekend and not is_holiday
+
+        # Check for early close
+        is_early_close = self._is_early_close(today) if is_trading_day else False
+
+        # Find next trading day
+        next_trading = self._get_next_trading_premarket(now)
+        next_trading_day = next_trading.date()
+
+        # Calculate hours until market opens
+        # Market opens at 9:30 AM ET
+        if is_trading_day:
+            market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = now.replace(hour=13 if is_early_close else 16,
+                                       minute=0, second=0, microsecond=0)
+
+            if now < market_open:
+                hours_until = (market_open - now).total_seconds() / 3600
+            elif now < market_close:
+                hours_until = 0  # Market is open
+            else:
+                # Market closed for today, calculate until next open
+                next_open = next_trading.replace(hour=9, minute=30)
+                hours_until = (next_open - now).total_seconds() / 3600
+        else:
+            # Not a trading day
+            next_open = next_trading.replace(hour=9, minute=30)
+            hours_until = (next_open - now).total_seconds() / 3600
+
+        calendar = MarketCalendar(
+            is_trading_day=is_trading_day,
+            is_early_close=is_early_close,
+            next_trading_day=next_trading_day,
+            hours_until_trading=max(0, hours_until),
+        )
+
+        logger.debug(f"MarketCalendar: trading_day={is_trading_day}, "
+                    f"early_close={is_early_close}, next={next_trading_day}, "
+                    f"hours_until={hours_until:.1f}")
+
+        return calendar
+
+    def get_operating_mode(self) -> OperatingMode:
+        """
+        Determine the current operating mode based on market status.
+
+        This is the primary decision point for what the system should be doing:
+        - TRADING: Market is open, focus on execution
+        - RESEARCH: Extended window (overnight/weekend/holiday), focus on research
+        - PREP: Pre-market or pre-week preparation
+
+        Returns:
+            OperatingMode enum value.
+        """
+        from daily_orchestrator import MarketPhase
+
+        now = datetime.now(self.orchestrator.tz)
+        phase = self.orchestrator.get_current_phase()
+        calendar = self.get_market_calendar()
+
+        # Pre-market is always PREP mode
+        if phase == MarketPhase.PRE_MARKET:
+            return OperatingMode.PREP
+
+        # Market hours = TRADING mode
+        if phase in (MarketPhase.MARKET_OPEN, MarketPhase.INTRADAY_OPEN,
+                     MarketPhase.INTRADAY_ACTIVE):
+            return OperatingMode.TRADING
+
+        # Post-market = PREP (end of day tasks)
+        if phase == MarketPhase.POST_MARKET:
+            return OperatingMode.PREP
+
+        # Weekend: check sub-phase timing
+        if phase == MarketPhase.WEEKEND:
+            day = now.weekday()
+            hour = now.hour
+
+            # Sunday afternoon (14:00+) = PREP for Monday
+            if day == 6 and hour >= 14:
+                return OperatingMode.PREP
+
+            # Otherwise weekend = RESEARCH
+            return OperatingMode.RESEARCH
+
+        # Overnight: check if close to pre-market
+        if phase == MarketPhase.OVERNIGHT:
+            # If less than 1.5 hours until pre-market, switch to PREP
+            if calendar.hours_until_trading < 1.5:
+                return OperatingMode.PREP
+            return OperatingMode.RESEARCH
+
+        # Evening: early evening is PREP, late evening is RESEARCH
+        if phase == MarketPhase.EVENING:
+            hour = now.hour
+            if hour < 19:  # Before 7 PM
+                return OperatingMode.PREP
+            return OperatingMode.RESEARCH
+
+        # Default to PREP for safety
+        return OperatingMode.PREP
+
+    def calculate_research_budget(self) -> ResearchBudget:
+        """
+        Calculate the research time budget based on actual hours available.
+
+        Key insight: A mid-week holiday gives ~22 hours, not 56+.
+        The system calculates actual time rather than assuming based on phase.
+
+        Returns:
+            ResearchBudget with total hours, research hours, and budget type.
+        """
+        from daily_orchestrator import MarketPhase
+
+        now = datetime.now(self.orchestrator.tz)
+        phase = self.orchestrator.get_current_phase()
+        calendar = self.get_market_calendar()
+
+        # Find next trading start
+        next_trading = self._get_next_trading_premarket(now)
+        next_open = next_trading.replace(hour=9, minute=30)
+
+        # Calculate total hours in this window
+        total_hours = (next_open - now).total_seconds() / 3600
+
+        # Determine budget type based on context
+        is_weekend = now.weekday() >= 5 or (now.weekday() == 4 and now.hour >= 17)
+        tomorrow_holiday = self._is_holiday(now.date() + timedelta(days=1))
+        today_holiday = self._is_holiday(now.date())
+
+        if is_weekend and tomorrow_holiday:
+            budget_type = "holiday_weekend"
+        elif is_weekend:
+            budget_type = "weekend"
+        elif today_holiday or tomorrow_holiday:
+            budget_type = "holiday"
+        else:
+            budget_type = "overnight"
+
+        # Reserve time for data refresh and prep (proportional to window)
+        # - Weekend: 3.5h reserved (data refresh, validation, prep)
+        # - Overnight: 1.5h reserved (quick validation, prep)
+        # - Holiday: 2h reserved (moderate validation)
+        reserve_hours = {
+            "weekend": 3.5,
+            "holiday_weekend": 4.0,
+            "holiday": 2.0,
+            "overnight": 1.5,
+        }.get(budget_type, 1.5)
+
+        research_hours = max(0, total_hours - reserve_hours)
+
+        # Extended = more than 12 hours available
+        is_extended = total_hours > 12
+
+        budget = ResearchBudget(
+            total_hours=total_hours,
+            research_hours=research_hours,
+            budget_type=budget_type,
+            is_extended=is_extended,
+        )
+
+        logger.info(f"ResearchBudget: type={budget_type}, total={total_hours:.1f}h, "
+                   f"research={research_hours:.1f}h, extended={is_extended}")
+
+        return budget
+
+    def get_extended_window_tasks(self) -> List[str]:
+        """
+        Get budget-aware task list for extended windows (overnight/weekend/holiday).
+
+        Task selection based on budget remaining:
+        - > 80% budget: Cleanup tasks (weekly report, backup, vacuum)
+        - 20%-80%: Research tasks (GA/GP optimization)
+        - 1.5h-20%: Data refresh (index constituents, fundamentals)
+        - < 1.5h: Prep tasks (validate strategies, verify readiness)
+
+        This replaces the rigid WeekendSubPhase state machine with dynamic
+        budget-aware task selection that works for any extended window.
+
+        Returns:
+            List of task names appropriate for current budget remaining.
+        """
+        import json
+        from pathlib import Path
+
+        budget = self.calculate_research_budget()
+
+        # Check for dashboard control file
+        control_path = Path(__file__).parent.parent / "logs" / "weekend_control.json"
+        if control_path.exists():
+            try:
+                with open(control_path) as f:
+                    control = json.load(f)
+                    action = control.get("action")
+                    if action == "pause":
+                        logger.info("Research paused via dashboard control")
+                        return []
+                    elif action == "skip":
+                        logger.info("Current task skipped via dashboard control")
+                        control_path.unlink()  # Remove after processing
+                    elif action == "stop":
+                        logger.info("Research stopped via dashboard control")
+                        control_path.unlink()
+                        return ["verify_system_readiness"]  # Jump to prep
+            except Exception as e:
+                logger.debug(f"Could not read control file: {e}")
+
+        pct_remaining = budget.budget_pct_remaining
+        hours_remaining = budget.research_hours
+
+        # Cleanup phase (early in window, >80% budget)
+        if pct_remaining > 0.80:
+            return [
+                "generate_weekly_report",
+                "backup_databases",
+                "vacuum_databases",
+            ]
+
+        # Research phase (main work, 20%-80% budget)
+        if pct_remaining > 0.20:
+            return [
+                "run_weekend_research",
+            ]
+
+        # Data refresh phase (1.5h-20% remaining)
+        if hours_remaining > 1.5:
+            return [
+                "refresh_index_constituents",
+                "refresh_fundamentals",
+            ]
+
+        # Prep phase (final stretch, <1.5h remaining)
+        return [
+            "train_ml_regime_model",
+            "validate_strategies",
+            "verify_system_readiness",
+        ]
+
+    def get_current_mode(self) -> Dict[str, Any]:
+        """
+        Get current operating mode info for orchestrator consumption.
+
+        This is the query interface that the orchestrator uses to get
+        all scheduling context in one call.
+
+        Returns:
+            Dict with mode, calendar, budget, and task list.
+        """
+        mode = self.get_operating_mode()
+        calendar = self.get_market_calendar()
+
+        result = {
+            "mode": mode.value,
+            "is_trading": mode == OperatingMode.TRADING,
+            "is_research": mode == OperatingMode.RESEARCH,
+            "is_prep": mode == OperatingMode.PREP,
+            "calendar": {
+                "is_trading_day": calendar.is_trading_day,
+                "is_early_close": calendar.is_early_close,
+                "next_trading_day": calendar.next_trading_day.isoformat(),
+                "hours_until_trading": calendar.hours_until_trading,
+                "is_market_open": calendar.is_market_open,
+            },
+        }
+
+        # Add research budget if in research mode
+        if mode == OperatingMode.RESEARCH:
+            budget = self.calculate_research_budget()
+            result["budget"] = {
+                "total_hours": budget.total_hours,
+                "research_hours": budget.research_hours,
+                "budget_type": budget.budget_type,
+                "is_extended": budget.is_extended,
+                "pct_remaining": budget.budget_pct_remaining,
+            }
+            result["tasks"] = self.get_extended_window_tasks()
+
+        return result
 
     # =========================================================================
     # HOLIDAY DETECTION

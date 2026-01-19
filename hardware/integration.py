@@ -60,6 +60,13 @@ class HardwareStatus:
         'weekend': {'system': 'healthy', 'trading': 'stopped'},
     }
 
+    # Map operating modes to LED states (unified scheduler)
+    OPERATING_MODE_LED_MAP = {
+        'trading': {'system': 'healthy', 'trading': 'active'},
+        'research': {'system': 'healthy', 'research': 'evolving'},
+        'prep': {'system': 'healthy', 'trading': 'pending'},
+    }
+
     def __init__(self):
         self._leds: Optional[LEDOrchestrator] = None
         self._screen_controller: Optional[ScreenController] = None
@@ -176,6 +183,42 @@ class HardwareStatus:
             logger.debug(f"Hardware phase set to: {phase}")
         except Exception as e:
             logger.error(f"Failed to set phase LEDs: {e}")
+
+    def set_operating_mode(self, mode: str) -> None:
+        """
+        Update LEDs based on operating mode (unified scheduler).
+
+        This is called when USE_UNIFIED_SCHEDULER is enabled and provides
+        mode-based LED feedback instead of phase-based.
+
+        Args:
+            mode: Operating mode ('trading', 'research', 'prep')
+        """
+        if not self._leds:
+            return
+
+        led_states = self.OPERATING_MODE_LED_MAP.get(mode, {})
+
+        try:
+            if 'system' in led_states:
+                self._leds.set_status('system', led_states['system'])
+            if 'trading' in led_states:
+                self._leds.set_status('trading', led_states['trading'])
+            if 'research' in led_states:
+                # Research mode: start breathing animation
+                if led_states['research'] == 'evolving':
+                    self._leds.breathe('research', 'blue', period=3.0, min_brightness=0.25)
+                    self._research_active = True
+                else:
+                    self._leds.set_status('research', led_states['research'])
+            else:
+                # Not in research mode - turn off research LED
+                if self._research_active:
+                    self._leds.set_status('research', 'offline')
+                    self._research_active = False
+            logger.debug(f"Hardware operating mode set to: {mode}")
+        except Exception as e:
+            logger.error(f"Failed to set operating mode LEDs: {e}")
 
     def set_research_active(self, active: bool) -> None:
         """

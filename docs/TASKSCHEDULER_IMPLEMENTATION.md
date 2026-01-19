@@ -462,3 +462,173 @@ All changes are additive - existing `_task_*` handlers unchanged.
 - [ ] No memory conflicts between heavy tasks
 - [ ] Task completion predictability > 85%
 - [ ] Zero breaking changes to existing functionality
+
+---
+
+## Phase 6: Unified Scheduler (January 2026)
+
+### Overview
+
+Phase 6 makes TaskScheduler the single authority for market status and operating mode. Replaces rigid `WeekendSubPhase` state machine with dynamic budget-aware task selection.
+
+### Commit 6.1: Add Core Dataclasses
+
+**Files modified:**
+- `orchestration/task_scheduler.py`
+
+**Add:**
+```python
+class OperatingMode(Enum):
+    TRADING = "trading"    # Market hours
+    RESEARCH = "research"  # Extended window
+    PREP = "prep"          # Pre-market/pre-week
+
+@dataclass
+class MarketCalendar:
+    is_trading_day: bool
+    is_early_close: bool
+    next_trading_day: date
+    hours_until_trading: float
+
+@dataclass
+class ResearchBudget:
+    total_hours: float
+    research_hours: float
+    budget_type: str  # overnight|weekend|holiday|holiday_weekend
+    is_extended: bool
+```
+
+**Test:**
+```bash
+python -c "from orchestration.task_scheduler import OperatingMode, MarketCalendar, ResearchBudget"
+```
+
+### Commit 6.2: Add Unified Scheduler Methods
+
+**Files modified:**
+- `orchestration/task_scheduler.py`
+
+**Add methods to TaskScheduler:**
+- `get_market_calendar()` - Returns MarketCalendar
+- `get_operating_mode()` - Returns OperatingMode based on calendar
+- `calculate_research_budget()` - Returns ResearchBudget with actual hours
+- `get_extended_window_tasks()` - Budget-aware task selection
+- `get_current_mode()` - Dict interface for orchestrator
+
+**Test:**
+```python
+from orchestration.task_scheduler import TaskScheduler
+sched = TaskScheduler(orch)
+print(sched.get_operating_mode())
+print(sched.calculate_research_budget())
+print(sched.get_current_mode())
+```
+
+### Commit 6.3: Add USE_UNIFIED_SCHEDULER Flag
+
+**Files modified:**
+- `config.py`
+
+**Add:**
+```python
+USE_UNIFIED_SCHEDULER = os.environ.get('USE_UNIFIED_SCHEDULER', 'false').lower() == 'true'
+```
+
+**Test:** Verify flag defaults to False and can be enabled via environment.
+
+### Commit 6.4: Orchestrator Integration
+
+**Files modified:**
+- `daily_orchestrator.py`
+
+**Add:**
+- Import `USE_UNIFIED_SCHEDULER` and `OperatingMode`
+- Add `_get_operating_mode_phase()` method
+- Add `_run_unified_extended_window()` method
+- Modify weekend handling in `run()` to use unified scheduler when flag enabled
+
+**Test:**
+```bash
+USE_UNIFIED_SCHEDULER=true python daily_orchestrator.py --once
+```
+
+### Commit 6.5: Hardware LED Integration
+
+**Files modified:**
+- `hardware/integration.py`
+
+**Add:**
+```python
+OPERATING_MODE_LED_MAP = {
+    'trading': {'system': 'healthy', 'trading': 'active'},
+    'research': {'system': 'healthy', 'research': 'evolving'},
+    'prep': {'system': 'healthy', 'trading': 'pending'},
+}
+
+def set_operating_mode(self, mode: str) -> None:
+    """Update LEDs based on operating mode."""
+```
+
+**Test:** Verify LEDs update correctly for each mode.
+
+### Commit 6.6: Unit Tests
+
+**Files created:**
+- `tests/unit/test_unified_scheduler.py`
+
+**Test cases:**
+- OperatingMode enum values
+- MarketCalendar creation and is_market_open property
+- ResearchBudget creation and budget_pct_remaining
+- get_operating_mode() returns correct mode for each phase
+- calculate_research_budget() returns correct budget types
+- get_extended_window_tasks() budget-aware selection
+- get_current_mode() returns complete dict
+- USE_UNIFIED_SCHEDULER flag defaults and enablement
+- Hardware LED mappings exist
+
+**Test:**
+```bash
+python -m pytest tests/unit/test_unified_scheduler.py -v
+```
+
+### Files Changed Summary (Phase 6)
+
+| Commit | New Files | Modified Files |
+|--------|-----------|----------------|
+| 6.1 | - | orchestration/task_scheduler.py |
+| 6.2 | - | orchestration/task_scheduler.py |
+| 6.3 | - | config.py |
+| 6.4 | - | daily_orchestrator.py |
+| 6.5 | - | hardware/integration.py |
+| 6.6 | tests/unit/test_unified_scheduler.py | - |
+
+### Migration Strategy
+
+1. **Week 1**: Deploy with `USE_UNIFIED_SCHEDULER=false`
+   - New code present but inactive
+   - Verify no regressions
+
+2. **Week 2**: Enable for weekend only
+   - Set flag true Friday evening
+   - Monitor budget calculations
+   - Rollback: `export USE_UNIFIED_SCHEDULER=false`
+
+3. **Week 3**: Enable for overnight
+   - Test overnight budget handling
+
+4. **Week 4**: Full enablement
+   - Keep legacy code as thin fallback
+
+### Verification Checklist
+
+- [ ] `get_operating_mode()` returns correct mode for all phases
+- [ ] `calculate_research_budget()` returns correct hours for:
+  - Regular overnight: ~10h
+  - Weekend: ~56h
+  - Mid-week holiday: ~22h
+  - Holiday + weekend: ~80h
+- [ ] Integration: Run with `USE_UNIFIED_SCHEDULER=true` during weekend
+- [ ] Rollback: Disable flag, verify legacy behavior works
+- [ ] Hardware: LEDs update correctly for each operating mode
+- [ ] All 51 tests pass (32 unified scheduler + 19 orchestrator)
