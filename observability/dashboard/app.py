@@ -1857,7 +1857,10 @@ def get_scheduler_status() -> Dict[str, Any]:
 
 
 def get_weekend_status() -> Dict[str, Any]:
-    """Get weekend phase status from orchestrator log and coordinator state."""
+    """Get weekend/extended window status from orchestrator log and coordinator state.
+
+    Supports both legacy WeekendSubPhase and new Unified Scheduler modes.
+    """
     import re
     import json
     from pathlib import Path
@@ -1871,6 +1874,12 @@ def get_weekend_status() -> Dict[str, Any]:
         'research_progress': {},
         'started_at': None,
         'timeline': [],  # For visual timeline display
+        # Unified scheduler fields
+        'unified_scheduler': False,
+        'operating_mode': None,
+        'budget_type': None,
+        'hours_remaining': None,
+        'budget_pct': None,
     }
 
     # Check if it's actually the weekend (or Friday after 4pm)
@@ -1927,21 +1936,57 @@ def get_weekend_status() -> Dict[str, Any]:
             with open(log_path, 'r') as f:
                 lines = f.readlines()[-200:]
 
-            # Patterns to match
+            # Unified Scheduler patterns (check first)
+            unified_mode_pattern = re.compile(r'Extended window: mode=(\w+)')
+            unified_budget_pattern = re.compile(r'type=(\w+),\s*([\d.]+)h remaining \((\d+)%\)')
+            unified_hours_pattern = re.compile(r'No tasks ready - ([\d.]+)h until trading')
+
+            # Legacy patterns
             sub_phase_pattern = re.compile(r'Weekend phase active - sub-phase: (\w+)')
             weekend_task_pattern = re.compile(r'Weekend sub-phase transition: \w+ -> (\w+)')
             task_complete_pattern = re.compile(r'Task (\w+) completed')
             research_pattern = re.compile(r'Starting weekend research|Launching weekend research')
 
             for line in reversed(lines):
-                # Get current sub-phase
-                if status['sub_phase'] is None:
+                # Check for Unified Scheduler mode first
+                if not status['unified_scheduler']:
+                    match = unified_mode_pattern.search(line)
+                    if match:
+                        status['unified_scheduler'] = True
+                        status['operating_mode'] = match.group(1)
+                        # Map mode to display
+                        mode_display = {
+                            'trading': 'Trading',
+                            'research': 'Research',
+                            'prep': 'Pre-Week Prep',
+                        }
+                        status['sub_phase_display'] = mode_display.get(
+                            status['operating_mode'],
+                            status['operating_mode'].title()
+                        )
+
+                # Get unified scheduler budget info
+                if status['unified_scheduler'] and status['budget_type'] is None:
+                    match = unified_budget_pattern.search(line)
+                    if match:
+                        status['budget_type'] = match.group(1)
+                        status['hours_remaining'] = float(match.group(2))
+                        status['budget_pct'] = int(match.group(3))
+
+                # Get hours until trading (for prep mode)
+                if status['unified_scheduler'] and status['hours_remaining'] is None:
+                    match = unified_hours_pattern.search(line)
+                    if match:
+                        status['hours_remaining'] = float(match.group(1))
+
+                # Legacy: Get current sub-phase (only if not using unified scheduler)
+                if not status['unified_scheduler'] and status['sub_phase'] is None:
                     match = sub_phase_pattern.search(line)
                     if match:
                         status['sub_phase'] = match.group(1)
 
-                # Get sub-phase from transition
-                if status['sub_phase'] is None:
+                # Legacy: Get sub-phase from transition
+                if not status['unified_scheduler'] and status['sub_phase'] is None:
                     match = weekend_task_pattern.search(line)
                     if match:
                         status['sub_phase'] = match.group(1)
@@ -3038,7 +3083,10 @@ def create_orchestrator_status_card():
 
 
 def create_weekend_status_card():
-    """Create weekend phase status card with timeline and control panel."""
+    """Create extended window status card with timeline and control panel.
+
+    Supports both weekend research and overnight/holiday windows via Unified Scheduler.
+    """
     # Get available strategies for multi-select
     from config import STRATEGIES
     strategy_options = [
@@ -3050,7 +3098,7 @@ def create_weekend_status_card():
         dbc.CardHeader([
             html.H5([
                 html.I(className="fas fa-flask me-2 text-info"),
-                "Weekend Research Phase"
+                "Extended Research Window"
             ], className="mb-0 d-inline"),
             dbc.Button(
                 html.I(className="fas fa-cog"),
@@ -5695,9 +5743,145 @@ def render_orchestrator_status():
         ])
 
 
+def render_unified_scheduler_status(weekend: dict):
+    """Render Unified Scheduler status with budget-aware display.
+
+    Shows operating mode, budget type, hours remaining, and progress bar.
+    """
+    mode = weekend.get('operating_mode', 'unknown')
+    budget_type = weekend.get('budget_type', '')
+    hours_remaining = weekend.get('hours_remaining')
+    budget_pct = weekend.get('budget_pct', 0)
+
+    # Mode badge styling
+    mode_styles = {
+        'trading': {'icon': 'fa-chart-line', 'color': 'success', 'label': 'Trading'},
+        'research': {'icon': 'fa-flask', 'color': 'info', 'label': 'Research'},
+        'prep': {'icon': 'fa-clock', 'color': 'warning', 'label': 'Pre-Week Prep'},
+    }
+    style = mode_styles.get(mode, {'icon': 'fa-question', 'color': 'secondary', 'label': mode.title()})
+
+    # Budget type display
+    budget_labels = {
+        'overnight': 'Overnight',
+        'weekend': 'Weekend',
+        'holiday': 'Holiday',
+        'holiday_weekend': 'Holiday Weekend',
+    }
+    budget_label = budget_labels.get(budget_type, budget_type.replace('_', ' ').title() if budget_type else 'Unknown')
+
+    # Build hours display
+    hours_display = None
+    if hours_remaining is not None:
+        if hours_remaining >= 1:
+            hours_text = f"{hours_remaining:.1f}h remaining"
+        else:
+            minutes = int(hours_remaining * 60)
+            hours_text = f"{minutes}m remaining"
+
+        # Progress bar color based on budget remaining
+        if budget_pct >= 50:
+            bar_color = "success"
+        elif budget_pct >= 20:
+            bar_color = "info"
+        elif budget_pct >= 5:
+            bar_color = "warning"
+        else:
+            bar_color = "danger"
+
+        hours_display = html.Div([
+            html.Div([
+                html.Span(hours_text, className="small"),
+                html.Span(f" ({budget_pct}%)", className="small text-muted"),
+            ], className="mb-1"),
+            dbc.Progress(
+                value=budget_pct,
+                color=bar_color,
+                style={"height": "8px"},
+                className="mb-2"
+            ),
+        ])
+
+    # Research progress (reuse existing logic)
+    research_info = []
+    research_status = weekend.get('research_status')
+    research_progress = weekend.get('research_progress', {})
+
+    if research_status == 'running' and research_progress:
+        research_phase = research_progress.get('phase', 'optimization')
+        phase_labels = {'optimization': 'Parameter Optimization', 'discovery': 'Strategy Discovery', 'adaptive': 'Adaptive GA'}
+        research_info.append(
+            html.Div([
+                html.I(className="fas fa-dna fa-spin text-warning me-2"),
+                html.Span(phase_labels.get(research_phase, research_phase), className="text-warning small"),
+            ], className="mb-1")
+        )
+
+        current_strat = research_progress.get('current_strategy', '')
+        gen = research_progress.get('generation', 0)
+        total_gen = research_progress.get('total_generations', 0)
+
+        if current_strat:
+            research_info.append(
+                html.Div([
+                    html.Span("Strategy: ", className="text-muted small"),
+                    html.Span(current_strat.replace('_', ' ').title(), className="small"),
+                ], className="mb-1")
+            )
+
+        if gen > 0:
+            progress_text = f"Gen {gen}/{total_gen}" if total_gen else f"Gen {gen}"
+            research_info.append(
+                html.Span(progress_text, className="small text-muted")
+            )
+
+    elif research_status == 'running':
+        research_info.append(
+            html.Div([
+                html.I(className="fas fa-cog fa-spin text-warning me-2"),
+                html.Span("Research running...", className="text-warning small"),
+            ])
+        )
+
+    return html.Div([
+        # Mode and budget type badges
+        html.Div([
+            html.Span([
+                html.I(className=f"fas {style['icon']} me-1"),
+                style['label']
+            ], className=f"badge bg-{style['color']} me-2"),
+            html.Span(budget_label, className="badge bg-secondary") if budget_type else None,
+        ], className="mb-3"),
+
+        # Hours remaining with progress bar (or mode-appropriate message)
+        hours_display if hours_display else html.Div([
+            html.Span(
+                "Waiting for market open..." if mode == 'prep' else "Calculating budget...",
+                className="text-muted small"
+            ),
+        ], className="mb-2"),
+
+        # Research progress
+        html.Div(research_info) if research_info else None,
+
+        # Footer note
+        html.Div([
+            html.I(className="fas fa-info-circle me-1"),
+            html.Span("Unified Scheduler", className="text-muted"),
+        ], className="small text-muted mt-2"),
+    ])
+
+
 def render_weekend_status():
-    """Render weekend phase status with visual timeline and research progress."""
+    """Render weekend/extended window status with visual timeline and research progress.
+
+    Supports both legacy WeekendSubPhase timeline and new Unified Scheduler mode.
+    """
     weekend = get_weekend_status()
+
+    # Unified Scheduler mode - show budget-aware display
+    if weekend['unified_scheduler']:
+        return render_unified_scheduler_status(weekend)
 
     if not weekend['is_weekend'] and not weekend['sub_phase']:
         return html.Div([
