@@ -5780,11 +5780,12 @@ def render_unified_scheduler_status(weekend: dict):
             hours_text = f"{minutes}m remaining"
 
         # Progress bar color based on budget remaining
-        if budget_pct >= 50:
+        pct = budget_pct if budget_pct is not None else 0
+        if pct >= 50:
             bar_color = "success"
-        elif budget_pct >= 20:
+        elif pct >= 20:
             bar_color = "info"
-        elif budget_pct >= 5:
+        elif pct >= 5:
             bar_color = "warning"
         else:
             bar_color = "danger"
@@ -5792,10 +5793,10 @@ def render_unified_scheduler_status(weekend: dict):
         hours_display = html.Div([
             html.Div([
                 html.Span(hours_text, className="small"),
-                html.Span(f" ({budget_pct}%)", className="small text-muted"),
+                html.Span(f" ({pct}%)", className="small text-muted") if budget_pct is not None else None,
             ], className="mb-1"),
             dbc.Progress(
-                value=budget_pct,
+                value=pct,
                 color=bar_color,
                 style={"height": "8px"},
                 className="mb-2"
