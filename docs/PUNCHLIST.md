@@ -31,6 +31,29 @@
 
 ---
 
+## Current Focus: 24-Hour Uptime
+
+**Goal:** Achieve 24+ hours continuous orchestrator uptime (never hit before)
+
+**Current Session:**
+- Started: Jan 15 20:59:55 PT
+- Target: Jan 16 20:59:55 PT
+
+**Jan 15 Changes:**
+- Disabled software watchdog (was causing 9 restarts in 2 days by killing legitimate research)
+- Protection still in place: systemd Restart=on-failure, Linux OOM killer, hardware watchdog
+
+**Uptime History (longest was 10.5 hours):**
+| Date | Duration | Cause of End |
+|------|----------|--------------|
+| Jan 14 10:25-13:10 | 2h 45m | Watchdog |
+| Jan 14 14:33-21:08 | 6h 35m | Watchdog |
+| Jan 14 22:14-Jan 15 08:43 | **10h 29m** | Unknown |
+| Jan 15 08:56-14:42 | 5h 46m | Unknown |
+| Jan 15 20:59-ongoing | **TBD** | - |
+
+---
+
 ## BUGS
 
 ### P0 - Critical (Blocks Progress)

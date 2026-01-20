@@ -22,7 +22,7 @@ import logging
 import argparse
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Callable
@@ -243,6 +243,10 @@ class OrchestratorState:
     weekend_config: Dict[str, Any] = field(default_factory=dict)  # Runtime config from dashboard
     weekend_research_progress: Dict[str, Any] = field(default_factory=dict)  # Generation, strategy, etc.
     last_phase_transition: Optional[datetime] = None  # For settle period tracking
+
+    # Holiday state
+    is_holiday: bool = False  # True if today is a market holiday
+    last_holiday_check_date: Optional[date] = None  # Date when holiday flag was last checked
 
 
 class DailyOrchestrator:
@@ -631,6 +635,10 @@ class DailyOrchestrator:
 
         # Friday after market close until Monday pre-market
         if weekday == 4 and now.hour >= 17:
+            return MarketPhase.WEEKEND
+
+        # Holiday check - treat holidays like weekends for extended research window
+        if self.state.is_holiday:
             return MarketPhase.WEEKEND
 
         current_time = now.hour * 60 + now.minute
@@ -1263,8 +1271,8 @@ class DailyOrchestrator:
             # 4. Check for market holiday
             logger.info("Step 4: Checking market calendar...")
             try:
-                is_holiday = self._is_market_holiday()
-                if is_holiday:
+                self.state.is_holiday = self._is_market_holiday()
+                if self.state.is_holiday:
                     logger.warning("TODAY IS A MARKET HOLIDAY - Trading will be skipped")
                 else:
                     logger.info("Market is open today")
@@ -3944,6 +3952,16 @@ class DailyOrchestrator:
         mode_info = self._task_scheduler.get_current_mode()
         mode = mode_info.get("mode", "prep")
 
+        # Holiday detection: if research mode with >24h remaining and research was already run,
+        # clear the completed status to allow research to restart
+        calendar = mode_info.get("calendar", {})
+        hours_until = calendar.get("hours_until_trading", 0)
+        if mode == "research" and hours_until > 24:
+            if "run_weekend_research" in self.state.weekend_tasks_completed:
+                logger.info(f"Holiday detected ({hours_until:.1f}h until trading) - allowing research restart")
+                self.state.weekend_tasks_completed.remove("run_weekend_research")
+                self.state.weekend_research_progress = {}
+
         # Log mode info for dashboard visibility
         if mode == "research":
             budget = mode_info.get("budget", {})
@@ -5069,6 +5087,15 @@ class DailyOrchestrator:
 
         try:
             while not self.shutdown_event.is_set():
+                # Refresh holiday flag at midnight (date change detection)
+                today = datetime.now(self.tz).date()
+                if self.state.last_holiday_check_date != today:
+                    old_holiday = self.state.is_holiday
+                    self.state.is_holiday = self._is_market_holiday()
+                    self.state.last_holiday_check_date = today
+                    if old_holiday != self.state.is_holiday:
+                        logger.info(f"Date changed to {today}: is_holiday={self.state.is_holiday}")
+
                 # Determine current phase
                 if force_phase:
                     phase_map = {
@@ -5115,6 +5142,11 @@ class DailyOrchestrator:
                         self.state.errors_today = []
                         self.state.daily_stats = {}
                         self.state.phase_tasks_completed = {}  # Reset per-phase tracking
+
+                        # Refresh holiday flag for today
+                        self.state.is_holiday = self._is_market_holiday()
+                        if self.state.is_holiday:
+                            logger.info("Today is a market holiday - will use extended research window")
 
                         # Reset weekend state for next weekend
                         if previous_phase == MarketPhase.WEEKEND:
@@ -5163,9 +5195,20 @@ class DailyOrchestrator:
                         if self._hardware:
                             self._update_hardware_display(current_phase)
 
-                        # If weekend is complete, sleep until Monday
+                        # If weekend is complete, check for holiday extension
                         if self.state.weekend_sub_phase == WeekendSubPhase.COMPLETE:
                             time_to_next = self.time_until_next_phase()
+                            hours_to_trading = time_to_next.total_seconds() / 3600
+
+                            # If >30 hours until trading (normal Sunday night is ~12-15h),
+                            # there's likely a holiday - restart research
+                            if hours_to_trading > 30:
+                                logger.info(f"Holiday detected ({hours_to_trading:.1f}h until trading) - restarting research")
+                                # Reset to research phase to run more optimization
+                                self.state.weekend_sub_phase = WeekendSubPhase.RESEARCH
+                                self.state.weekend_research_progress = {}  # Clear progress to allow restart
+                                continue
+
                             logger.info(f"Weekend tasks complete - ready for Monday ({time_to_next})")
                             sleep_seconds = min(time_to_next.total_seconds(), 3600)
                             self._interruptible_sleep(sleep_seconds)
@@ -5234,12 +5277,10 @@ class DailyOrchestrator:
             self.shutdown_event.wait(sleep_chunk)
             elapsed += sleep_chunk
 
-            # Update display during market hours for live price tracking
+            # Update display during all phases (portfolio/positions always relevant)
             if self._hardware and not self.shutdown_event.is_set():
                 current_phase = self.get_current_phase()
-                if current_phase in (MarketPhase.MARKET_OPEN, MarketPhase.INTRADAY_OPEN,
-                                     MarketPhase.INTRADAY_ACTIVE, MarketPhase.PRE_MARKET):
-                    self._update_hardware_display(current_phase)
+                self._update_hardware_display(current_phase)
 
     def _update_hardware_display(self, current_phase: MarketPhase) -> None:
         """Update LCD display with current system data."""

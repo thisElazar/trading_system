@@ -208,7 +208,7 @@ def evaluate_genes_parallel(genes: dict) -> float:
     except Exception as e:
         return 0.0
 
-def setup_parallel_fitness_context(strategy_name: str, backtester, data: dict, 
+def setup_parallel_fitness_context(strategy_name: str, backtester, data: dict,
                                    vix_data=None, train_data=None, test_data=None,
                                    train_vix=None, test_vix=None, wf_enabled=False,
                                    degradation_threshold=0.2):
@@ -226,6 +226,32 @@ def setup_parallel_fitness_context(strategy_name: str, backtester, data: dict,
         'degradation_threshold': degradation_threshold,
         'backtester': None,  # Don't store - create fresh in workers
     }
+
+
+def clear_parallel_fitness_context():
+    """
+    Clear the parallel fitness context to free memory.
+
+    Call this after each strategy evolution to allow gc to reclaim
+    the train/test data copies. This prevents memory accumulation
+    across multiple strategy evolutions.
+
+    Memory savings: ~200-400MB per strategy (train/test data copies).
+    """
+    global _parallel_fitness_context
+    _parallel_fitness_context = {
+        'strategy_name': None,
+        'train_data': None,
+        'test_data': None,
+        'train_vix': None,
+        'test_vix': None,
+        'full_data': None,
+        'full_vix': None,
+        'wf_enabled': False,
+        'degradation_threshold': 0.2,
+        'backtester': None,
+    }
+    gc.collect()
 
 
 import numpy as np
@@ -1643,7 +1669,8 @@ class NightlyResearchEngine:
                     skipped_count += 1
                     continue
 
-                df = df.copy()
+                # Note: normalize_dataframe() already does .copy() internally,
+                # so we don't need to copy here - avoids ~200MB memory duplication
 
                 # Ensure datetime index
                 if 'timestamp' in df.columns:
@@ -1943,6 +1970,8 @@ class NightlyResearchEngine:
                         except Exception as e:
                             logger.error(f"{strategy}: Exception - {e}")
                             errors.append(f"{strategy}: {e}")
+                # Clear parallel context after all parallel strategies complete
+                clear_parallel_fitness_context()
             else:
                 # Sequential fallback
                 for strategy in self.strategies:
@@ -1957,6 +1986,10 @@ class NightlyResearchEngine:
                             improvements += 1
                     else:
                         errors.append(f"{strategy}: Evolution failed")
+
+                    # Clear parallel context after each strategy to free train/test copies
+                    # This prevents memory accumulation across strategy evolutions (~200-400MB each)
+                    clear_parallel_fitness_context()
 
             # Intervention checkpoint: Apply GA results
             if improvements > 0:
@@ -1973,7 +2006,8 @@ class NightlyResearchEngine:
                     # Note: Results are already saved by evolve_strategy, this is informational
 
             # Clear memory between phases to prevent OOM during long research runs
-            gc.collect()
+            # Ensure parallel context is cleared (may already be done per-strategy)
+            clear_parallel_fitness_context()
             logger.info("Memory cleared after Phase 1")
 
         # ====================================================================
@@ -2013,9 +2047,9 @@ class NightlyResearchEngine:
 
             # Clear memory between phases to prevent OOM during long research runs
             # Aggressively clear caches to reclaim memory before Phase 3
+            clear_parallel_fitness_context()
             if hasattr(self, 'data_manager') and hasattr(self.data_manager, 'clear_cache'):
                 self.data_manager.clear_cache()
-            gc.collect()
             logger.info("Memory cleared after Phase 2")
 
         # ====================================================================
@@ -2073,7 +2107,7 @@ class NightlyResearchEngine:
                 errors.append(f"Adaptive GA: {adaptive_results.get('error', 'Unknown error')}")
 
             # Clear memory after Phase 3 to prevent OOM during long research runs
-            gc.collect()
+            clear_parallel_fitness_context()
             logger.info("Memory cleared after Phase 3")
 
         # Summary

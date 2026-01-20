@@ -714,13 +714,21 @@ class Backtester:
             List of BacktestResult for each test window
         """
         results = []
-        
-        # Get date range
+
+        # Get date range - only include datetime-like indices
         all_dates = set()
         for df in data.values():
-            all_dates.update(df.index.tolist())
+            if isinstance(df.index, pd.DatetimeIndex):
+                all_dates.update(df.index.tolist())
+            elif hasattr(df.index[0], 'year'):  # Check if datetime-like
+                all_dates.update(df.index.tolist())
+
+        if not all_dates:
+            logger.warning("No valid datetime indices found in data")
+            return results
+
         all_dates = sorted(all_dates)
-        
+
         if len(all_dates) < train_days + test_days:
             logger.warning("Insufficient data for walk-forward analysis")
             return results

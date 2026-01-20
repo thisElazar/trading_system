@@ -911,10 +911,11 @@ class ScreenController:
 
                     # Get the MOST RECENT ga_history entry (current strategy being evolved)
                     # Use generation DESC as tiebreaker when multiple gens have same timestamp
+                    # Exclude generation=-1 entries (final best markers)
                     cursor = conn.execute("""
                         SELECT strategy, generation, best_fitness, created_at
                         FROM ga_history
-                        WHERE run_date = ?
+                        WHERE run_date = ? AND generation >= 0
                         ORDER BY created_at DESC, generation DESC
                         LIMIT 1
                     """, (today,))
@@ -1068,7 +1069,7 @@ class ScreenController:
                         cursor = conn.execute("""
                             SELECT strategy, generation, best_fitness
                             FROM ga_history
-                            WHERE run_date = ?
+                            WHERE run_date = ? AND generation >= 0
                             ORDER BY best_fitness DESC
                             LIMIT 1
                         """, (today,))
@@ -1105,13 +1106,14 @@ class ScreenController:
                             })
 
                 # Always fetch summary stats for page 2 (regardless of status)
+                # Exclude generation=-1 entries (final best markers)
                 today = date.today().isoformat()
                 cursor = conn.execute("""
                     SELECT strategy,
                            MAX(generation) as max_gen,
                            MAX(best_fitness) as best_sharpe
                     FROM ga_history
-                    WHERE run_date = ?
+                    WHERE run_date = ? AND generation >= 0
                     GROUP BY strategy
                     ORDER BY best_sharpe DESC
                 """, (today,))

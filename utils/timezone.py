@@ -22,7 +22,7 @@ Usage:
 """
 
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from typing import Union, Optional
 import pytz
 
@@ -368,36 +368,103 @@ RESEARCH_STOP_TIME_SUNDAY = (19, 30)   # 7:30 PM ET - stop Sunday evening before
 
 def is_research_allowed() -> bool:
     """
-    Check if research is currently allowed based on time boundaries.
+    Check if research is currently allowed based on time until next trading day.
 
-    Research windows (all times in Eastern):
-    - Saturday: All day (00:00-23:59)
-    - Sunday: 00:00-19:30 (before futures open)
-    - Weekdays: 00:00-07:30 and 17:00-23:59 (before/after market +buffer)
+    Logic:
+    - Find the next trading day (skipping weekends and holidays)
+    - Calculate hours until market open (9:30 AM ET)
+    - If >14 hours until market: research allowed (extended window)
+    - If 2-14 hours: stop at 7:30 PM ET (prep time before futures/pre-market)
+    - If <2 hours: no research (too close to market)
+
+    This handles all cases uniformly:
+    - Normal weekends (Sat-Sun)
+    - 3-day weekends (Fri or Mon holiday)
+    - Mid-week holidays
+    - Multi-day holiday stretches
 
     Returns:
         True if research is allowed now, False otherwise
     """
     now = now_eastern()
-    weekday = now.weekday()  # 0=Mon, 5=Sat, 6=Sun
     hour, minute = now.hour, now.minute
     current_minutes = hour * 60 + minute
 
-    # Saturday: always allowed
-    if weekday == 5:
+    # Find next trading day
+    next_trading = _get_next_trading_day(now.date())
+
+    # Calculate hours until market open (9:30 AM ET)
+    market_open = datetime(
+        next_trading.year, next_trading.month, next_trading.day,
+        9, 30, tzinfo=TZ_EASTERN
+    )
+    hours_until_market = (market_open - now).total_seconds() / 3600
+
+    # Extended window (>14 hours): always allowed
+    # This covers: all of Saturday, most of Sunday, holiday days, overnight after 5 PM
+    if hours_until_market > 14:
         return True
 
-    # Sunday: allowed until 7:30 PM ET (before futures open at 8 PM)
-    if weekday == 6:
-        stop_minutes = RESEARCH_STOP_TIME_SUNDAY[0] * 60 + RESEARCH_STOP_TIME_SUNDAY[1]
-        return current_minutes < stop_minutes
+    # Close to market (<2 hours): never allowed
+    if hours_until_market < 2:
+        return False
 
-    # Weekday (Mon-Fri):
-    # Allowed if before 7:30 AM OR after 5:00 PM
-    stop_minutes = RESEARCH_STOP_TIME_WEEKDAY[0] * 60 + RESEARCH_STOP_TIME_WEEKDAY[1]
-    start_minutes = RESEARCH_START_TIME_WEEKDAY[0] * 60 + RESEARCH_START_TIME_WEEKDAY[1]
+    # Moderate window (2-14 hours): check time of day
+    # Stop at 7:30 PM ET (before futures open at 8 PM)
+    stop_minutes = RESEARCH_STOP_TIME_SUNDAY[0] * 60 + RESEARCH_STOP_TIME_SUNDAY[1]
+    if current_minutes >= stop_minutes:
+        return False
 
-    return current_minutes < stop_minutes or current_minutes >= start_minutes
+    # Morning before market: stop at 7:30 AM
+    morning_stop = RESEARCH_STOP_TIME_WEEKDAY[0] * 60 + RESEARCH_STOP_TIME_WEEKDAY[1]
+    if current_minutes >= morning_stop and hours_until_market < 3:
+        return False
+
+    return True
+
+
+def _get_next_trading_day(from_date: date) -> date:
+    """
+    Get the next trading day (skipping weekends and holidays).
+
+    Args:
+        from_date: Starting date
+
+    Returns:
+        Next date when market is open
+    """
+    check = from_date
+    # Look ahead up to 10 days (handles long holiday stretches)
+    for _ in range(10):
+        check = check + timedelta(days=1)
+        weekday = check.weekday()
+        # Skip weekends (5=Sat, 6=Sun)
+        if weekday >= 5:
+            continue
+        # Skip holidays
+        if _is_market_holiday(check):
+            continue
+        return check
+    # Fallback (shouldn't happen)
+    return from_date + timedelta(days=1)
+
+
+def _is_market_holiday(check_date: date) -> bool:
+    """Check if a date is a US market holiday."""
+    # 2026 NYSE holidays
+    NYSE_HOLIDAYS_2026 = [
+        date(2026, 1, 1),   # New Year's Day
+        date(2026, 1, 19),  # MLK Day
+        date(2026, 2, 16),  # Presidents Day
+        date(2026, 4, 3),   # Good Friday
+        date(2026, 5, 25),  # Memorial Day
+        date(2026, 6, 19),  # Juneteenth
+        date(2026, 7, 3),   # Independence Day (observed)
+        date(2026, 9, 7),   # Labor Day
+        date(2026, 11, 26), # Thanksgiving
+        date(2026, 12, 25), # Christmas
+    ]
+    return check_date in NYSE_HOLIDAYS_2026
 
 
 def get_research_deadline() -> Optional[datetime]:
