@@ -71,7 +71,8 @@ logger = logging.getLogger(__name__)
 # Default paths
 PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "fundamentals" / "fundamentals.parquet"
-DEFAULT_SYMBOLS_FILE = PROJECT_ROOT / "data" / "reference" / "small_cap_universe.txt"
+# Use combined universe (2467 symbols) - includes Russell 2000, S&P 500, Nasdaq 100
+DEFAULT_SYMBOLS_FILE = PROJECT_ROOT / "data" / "reference" / "combined_universe_constituents.json"
 
 
 # Sample small-cap symbols for testing (expand this list for production)
@@ -201,11 +202,28 @@ def download_fundamentals_batch(
 
 
 def load_symbols_from_file(filepath: Path) -> List[str]:
-    """Load symbols from a text file (one symbol per line)."""
+    """Load symbols from a text file (one symbol per line) or JSON file."""
     if not filepath.exists():
         logger.warning(f"Symbols file not found: {filepath}")
         return []
 
+    # Handle JSON files (e.g., russell2000_constituents.json)
+    if filepath.suffix.lower() == '.json':
+        import json
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        # Handle format: {"symbols": [...]} or {"index": "...", "symbols": [...]}
+        if isinstance(data, dict) and 'symbols' in data:
+            symbols = [s.upper() for s in data['symbols']]
+        elif isinstance(data, list):
+            symbols = [s.upper() for s in data]
+        else:
+            logger.warning(f"Unexpected JSON format in {filepath}")
+            return []
+        logger.info(f"Loaded {len(symbols)} symbols from {filepath}")
+        return symbols
+
+    # Handle text files (one symbol per line)
     with open(filepath, 'r') as f:
         symbols = [line.strip().upper() for line in f if line.strip()]
 

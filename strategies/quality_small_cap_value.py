@@ -119,9 +119,11 @@ class QualitySmallCapValueStrategy(LongOnlyStrategy):
     # ==========================================================================
     # These thresholds filter out the "junk" that plagues small-cap indices
     # Research: 35% of Russell 2000 is unprofitable - we exclude them all
+    # NOTE: D/E threshold relaxed from 0.6 to 3.0 - data shows most small-caps
+    # have D/E > 2.0, and strict threshold was eliminating all candidates
     MIN_ROA = 0.03            # 3% min ROA (was 2% - v2.0 stricter)
     MIN_PROFIT_MARGIN = 0.03  # 3% min margin (was 2% - v2.0 stricter)
-    MAX_DEBT_TO_EQUITY = 0.60 # 0.6x max D/E (was 0.8 - v2.0 conservative)
+    MAX_DEBT_TO_EQUITY = 3.0  # 3.0x max D/E (was 0.6 - relaxed to allow candidates)
 
     # ==========================================================================
     # VALUE THRESHOLD (Fama-French HML Factor)
@@ -629,10 +631,11 @@ class QualitySmallCapValueStrategy(LongOnlyStrategy):
 
 # Genetic algorithm parameter specs for optimization
 # Ranges based on academic research and practical constraints
+# NOTE: D/E range expanded to 1.0-5.0 to match actual small-cap data distributions
 OPTIMIZATION_PARAMS = [
     {'name': 'min_roa', 'min_val': 0.0, 'max_val': 0.05, 'step': 0.01},           # 0-5% ROA threshold
     {'name': 'min_profit_margin', 'min_val': 0.0, 'max_val': 0.05, 'step': 0.01}, # 0-5% margin threshold
-    {'name': 'max_debt_to_equity', 'min_val': 0.5, 'max_val': 1.5, 'step': 0.1},  # 0.5-1.5x D/E cap
+    {'name': 'max_debt_to_equity', 'min_val': 1.0, 'max_val': 5.0, 'step': 0.5},  # 1.0-5.0x D/E cap (expanded)
     {'name': 'value_percentile', 'min_val': 0.15, 'max_val': 0.35, 'step': 0.05}, # 15-35% value screen
     {'name': 'max_positions', 'min_val': 20, 'max_val': 50, 'step': 5},           # 20-50 positions
     {'name': 'max_single_position', 'min_val': 0.02, 'max_val': 0.05, 'step': 0.01}, # 2-5% max position

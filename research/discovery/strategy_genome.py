@@ -407,6 +407,11 @@ class GenomeFactory:
                     return tree
                 index = random.randrange(1, tree_len)
                 slice_ = tree.searchSubtree(index)
+                # Validate slice bounds before using (DEAP can return invalid slices)
+                if (slice_ is None or slice_.start is None or slice_.stop is None or
+                    slice_.start < 0 or slice_.stop > tree_len or slice_.start >= slice_.stop):
+                    logger.debug(f"Hoist skipped: invalid slice {slice_} for tree length {tree_len}")
+                    return tree
                 subtree = tree[slice_]
                 # Verify hoist preserves root type (critical for STGP)
                 try:

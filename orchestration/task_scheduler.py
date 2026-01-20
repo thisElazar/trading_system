@@ -648,46 +648,55 @@ class TaskScheduler:
         Returns:
             OperatingMode enum value.
         """
-        from daily_orchestrator import MarketPhase
-
         now = datetime.now(self.orchestrator.tz)
         phase = self.orchestrator.get_current_phase()
         calendar = self.get_market_calendar()
 
+        # Use phase.value for comparison to avoid circular import enum mismatch
+        phase_val = phase.value
+
         # Pre-market is always PREP mode
-        if phase == MarketPhase.PRE_MARKET:
+        if phase_val == "pre_market":
             return OperatingMode.PREP
 
         # Market hours = TRADING mode
-        if phase in (MarketPhase.MARKET_OPEN, MarketPhase.INTRADAY_OPEN,
-                     MarketPhase.INTRADAY_ACTIVE):
+        if phase_val in ("market_open", "intraday_open", "intraday_active"):
             return OperatingMode.TRADING
 
         # Post-market = PREP (end of day tasks)
-        if phase == MarketPhase.POST_MARKET:
+        if phase_val == "post_market":
             return OperatingMode.PREP
 
         # Weekend: check sub-phase timing
-        if phase == MarketPhase.WEEKEND:
+        if phase_val == "weekend":
             day = now.weekday()
             hour = now.hour
+            logger.info(f"WEEKEND_BRANCH: entered, day={day}, hour={hour}")
 
             # Sunday afternoon (14:00+) = PREP for Monday
+            # BUT if Monday is a holiday (>24h until trading), continue research
             if day == 6 and hour >= 14:
+                logger.info(f"SUNDAY_BRANCH: hours_until={calendar.hours_until_trading:.1f}, checking >24...")
+                if calendar.hours_until_trading > 24:
+                    # Monday is a holiday - continue research
+                    logger.info(f"HOLIDAY_RETURN: returning RESEARCH")
+                    return OperatingMode.RESEARCH
+                logger.info(f"NORMAL_RETURN: returning PREP")
                 return OperatingMode.PREP
 
             # Otherwise weekend = RESEARCH
+            logger.info(f"WEEKEND_DEFAULT: returning RESEARCH")
             return OperatingMode.RESEARCH
 
         # Overnight: check if close to pre-market
-        if phase == MarketPhase.OVERNIGHT:
+        if phase_val == "overnight":
             # If less than 1.5 hours until pre-market, switch to PREP
             if calendar.hours_until_trading < 1.5:
                 return OperatingMode.PREP
             return OperatingMode.RESEARCH
 
         # Evening: early evening is PREP, late evening is RESEARCH
-        if phase == MarketPhase.EVENING:
+        if phase_val == "evening":
             hour = now.hour
             if hour < 19:  # Before 7 PM
                 return OperatingMode.PREP
@@ -805,13 +814,24 @@ class TaskScheduler:
         pct_remaining = budget.budget_pct_remaining
         hours_remaining = budget.research_hours
 
+        # Holiday override: if this is a holiday weekend with lots of time remaining,
+        # skip cleanup phase and go straight to research (cleanup was done earlier)
+        if budget.budget_type == "holiday_weekend" and hours_remaining > 24:
+            logger.info(f"Holiday weekend with {hours_remaining:.1f}h remaining - prioritizing research")
+            return ["run_weekend_research"]
+
         # Cleanup phase (early in window, >80% budget)
+        # NOTE: If cleanup is done, fall through to research immediately
+        # rather than waiting for pct to drop below 80%
         if pct_remaining > 0.80:
-            return [
+            cleanup_tasks = [
                 "generate_weekly_report",
                 "backup_databases",
                 "vacuum_databases",
             ]
+            # Return cleanup tasks; orchestrator will skip completed ones
+            # and fall through to research via run_weekend_research below
+            return cleanup_tasks + ["run_weekend_research"]
 
         # Research phase (main work, 20%-80% budget)
         if pct_remaining > 0.20:
