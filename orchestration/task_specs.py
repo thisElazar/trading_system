@@ -65,7 +65,7 @@ TASK_SPECS = {
         estimated_minutes=0.5,
         max_runtime_minutes=2,
         memory_mb=100,
-        phases={"market_open"},
+        phases=set(),  # DISABLED - let strategies manage their own exits
         min_interval_minutes=5,
         requires_market_open=True,
     ),

@@ -1693,10 +1693,31 @@ class DailyOrchestrator:
 
             # Get exit config
             exit_config = INTRADAY_EXIT_CONFIG
-            tp_pct = exit_config.get("take_profit_pct", 0.10)
-            sl_pct = exit_config.get("stop_loss_pct", 0.08)
+            fallback_tp_pct = exit_config.get("take_profit_pct", 0.10)
+            fallback_sl_pct = exit_config.get("stop_loss_pct", 0.08)
             exit_enabled = exit_config.get("enabled", True)
             log_checks = exit_config.get("log_checks", False)
+
+            # Load per-position TP/SL targets from database
+            position_targets = {}
+            try:
+                import sqlite3
+                db_path = DATABASES.get("trades", "db/trades.db")
+                with sqlite3.connect(db_path) as conn:
+                    cursor = conn.execute("""
+                        SELECT symbol, take_profit, stop_loss, entry_price
+                        FROM positions
+                        WHERE status = 'open'
+                    """)
+                    for row in cursor:
+                        symbol, tp, sl, db_entry = row
+                        position_targets[symbol] = {
+                            "take_profit": tp,
+                            "stop_loss": sl,
+                            "entry_price": db_entry
+                        }
+            except Exception as e:
+                logger.warning(f"Could not load position targets from DB: {e}")
 
             exits_executed = []
 
@@ -1725,12 +1746,28 @@ class DailyOrchestrator:
 
                     gain_pct = (current_price - entry_price) / entry_price
 
-                    if log_checks:
-                        logger.debug(f"{symbol}: entry=${entry_price:.2f}, current=${current_price:.2f}, gain={gain_pct:.2%}")
+                    # Get per-position targets or fall back to percentage-based
+                    targets = position_targets.get(symbol, {})
+                    tp_price = targets.get("take_profit")
+                    sl_price = targets.get("stop_loss")
 
-                    # Check take-profit
-                    if gain_pct >= tp_pct:
-                        logger.info(f"TAKE PROFIT: {symbol} hit +{gain_pct:.2%} (threshold: +{tp_pct:.0%})")
+                    if log_checks:
+                        logger.debug(f"{symbol}: entry=${entry_price:.2f}, current=${current_price:.2f}, "
+                                   f"gain={gain_pct:.2%}, tp=${tp_price}, sl=${sl_price}")
+
+                    # Check take-profit using per-position price target
+                    tp_triggered = False
+                    if tp_price and tp_price > 0:
+                        # Use the stored take_profit price
+                        tp_triggered = current_price >= tp_price
+                        tp_info = f"${tp_price:.2f}"
+                    else:
+                        # Fall back to percentage threshold
+                        tp_triggered = gain_pct >= fallback_tp_pct
+                        tp_info = f"+{fallback_tp_pct:.0%}"
+
+                    if tp_triggered:
+                        logger.info(f"TAKE PROFIT: {symbol} hit +{gain_pct:.2%} (target: {tp_info})")
                         exit_result = self._execute_exit(
                             symbol=symbol,
                             qty=qty,
@@ -1750,10 +1787,21 @@ class DailyOrchestrator:
                                 level="warning",
                                 title="Position Closed"
                             )
+                        continue  # Don't check SL if TP triggered
 
-                    # Check stop-loss
-                    elif gain_pct <= -sl_pct:
-                        logger.info(f"STOP LOSS: {symbol} hit {gain_pct:.2%} (threshold: -{sl_pct:.0%})")
+                    # Check stop-loss using per-position price target
+                    sl_triggered = False
+                    if sl_price and sl_price > 0:
+                        # Use the stored stop_loss price
+                        sl_triggered = current_price <= sl_price
+                        sl_info = f"${sl_price:.2f}"
+                    else:
+                        # Fall back to percentage threshold
+                        sl_triggered = gain_pct <= -fallback_sl_pct
+                        sl_info = f"-{fallback_sl_pct:.0%}"
+
+                    if sl_triggered:
+                        logger.info(f"STOP LOSS: {symbol} hit {gain_pct:.2%} (target: {sl_info})")
                         exit_result = self._execute_exit(
                             symbol=symbol,
                             qty=qty,
