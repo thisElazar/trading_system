@@ -169,24 +169,26 @@ logger = logging.getLogger("orchestrator")
 logger.setLevel(logging.INFO)
 logger.propagate = False  # Don't propagate to root logger (avoids duplicate logs)
 
-# Add file handler with rotation
-_file_handler = RotatingFileHandler(
-    LOG_DIR / "orchestrator.log",
-    maxBytes=LOG_MAX_BYTES,
-    backupCount=LOG_BACKUP_COUNT
-)
-_file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
-logger.addHandler(_file_handler)
+# Only add handlers if not already configured (prevents duplicates on re-import)
+if not logger.handlers:
+    # Add file handler with rotation
+    _file_handler = RotatingFileHandler(
+        LOG_DIR / "orchestrator.log",
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT
+    )
+    _file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
+    logger.addHandler(_file_handler)
 
-# Add console handler for systemd journal
-_console_handler = logging.StreamHandler()
-_console_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
-logger.addHandler(_console_handler)
+    # Add console handler for systemd journal
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
+    logger.addHandler(_console_handler)
 
-# Add database handler for errors/warnings (enables dashboard display)
-db_error_handler = DatabaseErrorHandler(min_level=logging.WARNING)
-db_error_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
-logger.addHandler(db_error_handler)
+    # Add database handler for errors/warnings (enables dashboard display)
+    db_error_handler = DatabaseErrorHandler(min_level=logging.WARNING)
+    db_error_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
+    logger.addHandler(db_error_handler)
 
 
 class MarketPhase(Enum):
@@ -212,13 +214,18 @@ class WeekendSubPhase(Enum):
 
 @dataclass
 class PhaseConfig:
-    """Configuration for each market phase."""
+    """Configuration for each market phase.
+
+    NOTE: Tasks are now defined in TASK_SPECS (orchestration/task_specs.py).
+    The `tasks` field is deprecated - use TASK_SPECS phases instead.
+    """
     start_hour: int
     start_minute: int
     end_hour: int
     end_minute: int
-    tasks: List[str] = field(default_factory=list)
     check_interval_seconds: int = 60
+    # DEPRECATED: Tasks are now sourced from TASK_SPECS
+    tasks: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -257,54 +264,47 @@ class DailyOrchestrator:
     """
 
     # Phase configurations (Eastern Time)
+    # NOTE: Tasks are now defined in TASK_SPECS (orchestration/task_specs.py)
+    # PHASE_CONFIGS only defines timing and check intervals.
     PHASE_CONFIGS = {
         MarketPhase.PRE_MARKET: PhaseConfig(
             start_hour=8, start_minute=0,
             end_hour=9, end_minute=30,
-            tasks=["stop_research_processes", "refresh_premarket_data", "refresh_intraday_data", "refresh_data", "system_check", "sync_positions_from_broker", "review_positions", "cancel_stale_orders", "update_regime_detection", "calculate_position_scalars", "load_live_strategies"],
             check_interval_seconds=60
         ),
         MarketPhase.INTRADAY_OPEN: PhaseConfig(
             start_hour=9, start_minute=30,
             end_hour=9, end_minute=35,
-            tasks=["start_intraday_stream", "detect_gaps"],
             check_interval_seconds=5  # Fast checking during open
         ),
         MarketPhase.INTRADAY_ACTIVE: PhaseConfig(
             start_hour=9, start_minute=35,
             end_hour=11, end_minute=30,
-            tasks=["monitor_intraday_positions"],
             check_interval_seconds=10
         ),
         MarketPhase.MARKET_OPEN: PhaseConfig(
             start_hour=9, start_minute=30,
             end_hour=16, end_minute=0,
-            # monitor_positions FIRST - TP/SL checks should never be blocked by slow scheduler
-            tasks=["monitor_positions", "run_scheduler", "check_risk_limits", "score_pending_signals", "process_shadow_trades"],
             check_interval_seconds=30
         ),
         MarketPhase.POST_MARKET: PhaseConfig(
             start_hour=16, start_minute=0,
             end_hour=17, end_minute=0,
-            tasks=["reconcile_positions", "calculate_pnl", "generate_daily_report", "send_alerts", "update_ensemble_correlations", "update_paper_metrics", "update_live_metrics", "run_promotion_pipeline"],
             check_interval_seconds=60
         ),
         MarketPhase.EVENING: PhaseConfig(
             start_hour=17, start_minute=0,
             end_hour=21, end_minute=30,
-            tasks=["refresh_eod_data", "cleanup_logs", "backup_databases", "cleanup_databases"],
             check_interval_seconds=300
         ),
         MarketPhase.OVERNIGHT: PhaseConfig(
             start_hour=21, start_minute=30,
             end_hour=8, end_minute=0,  # Next day
-            tasks=["run_nightly_research", "train_ml_regime_model"],
             check_interval_seconds=600
         ),
         MarketPhase.WEEKEND: PhaseConfig(
             start_hour=16, start_minute=0,  # Friday 4 PM start
             end_hour=20, end_minute=0,  # Sunday 8 PM end
-            tasks=["run_weekend_schedule"],  # Master dispatcher handles sub-phases
             check_interval_seconds=1800  # 30 min checks
         ),
     }
@@ -712,6 +712,47 @@ class DailyOrchestrator:
     def get_phase_config(self, phase: MarketPhase) -> PhaseConfig:
         """Get configuration for a phase."""
         return self.PHASE_CONFIGS.get(phase, PhaseConfig(0, 0, 0, 0))
+
+    def get_tasks_for_phase(self, phase: MarketPhase) -> List[Dict[str, Any]]:
+        """
+        Get tasks for a phase from TASK_SPECS (single source of truth).
+
+        Returns tasks sorted by priority (CRITICAL first, then HIGH, etc.)
+        with all metadata needed for execution decisions.
+
+        Args:
+            phase: The market phase to get tasks for
+
+        Returns:
+            List of task info dicts with name, spec, and execution rules
+        """
+        if TASK_SPECS is None:
+            # Fallback to legacy config if TASK_SPECS not available
+            config = self.get_phase_config(phase)
+            return [{"name": t, "spec": None} for t in config.tasks]
+
+        phase_key = phase.value
+        tasks = []
+
+        for task_name, spec in TASK_SPECS.items():
+            # Check if task is valid for this phase
+            if spec.phases and phase_key not in spec.phases:
+                continue
+
+            tasks.append({
+                "name": task_name,
+                "spec": spec,
+                "priority": spec.priority.value if spec.priority else 5,
+                "run_once_per_phase": spec.run_once_per_phase,
+                "run_once_per_day": spec.run_once_per_day,
+                "min_interval_minutes": spec.min_interval_minutes,
+                "requires_market_open": spec.requires_market_open,
+            })
+
+        # Sort by priority (lower = higher priority)
+        tasks.sort(key=lambda t: t["priority"])
+
+        return tasks
 
     def time_until_next_phase(self) -> timedelta:
         """Calculate time until the next phase transition."""
@@ -4930,8 +4971,8 @@ class DailyOrchestrator:
 
             return False
 
-    # Tasks that should only run ONCE per phase (initialization tasks)
-    # All other tasks run repeatedly based on check_interval_seconds
+    # DEPRECATED: Use TASK_SPECS run_once_per_phase attribute instead.
+    # Kept as fallback for tasks not yet in TASK_SPECS.
     ONCE_PER_PHASE_TASKS = {
         # Pre-market
         "run_scheduler",           # Start scheduler thread once
@@ -4967,6 +5008,9 @@ class DailyOrchestrator:
         """
         Run all tasks for a specific phase.
 
+        Uses TASK_SPECS as the single source of truth for which tasks run
+        in which phases, their intervals, and execution rules.
+
         Args:
             phase: The market phase to run tasks for
 
@@ -4981,32 +5025,63 @@ class DailyOrchestrator:
         if phase_key not in self.state.phase_tasks_completed:
             self.state.phase_tasks_completed[phase_key] = set()
 
-        logger.info(f"Running tasks for phase: {phase.value}")
+        # Get tasks from TASK_SPECS (single source of truth)
+        tasks = self.get_tasks_for_phase(phase)
 
-        for task_name in config.tasks:
-            # Check if this is a once-per-phase task that already ran
-            is_once_per_phase = task_name in self.ONCE_PER_PHASE_TASKS
+        if not tasks:
+            logger.debug(f"No tasks defined for phase: {phase.value}")
+            return results
+
+        logger.info(f"Running {len(tasks)} tasks for phase: {phase.value}")
+
+        for task_info in tasks:
+            task_name = task_info["name"]
+            spec = task_info.get("spec")
+
+            # Get execution rules from TASK_SPECS (or fallback to legacy)
+            is_once_per_phase = task_info.get("run_once_per_phase", task_name in self.ONCE_PER_PHASE_TASKS)
+            is_once_per_day = task_info.get("run_once_per_day", False)
+            min_interval_minutes = task_info.get("min_interval_minutes", 0)
+
+            # Check once-per-day constraint
+            if is_once_per_day and task_name in self.state.tasks_completed_today:
+                logger.debug(f"Skipping {task_name}, already completed today (once-per-day)")
+                results[task_name] = True
+                continue
+
+            # Check once-per-phase constraint
             if is_once_per_phase and task_name in self.state.phase_tasks_completed[phase_key]:
                 logger.debug(f"Skipping {task_name}, already completed this phase (once-per-phase)")
                 results[task_name] = True
                 continue
 
-            # Check if task was already run recently (within check interval)
-            # This applies to recurring tasks like monitor_positions
+            # Check minimum interval constraint
             last_run = self.state.last_task_run.get(task_name)
-            if last_run:
+            if last_run and min_interval_minutes > 0:
+                minutes_since = (datetime.now(self.tz) - last_run).total_seconds() / 60
+                if minutes_since < min_interval_minutes:
+                    logger.debug(f"Skipping {task_name}, ran {minutes_since:.1f}min ago (interval: {min_interval_minutes}min)")
+                    results[task_name] = True
+                    continue
+
+            # Fallback to phase check_interval if no spec interval
+            if last_run and min_interval_minutes == 0:
                 seconds_since = (datetime.now(self.tz) - last_run).total_seconds()
                 if seconds_since < config.check_interval_seconds:
                     logger.debug(f"Skipping {task_name}, ran {seconds_since:.0f}s ago")
                     results[task_name] = True
                     continue
 
+            # Execute the task
             result = self.run_task(task_name)
             results[task_name] = result
 
-            # Only mark once-per-phase tasks as completed
-            if result and is_once_per_phase:
-                self.state.phase_tasks_completed[phase_key].add(task_name)
+            # Track completion
+            if result:
+                if is_once_per_phase:
+                    self.state.phase_tasks_completed[phase_key].add(task_name)
+                if is_once_per_day:
+                    self.state.tasks_completed_today.append(task_name)
 
         return results
 
