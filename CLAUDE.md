@@ -51,15 +51,23 @@ Automated trading system on Raspberry Pi 5. Paper trading via Alpaca.
 |---------|--------------|-----|
 | No trades executing | Circuit breaker triggered | Check `circuit_breaker_state` table |
 | Orchestrator frozen | Memory pressure or deadlock | `sudo systemctl restart trading-orchestrator` |
+| Position not exiting at target | Was using global 10% threshold | Fixed: now uses per-position TP/SL from DB |
+| Pre-market refresh hung for hours | Alpaca API call with no timeout | Fixed: 30s timeout + 3 retries on all fetchers |
 | LCD showing stale data | Orchestrator not updating | Check service status |
 | Research not running | Wrong phase or disabled | Check ENABLE_* flags in config.py |
 | Watchdog crash loop | Systemd `WatchdogSec` without `sd_notify` | Remove `WatchdogSec` from service file |
 | "Nightly research failed" | Time boundary stop (expected) | Check if `stopped_early: True` - not a real failure |
 | "Could not get open positions" | Wrong method call | Use `execution_tracker.db.get_open_positions()` |
-| EOD refresh hangs | Slow/failed network | Timeouts added (15s/symbol, 30min overall) |
 | System reboot overnight | Memory pressure during research | LRU cache limits added, monitor with `free -h` |
 
-## Recent Fixes (Jan 14)
+## Recent Fixes (Jan 22)
+
+- **Position exits**: Now use per-position `take_profit`/`stop_loss` prices from DB (not global 10% threshold)
+- **Rapid gain scaler**: Disabled (was trimming positions prematurely)
+- **API timeouts**: Alpaca fetchers have 30s request timeout, 60s per-symbol limit, 3 retries with backoff
+- **Watchdog thresholds**: 98% memory (was 95%), 80% swap, 15-minute tolerance (was 5)
+
+## Previous Fixes (Jan 14)
 
 - **Watchdog service**: Removed `WatchdogSec=120` (script doesn't use sd_notify)
 - **Research exit codes**: Time boundary stop now returns success=True

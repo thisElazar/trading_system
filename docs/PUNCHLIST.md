@@ -1149,6 +1149,12 @@ python3 -c "from execution.alpaca_connector import AlpacaConnector; c = AlpacaCo
 | 2026-01-10 | **GP-013 RESOLVED** - Self-adaptive mutation rates: per-individual rates evolve with ES log-normal adaptation |
 | 2026-01-10 | **GP-014 RESOLVED** - Omega Ratio implemented in `fitness_utils.py` for non-normal distribution capture |
 | 2026-01-10 | **GP-017 RESOLVED** - BehaviorVector expanded to 10 dimensions: added recovery_time, profit_factor, sharpe_ratio |
+| 2026-01-22 | **BUG-008 FIXED** - Position exits now use per-position `take_profit`/`stop_loss` prices from DB instead of global 10% threshold |
+| 2026-01-22 | Exited 4 positions (COST, HII, LHX, STZ) that were above TP targets but missed by old logic (+$573.41 realized) |
+| 2026-01-22 | **RAPID GAIN SCALER DISABLED** - Was trimming positions prematurely; set `phases=set()` in task_specs.py |
+| 2026-01-22 | **BUG-009 FIXED** - Alpaca API fetchers had no timeout (caused 4.5hr freeze overnight); added 30s request timeout, 60s/symbol limit, 3 retries with exponential backoff |
+| 2026-01-22 | Updated `daily_bars.py` and `intraday_bars.py` with `retry_with_backoff` decorator and ThreadPoolExecutor timeout wrapper |
+| 2026-01-22 | **WATCHDOG TUNING** - Raised memory threshold 95%→98%, added swap monitoring (80%), increased tolerance 5→15 minutes |
 
 ---
 
