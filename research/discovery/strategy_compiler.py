@@ -64,6 +64,10 @@ class EvolvedStrategy(BaseStrategy):
         # Trees are stored in genome, nothing to pre-compile
         pass
 
+    # Maximum signals per evaluation - prevents memory exhaustion from degenerate strategies
+    # A strategy that triggers on > 10% of symbols is likely a bad genome
+    MAX_SIGNALS_PER_EVAL = 50
+
     def generate_signals(self,
                          data: Dict[str, pd.DataFrame],
                          current_positions: List[str] = None,
@@ -81,11 +85,20 @@ class EvolvedStrategy(BaseStrategy):
         """
         signals = []
         current_positions = current_positions or []
+        entry_count = 0  # Track how many symbols triggered entry
 
         for symbol, df in data.items():
             # Need enough history for indicators
             if len(df) < 50:
                 continue
+
+            # Safety: abort if we've generated too many signals (degenerate strategy)
+            if len(signals) >= self.MAX_SIGNALS_PER_EVAL:
+                logger.warning(
+                    f"Strategy {self.genome.genome_id} hit signal limit ({self.MAX_SIGNALS_PER_EVAL}) - "
+                    f"likely degenerate genome. Aborting signal generation."
+                )
+                break
 
             try:
                 # Check if we should enter
@@ -93,6 +106,7 @@ class EvolvedStrategy(BaseStrategy):
                     entry_signal = self._evaluate_entry(df)
 
                     if entry_signal:
+                        entry_count += 1
                         price = float(df['close'].iloc[-1])
                         position_pct = self._evaluate_position(df)
                         stop_pct = self._evaluate_stop_loss(df)

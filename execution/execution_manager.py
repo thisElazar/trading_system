@@ -271,6 +271,13 @@ class ExecutionManager:
         self._held_symbols_cache: Set[str] = set()  # Cached held symbols
         self._held_symbols_cache_time: datetime = datetime.min
 
+        # Pending approval tracking (fixes batch processing race condition)
+        # These counters track signals that have been APPROVED but not yet persisted
+        # to the database. This prevents multiple signals in a batch from all passing
+        # the position limit check before any positions are actually created.
+        self._pending_approval_count: int = 0  # Global pending approvals
+        self._pending_approval_by_strategy: Dict[str, int] = {}  # Per-strategy pending
+
         # Initialize database
         self._init_decision_logging()
 
@@ -408,6 +415,8 @@ class ExecutionManager:
         # 8. Final validation
         if decision.final_shares > 0:
             decision.approved = True
+            # Increment pending approval counters to prevent batch race conditions
+            self._increment_pending_approval(strategy_name)
             logger.info(f"Signal APPROVED: {symbol} {direction} x{decision.final_shares} via {route}")
         else:
             decision.rejection_reason = "Zero shares after sizing"
@@ -562,6 +571,56 @@ class ExecutionManager:
             else:
                 logger.debug(f"Order not filled: {symbol} removed from pending")
 
+    def _increment_pending_approval(self, strategy_name: str) -> None:
+        """
+        Increment pending approval counters after a signal is approved.
+
+        This prevents batch race conditions where multiple signals all pass
+        the position limit check before any positions are actually created.
+        Must be decremented when the position is persisted or signal fails.
+        """
+        with self._position_lock:
+            self._pending_approval_count += 1
+            self._pending_approval_by_strategy[strategy_name] = (
+                self._pending_approval_by_strategy.get(strategy_name, 0) + 1
+            )
+            logger.debug(
+                f"Pending approval incremented: global={self._pending_approval_count}, "
+                f"{strategy_name}={self._pending_approval_by_strategy[strategy_name]}"
+            )
+
+    def decrement_pending_approval(self, strategy_name: str) -> None:
+        """
+        Decrement pending approval counters after position is persisted or signal fails.
+
+        Call this after:
+        1. Position is successfully created in the database
+        2. Order fails to execute
+        3. Signal is abandoned for any reason
+        """
+        with self._position_lock:
+            self._pending_approval_count = max(0, self._pending_approval_count - 1)
+            current = self._pending_approval_by_strategy.get(strategy_name, 0)
+            if current > 0:
+                self._pending_approval_by_strategy[strategy_name] = current - 1
+            logger.debug(
+                f"Pending approval decremented: global={self._pending_approval_count}, "
+                f"{strategy_name}={self._pending_approval_by_strategy.get(strategy_name, 0)}"
+            )
+
+    def reset_pending_approvals(self) -> None:
+        """
+        Reset all pending approval counters.
+
+        Call this at the start of each trading day or after position sync.
+        """
+        with self._position_lock:
+            old_count = self._pending_approval_count
+            self._pending_approval_count = 0
+            self._pending_approval_by_strategy.clear()
+            if old_count > 0:
+                logger.info(f"Reset pending approvals: cleared {old_count} pending")
+
     def _score_signal(
         self,
         strategy_name: str,
@@ -636,12 +695,29 @@ class ExecutionManager:
         global_limit = self.config.max_positions
         strategy_limit = self.config.max_positions_per_strategy
 
-        # Check if at limits
-        at_global_limit = len(current_positions) >= global_limit
-        at_strategy_limit = len(strategy_positions) >= strategy_limit
+        # Include pending approvals in the count (fixes batch processing race condition)
+        # These are signals that have been approved but not yet persisted to the database
+        with self._position_lock:
+            pending_global = self._pending_approval_count
+            pending_strategy = self._pending_approval_by_strategy.get(strategy_name, 0)
+
+        effective_global_count = len(current_positions) + pending_global
+        effective_strategy_count = len(strategy_positions) + pending_strategy
+
+        # Check if at limits (including pending)
+        at_global_limit = effective_global_count >= global_limit
+        at_strategy_limit = effective_strategy_count >= strategy_limit
 
         decision.checks_performed['global_position_limit'] = not at_global_limit
         decision.checks_performed['strategy_position_limit'] = not at_strategy_limit
+
+        # Log effective counts for debugging
+        if at_global_limit or at_strategy_limit:
+            logger.info(
+                f"Position limit check: global={effective_global_count}/{global_limit} "
+                f"(+{pending_global} pending), strategy={effective_strategy_count}/{strategy_limit} "
+                f"(+{pending_strategy} pending)"
+            )
 
         # Case 1: Under limits - approve
         if not at_global_limit and not at_strategy_limit:
@@ -982,6 +1058,11 @@ class ExecutionManager:
             logger.error(f"Execution failed: {e}")
             result.success = False
             result.error = str(e)
+
+        finally:
+            # Always decrement pending approval counter after execution attempt
+            # This must happen regardless of success/failure to prevent counter drift
+            self.decrement_pending_approval(decision.strategy_name)
 
         return result
 

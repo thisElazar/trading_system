@@ -297,9 +297,12 @@ class ScreenController:
                         self._render_current_page()
 
                 # Button press detection (falling edge - button down)
+                # Only start timing if not already in a hold (prevents bounce from resetting timer)
                 if self._last_sw == 1 and sw == 0:
-                    self._button_press_time = now
-                    self._reset_feedback_given = False
+                    # Only reset timer if no active hold (prevents bounce during long press)
+                    if self._button_press_time == 0 or (now - self._button_press_time) > 0.5:
+                        self._button_press_time = now
+                        self._reset_feedback_given = False
 
                 # While button is held, check for 5-second threshold
                 if sw == 0 and self._button_press_time > 0:
@@ -326,6 +329,8 @@ class ScreenController:
                     else:
                         # Short click
                         self._on_click()
+                    # Reset timer after processing release
+                    self._button_press_time = 0
 
                 self._last_clk = clk
                 self._last_sw = sw

@@ -257,17 +257,34 @@ class SharedDataReader:
         info = self._metadata[key]
         shm = self._shared_blocks[key]
 
-        # Read array from shared memory
+        # Read array from shared memory (zero-copy view)
         arr = np.ndarray(tuple(info['shape']), dtype=info['dtype'], buffer=shm.buf)
 
-        # Reconstruct DataFrame
-        df = pd.DataFrame(arr.copy(), columns=info['columns'])  # Copy to avoid shared memory issues
+        # Identify timestamp column
+        timestamp_col = info['index_name'] if info['index_name'] in info['columns'] else 'timestamp'
+        ts_col_idx = info['columns'].index(timestamp_col) if timestamp_col in info['columns'] else None
 
-        # Convert timestamp column back to datetime
-        timestamp_col = info['index_name'] if info['index_name'] in df.columns else 'timestamp'
-        if timestamp_col in df.columns:
-            df[timestamp_col] = pd.to_datetime(df[timestamp_col], unit='s')
-            df = df.set_index(timestamp_col)
+        if ts_col_idx is not None:
+            # Extract timestamp column and convert to datetime index
+            ts_values = arr[:, ts_col_idx]
+            datetime_idx = pd.to_datetime(ts_values, unit='s')
+
+            # Create DataFrame from non-timestamp columns only (zero-copy slices)
+            data_cols = [c for c in info['columns'] if c != timestamp_col]
+            col_indices = [info['columns'].index(c) for c in data_cols]
+
+            # Build DataFrame column by column to preserve zero-copy views
+            df_data = {}
+            for i, col in zip(col_indices, data_cols):
+                col_arr = arr[:, i]
+                col_arr.flags.writeable = False  # Mark read-only
+                df_data[col] = col_arr
+
+            df = pd.DataFrame(df_data, index=pd.DatetimeIndex(datetime_idx, name=timestamp_col), copy=False)
+        else:
+            # No timestamp column - just create DataFrame directly
+            arr.flags.writeable = False
+            df = pd.DataFrame(arr, columns=info['columns'], copy=False)
 
         # LRU eviction before adding new entry
         if len(self._data_cache) >= self.MAX_CACHE_SIZE:

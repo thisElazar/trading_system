@@ -384,28 +384,33 @@ class StrategyScheduler:
             logger.info(f"SHADOW ONLY: {direction} {shares} {symbol} @ ${price:.2f} ({actual_strategy} not graduated)")
 
         # 4. Record in signal tracker for monitoring
-        self.tracker.record_signal_and_execute(
-            strategy_name=actual_strategy,
-            symbol=symbol,
-            direction=direction,
-            entry_price=price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            quantity=shares,
-            confidence=confidence,
-            metadata={
-                **metadata,
-                'alpaca_order_id': alpaca_order_id,
-                'shadow_trade_id': shadow_trade_id,
-                'execution_mode': 'hybrid_live' if is_graduated else 'shadow_only',
-                'execution_decision': {
-                    'conviction': decision.conviction,
-                    'win_probability': decision.win_probability,
-                    'route': decision.route,
-                    'is_graduated': is_graduated
+        try:
+            self.tracker.record_signal_and_execute(
+                strategy_name=actual_strategy,
+                symbol=symbol,
+                direction=direction,
+                entry_price=price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                quantity=shares,
+                confidence=confidence,
+                metadata={
+                    **metadata,
+                    'alpaca_order_id': alpaca_order_id,
+                    'shadow_trade_id': shadow_trade_id,
+                    'execution_mode': 'hybrid_live' if is_graduated else 'shadow_only',
+                    'execution_decision': {
+                        'conviction': decision.conviction,
+                        'win_probability': decision.win_probability,
+                        'route': decision.route,
+                        'is_graduated': is_graduated
+                    }
                 }
-            }
-        )
+            )
+        finally:
+            # Decrement pending approval counter now that position is persisted
+            # This must happen regardless of success/failure to prevent counter drift
+            exec_manager.decrement_pending_approval(actual_strategy)
 
     def _execute_shadow_trade(self, shadow_trader, strategy: str, symbol: str,
                                direction: str, price: float, shares: int) -> str:
