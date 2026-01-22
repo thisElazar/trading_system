@@ -1504,6 +1504,11 @@ class DailyOrchestrator:
 
             logger.info(f"Position sync complete: {new_count} new, {updated_count} updated, {closed_count} closed")
 
+            # Reset pending approval counters after sync to clear any stale state
+            # This ensures position limits are accurate at the start of each day
+            if hasattr(self, 'execution_manager') and self.execution_manager:
+                self.execution_manager.reset_pending_approvals()
+
             # Also store broker account equity for use by position sizing
             account = self.broker.get_account()
             if account:
@@ -3715,50 +3720,80 @@ class DailyOrchestrator:
             return False
 
     def _task_validate_candidates(self) -> bool:
-        """Run heavy validation on CANDIDATE strategies during off-hours.
+        """Run heavy validation via subprocess for memory isolation.
 
-        This is an opportunistic task that runs during OVERNIGHT/WEEKEND when:
-        1. Core research has completed
-        2. There's sufficient memory available
-        3. Time window allows for extended validation
+        This spawns validation in a separate process to prevent OOM crashes.
+        The subprocess runs walk-forward analysis and Monte Carlo tests with
+        memory safety features (800 symbol limit, stratified sampling, timeouts).
 
-        Heavy validation includes:
-        - Walk-forward analysis (4+ periods)
-        - Monte Carlo permutation tests (1000+ iterations)
-        - Out-of-sample verification
-
-        Strategies passing validation are promoted to VALIDATED status.
+        Validates both:
+        1. CANDIDATE strategies needing initial validation
+        2. VALIDATED strategies with placeholder metrics (0.5/0.5)
         """
+        import subprocess
+
         if not HAS_PROMOTION_PIPELINE or self.promotion_pipeline is None:
             logger.debug("Promotion pipeline not available")
             return True
 
         try:
-            # Check memory availability before heavy validation
+            # Check memory before spawning
             mem = psutil.virtual_memory()
             available_mb = mem.available // (1024 * 1024)
 
-            if available_mb < 1500:
-                logger.info(f"Skipping candidate validation - insufficient memory ({available_mb}MB available)")
+            if available_mb < 1000:
+                logger.info(f"Skipping validation - insufficient memory ({available_mb}MB available)")
                 return True
 
-            logger.info("Running heavy validation on candidate strategies...")
+            script_path = Path(__file__).parent / "scripts" / "validate_strategies_subprocess.py"
 
-            # Process promotions with heavy validation enabled
-            results = self.promotion_pipeline.process_all_promotions(skip_heavy_validation=False)
+            if not script_path.exists():
+                logger.error(f"Validation script not found: {script_path}")
+                return False
 
-            validated = results.get('validated', 0)
-            failed = results.get('validation_failed', 0)
-            promoted = results.get('promoted', 0)
+            # Validate CANDIDATE strategies first
+            logger.info("Spawning validation subprocess for candidates...")
+            result = subprocess.run(
+                [sys.executable, str(script_path), "--all-candidates", "--memory-limit", "1500"],
+                capture_output=True,
+                text=True,
+                timeout=1800  # 30 minute max
+            )
 
-            if validated > 0 or failed > 0:
-                logger.info(f"Candidate validation: {validated} validated, {failed} failed")
-            if promoted > 0:
-                logger.info(f"Promotion pipeline: {promoted} promoted")
+            if result.returncode == 0:
+                logger.info("Candidate validation subprocess completed successfully")
+            elif result.returncode == 2:
+                logger.warning("Candidate validation subprocess hit memory limit")
+            else:
+                logger.warning(f"Candidate validation subprocess exit code {result.returncode}")
+                if result.stderr:
+                    logger.debug(f"Stderr: {result.stderr[:500]}")
 
-            # Force garbage collection after heavy validation
+            # Then validate VALIDATED strategies with placeholder metrics
+            logger.info("Spawning validation subprocess for placeholder strategies...")
+            result = subprocess.run(
+                [sys.executable, str(script_path), "--validated-placeholders", "--memory-limit", "1500"],
+                capture_output=True,
+                text=True,
+                timeout=1800  # 30 minute max
+            )
+
+            if result.returncode == 0:
+                logger.info("Placeholder validation subprocess completed successfully")
+            elif result.returncode == 2:
+                logger.warning("Placeholder validation subprocess hit memory limit")
+            else:
+                logger.warning(f"Placeholder validation subprocess exit code {result.returncode}")
+                if result.stderr:
+                    logger.debug(f"Stderr: {result.stderr[:500]}")
+
+            # Force garbage collection
             gc.collect()
 
+            return True  # Don't fail the task even if validation fails
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Validation subprocess timed out after 30 minutes")
             return True
 
         except Exception as e:
@@ -5228,14 +5263,27 @@ class DailyOrchestrator:
                 elif mem_status['level'] == 'warning':
                     logger.warning(f"Memory warning: {mem_status['available_mb']:.0f}MB available ({mem_status['percent_used']:.0f}% used)")
 
-                # Run phase tasks (using TaskScheduler if enabled, otherwise legacy)
-                if self._task_scheduler is not None and USE_TASK_SCHEDULER:
-                    # TaskScheduler execution path (Phase 2+)
+                # Run phase tasks
+                # Market hours = simple, reliable legacy execution (CRITICAL for trading)
+                # Non-market hours = TaskScheduler for complex research scheduling
+                is_market_hours = current_phase in (
+                    MarketPhase.PRE_MARKET,
+                    MarketPhase.INTRADAY_OPEN,
+                    MarketPhase.INTRADAY_ACTIVE,
+                    MarketPhase.MARKET_OPEN,
+                    MarketPhase.POST_MARKET,
+                )
+
+                if is_market_hours:
+                    # Market hours: ALWAYS use legacy execution for reliability
+                    results = self.run_phase_tasks(current_phase)
+                elif self._task_scheduler is not None and USE_TASK_SCHEDULER:
+                    # Non-market hours: use TaskScheduler for research/overnight
                     if TASK_SCHEDULER_DEBUG:
                         logger.debug(f"TaskScheduler: Planning tasks for {current_phase.value}")
                     results = self._run_scheduler_tasks(current_phase)
                 else:
-                    # Legacy execution path
+                    # Fallback to legacy
                     results = self.run_phase_tasks(current_phase)
 
                 # Log results summary
