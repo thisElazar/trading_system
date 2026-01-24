@@ -1480,22 +1480,27 @@ class DailyOrchestrator:
         """
         Check if today is a US market holiday.
 
-        Returns:
-            True if market is closed for holiday
+        Returns True only for actual market holidays, NOT weekends.
+        Weekends are handled separately by get_current_phase().
         """
+        from datetime import date
+        today = date.today()
+
+        # Weekends are NOT holidays - they're handled separately
+        if today.weekday() >= 5:  # Saturday = 5, Sunday = 6
+            return False
+
         try:
             # Try to use Alpaca's calendar API
-            from datetime import date
             from alpaca.trading.requests import GetCalendarRequest
-            today = date.today()
 
             # Get calendar from broker's trading client
             request = GetCalendarRequest(start=today, end=today)
             calendar = self.broker.trading_client.get_calendar(request)
 
             if not calendar:
-                # No trading day returned = holiday
-                logger.info(f"No market calendar entry for {today} - likely holiday")
+                # No trading day returned on a weekday = holiday
+                logger.info(f"No market calendar entry for {today} (weekday) - holiday")
                 return True
 
             # Calendar returns trading days only
@@ -4076,13 +4081,13 @@ class DailyOrchestrator:
         mode_info = self._task_scheduler.get_current_mode()
         mode = mode_info.get("mode", "prep")
 
-        # Holiday detection: if research mode with >24h remaining and research was already run,
-        # clear the completed status to allow research to restart
+        # Extended window detection: if research mode with >24h remaining and research was already run,
+        # clear the completed status to allow research to restart (applies to weekends and holidays)
         calendar = mode_info.get("calendar", {})
         hours_until = calendar.get("hours_until_trading", 0)
         if mode == "research" and hours_until > 24:
             if "run_weekend_research" in self.state.weekend_tasks_completed:
-                logger.info(f"Holiday detected ({hours_until:.1f}h until trading) - allowing research restart")
+                logger.info(f"Extended window ({hours_until:.1f}h until trading) - allowing research restart")
                 self.state.weekend_tasks_completed.remove("run_weekend_research")
                 self.state.weekend_research_progress = {}
 
@@ -5353,15 +5358,15 @@ class DailyOrchestrator:
                         if self._hardware:
                             self._update_hardware_display(current_phase)
 
-                        # If weekend is complete, check for holiday extension
+                        # If weekend is complete, check for extended window
                         if self.state.weekend_sub_phase == WeekendSubPhase.COMPLETE:
                             time_to_next = self.time_until_next_phase()
                             hours_to_trading = time_to_next.total_seconds() / 3600
 
                             # If >30 hours until trading (normal Sunday night is ~12-15h),
-                            # there's likely a holiday - restart research
+                            # there's extra time (long weekend or holiday) - restart research
                             if hours_to_trading > 30:
-                                logger.info(f"Holiday detected ({hours_to_trading:.1f}h until trading) - restarting research")
+                                logger.info(f"Extended window ({hours_to_trading:.1f}h until trading) - restarting research")
                                 # Reset to research phase to run more optimization
                                 self.state.weekend_sub_phase = WeekendSubPhase.RESEARCH
                                 self.state.weekend_research_progress = {}  # Clear progress to allow restart

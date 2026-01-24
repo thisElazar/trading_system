@@ -398,8 +398,10 @@ class EvolutionEngine:
         Validate genome for degenerate patterns before backtesting.
 
         Checks:
-        1. Stop loss tree doesn't indicate "no stop" intent (> 50%)
-        2. Entry condition triggers on enough symbols (>= MIN_ENTRY_SYMBOLS)
+        1. Reject trivial trees (true, false, not_(not_(true)))
+        2. Require at least one vector primitive in entry tree (VGP mode)
+        3. Stop loss tree doesn't indicate "no stop" intent (> 50%)
+        4. Entry condition triggers on enough symbols (>= MIN_ENTRY_SYMBOLS)
 
         Returns:
             Tuple of (is_valid, rejection_reason)
@@ -407,27 +409,40 @@ class EvolutionEngine:
         from .gp_core import set_eval_data, clear_eval_data
         from deap import gp
 
-        MIN_ENTRY_SYMBOLS = 10  # Minimum symbols entry must trigger on
-        MAX_STOP_LOSS_PCT = 0.50  # 50% - anything higher indicates "no stop" intent
+        MIN_ENTRY_SYMBOLS = 5  # Minimum symbols entry must trigger on (lowered for VGP specificity)
 
-        # Check 1: Stop loss value
-        try:
-            # Get a sample dataframe for evaluation context
-            sample_symbol = next(iter(self._data.keys()))
-            sample_df = self._data[sample_symbol]
+        # Check 1: Reject trivial trees
+        entry_str = str(genome.entry_tree)
+        trivial_patterns = [
+            'true', 'false',
+            'not_(true)', 'not_(false)',
+            'not_(not_(true))', 'not_(not_(false))',
+            'and_(true, true)', 'or_(false, false)'
+        ]
+        if entry_str in trivial_patterns:
+            return False, f"Trivial entry tree: {entry_str}"
 
-            set_eval_data(sample_df)
-            stop_tree = genome.stop_loss_tree
-            stop_compiled = gp.compile(stop_tree, self.factory.float_pset)
-            raw_stop = stop_compiled() if callable(stop_compiled) else stop_compiled
-            clear_eval_data()
+        # Check 2 (VGP): Require vector primitives in entry tree
+        if self.factory.use_vgp:
+            # VGP entry trees should contain at least one vector operation
+            vgp_markers = [
+                'vec_close_', 'vec_sma_', 'vec_ema_', 'vec_rsi_',
+                'vec_ret_', 'vec_vol_', 'vec_rising', 'vec_falling',
+                'vec_mom_pos', 'vec_accel', 'vec_cross_', 'vec_diverging',
+                'vec_converging', 'vec_all', 'vec_any', 'vec_majority',
+                'vec_gt', 'vec_lt'
+            ]
+            has_vector = any(marker in entry_str for marker in vgp_markers)
+            if not has_vector:
+                return False, f"VGP entry lacks vector primitives: {entry_str[:60]}..."
 
-            if raw_stop is not None and abs(float(raw_stop)) > MAX_STOP_LOSS_PCT:
-                return False, f"Stop loss {abs(float(raw_stop)):.0%} > {MAX_STOP_LOSS_PCT:.0%} (no-stop intent)"
-        except Exception as e:
-            logger.debug(f"Stop loss validation failed: {e}")
+        # Note: Stop loss validation removed. The float primitive set includes price
+        # indicators (close()~100, volume()~100000) designed for comparison, not
+        # direct percentage output. Since strategy_genome.py clamps stop_loss to
+        # [min_stop_loss_pct, max_stop_loss_pct], extreme raw values don't matter.
+        # The important validation is the entry tree (VGP patterns) above.
 
-        # Check 2: Entry condition symbol coverage
+        # Check 4: Entry condition symbol coverage
         try:
             entry_tree = genome.entry_tree
 

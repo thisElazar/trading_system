@@ -830,12 +830,16 @@ class TaskScheduler:
                 "vacuum_databases",
             ]
             # Return cleanup tasks; orchestrator will skip completed ones
-            # and fall through to research via run_weekend_research below
-            return cleanup_tasks + ["run_weekend_research"]
+            # and fall through to validation + research below
+            # validate_candidates runs heavy WF/MC tests on discovered strategies
+            return cleanup_tasks + ["validate_candidates", "run_weekend_research"]
 
         # Research phase (main work, 20%-80% budget)
+        # Also includes validate_candidates to ensure discovered strategies
+        # get promoted through the pipeline (validated -> paper -> live)
         if pct_remaining > 0.20:
             return [
+                "validate_candidates",
                 "run_weekend_research",
             ]
 
@@ -939,7 +943,17 @@ class TaskScheduler:
         return is_early
 
     def _check_alpaca_calendar(self, check_date: date) -> bool:
-        """Query Alpaca API for market calendar."""
+        """Query Alpaca API for market calendar.
+
+        Returns True only for actual market holidays, NOT weekends.
+        Weekends always return False since they are handled separately
+        by the is_weekend logic in calculate_research_budget().
+        """
+        # Weekends are NOT holidays - they're handled by is_weekend logic
+        # Don't query Alpaca for weekends as they return empty calendar
+        if check_date.weekday() >= 5:  # Saturday = 5, Sunday = 6
+            return False
+
         from alpaca.trading.client import TradingClient
         from alpaca.trading.requests import GetCalendarRequest
 
@@ -953,7 +967,7 @@ class TaskScheduler:
         request = GetCalendarRequest(start=check_date, end=check_date)
         calendar = client.get_calendar(request)
 
-        # Empty calendar means market closed (holiday)
+        # Empty calendar on a weekday means market closed (holiday)
         return len(calendar) == 0
 
     def _check_alpaca_early_close(self, check_date: date) -> bool:

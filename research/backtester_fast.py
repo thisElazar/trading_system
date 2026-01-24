@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FastBacktestResult:
-    """Lightweight result container."""
+    """Lightweight result container compatible with novelty_search."""
     run_id: str
     strategy: str
     sharpe_ratio: float = 0.0
@@ -45,6 +45,17 @@ class FastBacktestResult:
     win_rate: float = 0.0
     total_trades: int = 0
     profit_factor: float = 0.0
+
+    # Required by novelty_search.extract_behavior_vector()
+    equity_curve: List[float] = field(default_factory=list)
+    trades: List[Dict] = field(default_factory=list)
+
+    # Additional fields for compatibility with BacktestResult
+    start_date: str = ""
+    end_date: str = ""
+    total_return: float = 0.0
+    max_drawdown: float = 0.0
+    volatility: float = 0.0
 
 
 class FastBacktester:
@@ -296,12 +307,24 @@ class FastBacktester:
         equities = [e[1] for e in self._equity_curve]
         dates = [e[0] for e in self._equity_curve]
 
+        # Store equity curve and trades for novelty_search compatibility
+        result.equity_curve = equities
+        result.trades = self._trades.copy()
+        result.start_date = str(dates[0]) if dates else ""
+        result.end_date = str(dates[-1]) if dates else ""
+
         # Returns
         returns = np.diff(equities) / equities[:-1]
         returns = returns[~np.isnan(returns)]
 
         if len(returns) < 10:
             return result
+
+        # Total return
+        result.total_return = (equities[-1] / equities[0]) - 1
+
+        # Volatility
+        result.volatility = returns.std() * np.sqrt(252) if len(returns) > 0 else 0.0
 
         # Sharpe
         if returns.std() > 0:
@@ -317,8 +340,7 @@ class FastBacktester:
         # Annual return
         total_days = (dates[-1] - dates[0]).days
         if total_days > 0:
-            total_return = (equities[-1] / equities[0]) - 1
-            result.annual_return = ((1 + total_return) ** (365 / total_days) - 1) * 100
+            result.annual_return = ((1 + result.total_return) ** (365 / total_days) - 1) * 100
 
         # Max drawdown
         peak = equities[0]
@@ -330,6 +352,7 @@ class FastBacktester:
             if dd < max_dd:
                 max_dd = dd
         result.max_drawdown_pct = max_dd * 100
+        result.max_drawdown = max_dd * equities[0]  # Absolute value
 
         # Win rate
         result.total_trades = len(self._trades)

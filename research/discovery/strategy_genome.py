@@ -25,13 +25,15 @@ from deap import gp, tools
 from .gp_core import (
     create_primitive_set,
     create_boolean_primitive_set,
+    create_vgp_primitive_set,
     create_toolbox,
     setup_deap_types,
     tree_to_string,
     tree_complexity,
     evaluate_tree,
     BoolType,
-    FloatType
+    FloatType,
+    VecType
 )
 from .config import EvolutionConfig, PrimitiveConfig
 
@@ -98,6 +100,7 @@ class StrategyGenome:
     def to_dict(self) -> Dict[str, Any]:
         """Serialize genome to dictionary."""
         return {
+            'genome_version': 2,  # VGP genome version
             'genome_id': self.genome_id,
             'generation': self.generation,
             'parent_ids': self.parent_ids,
@@ -135,20 +138,33 @@ class GenomeFactory:
     - Serialization/deserialization
     """
 
-    def __init__(self, config: EvolutionConfig = None, prim_config: PrimitiveConfig = None):
+    def __init__(self, config: EvolutionConfig = None, prim_config: PrimitiveConfig = None,
+                 use_vgp: bool = True):
         """
         Initialize genome factory.
 
         Args:
             config: Evolution configuration
             prim_config: Primitive set configuration
+            use_vgp: Use VGP (Vectorial GP) for entry/exit conditions (default True)
         """
         self.config = config or EvolutionConfig()
         self.prim_config = prim_config or PrimitiveConfig()
+        self.use_vgp = use_vgp and getattr(self.prim_config, 'vgp_enabled', True)
 
         # Create primitive sets
         self.float_pset = create_primitive_set(self.prim_config)
-        self.bool_pset = create_boolean_primitive_set(self.prim_config)
+
+        # Use VGP primitive set for boolean expressions if enabled
+        if self.use_vgp:
+            self.bool_pset = create_vgp_primitive_set(self.prim_config)
+            logger.info("GenomeFactory: Using VGP primitive set for entry/exit conditions")
+        else:
+            self.bool_pset = create_boolean_primitive_set(self.prim_config)
+            logger.info("GenomeFactory: Using scalar primitive set for entry/exit conditions")
+
+        # Keep scalar bool_pset for deserialization of v1 genomes
+        self._scalar_bool_pset = create_boolean_primitive_set(self.prim_config)
 
         # Setup DEAP types
         setup_deap_types()
@@ -597,14 +613,26 @@ class GenomeFactory:
         """
         Deserialize genome from JSON string.
 
+        Handles both v1 (scalar) and v2 (VGP) genomes.
         Note: This creates new trees from string representation,
         which may not be identical to originals but are functionally equivalent.
         """
-        d = json.loads(data)
+        d = json.loads(data) if isinstance(data, str) else data
+
+        # Determine genome version
+        genome_version = d.get('genome_version', 1)
+
+        # Choose appropriate primitive set for boolean trees
+        if genome_version >= 2 and self.use_vgp:
+            # VGP genome - use VGP pset
+            bool_pset = self.bool_pset
+        else:
+            # v1 scalar genome - use scalar pset
+            bool_pset = self._scalar_bool_pset
 
         # Parse trees from strings with fallback for type mismatches
-        entry = self._safe_tree_from_string(d['trees']['entry'], self.bool_pset)
-        exit_tree = self._safe_tree_from_string(d['trees']['exit'], self.bool_pset)
+        entry = self._safe_tree_from_string(d['trees']['entry'], bool_pset)
+        exit_tree = self._safe_tree_from_string(d['trees']['exit'], bool_pset)
         position = self._safe_tree_from_string(d['trees']['position'], self.float_pset)
         stop_loss = self._safe_tree_from_string(d['trees']['stop_loss'], self.float_pset)
         target = self._safe_tree_from_string(d['trees']['target'], self.float_pset)
@@ -622,6 +650,12 @@ class GenomeFactory:
         )
 
         genome.fitness_values = tuple(d['fitness_values']) if d.get('fitness_values') else None
+
+        # Restore self-adaptive parameters if present
+        if 'mutation_rate' in d:
+            genome.mutation_rate = d['mutation_rate']
+        if 'crossover_rate' in d:
+            genome.crossover_rate = d['crossover_rate']
 
         return genome
 

@@ -63,6 +63,20 @@ class BoolType:
 FloatType = float
 
 
+class VecType:
+    """
+    Vector type for VGP - represents a time series window.
+
+    VGP (Vectorial Genetic Programming) uses vectors to represent temporal
+    patterns, solving the degeneracy problem where scalar GP converges to
+    trivial conditions like `const_1 > open()`.
+
+    Vector primitives return np.ndarray of recent values (e.g., last 5 closes),
+    and aggregators collapse these to BoolType for entry/exit conditions.
+    """
+    pass
+
+
 # Protected division to avoid division by zero
 def protected_div(a: float, b: float) -> float:
     """Division that returns 1.0 when dividing by near-zero."""
@@ -308,6 +322,416 @@ def _make_volatility(period: int = 20):
         return float(vol) if not np.isnan(vol) else 0.0
     _volatility.__name__ = f'volatility_{period}'
     return _volatility
+
+
+# ==========================================================================
+# VGP: Vector Indicator Factories (return np.ndarray instead of scalar)
+# ==========================================================================
+# These functions return the last N values as a vector for temporal analysis
+
+def _safe_get_vector(df, col: str, lookback: int, default: float = 0.0) -> np.ndarray:
+    """Safely get the last N values from a DataFrame column as vector."""
+    if df is None or len(df) == 0:
+        return np.full(lookback, default)
+    if col not in df.columns:
+        return np.full(lookback, default)
+    values = df[col].tail(lookback).values
+    if len(values) < lookback:
+        # Pad with default if not enough data
+        padded = np.full(lookback, default)
+        padded[-len(values):] = values
+        return padded
+    return values.astype(float)
+
+
+def _make_vec_close(lookback: int):
+    """Factory for vector of last N close prices."""
+    def _vec_close() -> np.ndarray:
+        return _safe_get_vector(get_eval_data(), 'close', lookback, 100.0)
+    _vec_close.__name__ = f'vec_close_{lookback}'
+    return _vec_close
+
+
+def _make_vec_sma(period: int, lookback: int):
+    """Factory for vector of last N SMA values."""
+    def _vec_sma() -> np.ndarray:
+        df = get_eval_data()
+        if df is None or len(df) < period + lookback:
+            return np.full(lookback, 0.0)
+        sma = df['close'].rolling(period).mean()
+        values = sma.tail(lookback).values
+        return np.nan_to_num(values, nan=0.0)
+    _vec_sma.__name__ = f'vec_sma_{period}_{lookback}'
+    return _vec_sma
+
+
+def _make_vec_ema(period: int, lookback: int):
+    """Factory for vector of last N EMA values."""
+    def _vec_ema() -> np.ndarray:
+        df = get_eval_data()
+        if df is None or len(df) < period + lookback:
+            return np.full(lookback, 0.0)
+        ema = df['close'].ewm(span=period, adjust=False).mean()
+        values = ema.tail(lookback).values
+        return np.nan_to_num(values, nan=0.0)
+    _vec_ema.__name__ = f'vec_ema_{period}_{lookback}'
+    return _vec_ema
+
+
+def _make_vec_rsi(period: int, lookback: int):
+    """Factory for vector of last N RSI values."""
+    def _vec_rsi() -> np.ndarray:
+        df = get_eval_data()
+        if df is None or len(df) < period + lookback + 1:
+            return np.full(lookback, 50.0)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss.replace(0, 1e-10)
+        rsi = 100 - (100 / (1 + rs))
+        values = rsi.tail(lookback).values
+        return np.nan_to_num(values, nan=50.0)
+    _vec_rsi.__name__ = f'vec_rsi_{period}_{lookback}'
+    return _vec_rsi
+
+
+def _make_vec_returns(period: int, lookback: int):
+    """Factory for vector of last N period returns."""
+    def _vec_returns() -> np.ndarray:
+        df = get_eval_data()
+        if df is None or len(df) < period + lookback + 1:
+            return np.zeros(lookback)
+        returns = df['close'].pct_change(periods=period)
+        values = returns.tail(lookback).values
+        return np.nan_to_num(values, nan=0.0)
+    _vec_returns.__name__ = f'vec_returns_{period}_{lookback}'
+    return _vec_returns
+
+
+def _make_vec_volume(lookback: int):
+    """Factory for vector of last N relative volumes (vs 20-day SMA)."""
+    def _vec_volume() -> np.ndarray:
+        df = get_eval_data()
+        if df is None or len(df) < 20 + lookback:
+            return np.ones(lookback)
+        vol_sma = df['volume'].rolling(20).mean()
+        rel_vol = df['volume'] / vol_sma.replace(0, 1)
+        values = rel_vol.tail(lookback).values
+        return np.nan_to_num(values, nan=1.0)
+    _vec_volume.__name__ = f'vec_volume_{lookback}'
+    return _vec_volume
+
+
+# ==========================================================================
+# VGP: Aggregators (VecType -> BoolType) - CRITICAL for tree output
+# ==========================================================================
+
+def vec_all(vec: np.ndarray) -> bool:
+    """True if all elements are truthy (> 0 for numeric)."""
+    if vec is None or len(vec) == 0:
+        return False
+    return bool(np.all(vec > 0))
+
+
+def vec_any(vec: np.ndarray) -> bool:
+    """True if any element is truthy (> 0 for numeric)."""
+    if vec is None or len(vec) == 0:
+        return False
+    return bool(np.any(vec > 0))
+
+
+def vec_majority(vec: np.ndarray) -> bool:
+    """True if >50% of elements are truthy (> 0 for numeric)."""
+    if vec is None or len(vec) == 0:
+        return False
+    return bool(np.sum(vec > 0) > len(vec) / 2)
+
+
+# ==========================================================================
+# VGP: Trend Detectors (VecType -> BoolType)
+# ==========================================================================
+
+def vec_rising(vec: np.ndarray) -> bool:
+    """True if vector shows upward trend (linear regression slope > 0)."""
+    if vec is None or len(vec) < 2:
+        return False
+    # Simple: compare first half mean to second half mean
+    mid = len(vec) // 2
+    return bool(np.mean(vec[mid:]) > np.mean(vec[:mid]))
+
+
+def vec_falling(vec: np.ndarray) -> bool:
+    """True if vector shows downward trend (linear regression slope < 0)."""
+    if vec is None or len(vec) < 2:
+        return False
+    mid = len(vec) // 2
+    return bool(np.mean(vec[mid:]) < np.mean(vec[:mid]))
+
+
+def vec_momentum_positive(vec: np.ndarray) -> bool:
+    """True if last value > first value (positive momentum)."""
+    if vec is None or len(vec) < 2:
+        return False
+    return bool(vec[-1] > vec[0])
+
+
+def vec_accelerating(vec: np.ndarray) -> bool:
+    """True if rate of change is increasing (2nd derivative positive)."""
+    if vec is None or len(vec) < 3:
+        return False
+    # Calculate rate of change for first and second halves
+    third = len(vec) // 3
+    if third < 1:
+        return False
+    roc1 = vec[third] - vec[0]
+    roc2 = vec[-1] - vec[-1-third]
+    return bool(roc2 > roc1)
+
+
+# ==========================================================================
+# VGP: Cross Detectors (VecType, VecType -> BoolType)
+# ==========================================================================
+
+def vec_cross_above(v1: np.ndarray, v2: np.ndarray) -> bool:
+    """True if v1 crossed above v2 (was below, now above)."""
+    if v1 is None or v2 is None or len(v1) < 2 or len(v2) < 2:
+        return False
+    # Ensure same length
+    min_len = min(len(v1), len(v2))
+    v1, v2 = v1[-min_len:], v2[-min_len:]
+    # Check: v1 was below v2, now v1 >= v2
+    return bool(v1[-2] < v2[-2] and v1[-1] >= v2[-1])
+
+
+def vec_cross_below(v1: np.ndarray, v2: np.ndarray) -> bool:
+    """True if v1 crossed below v2 (was above, now below)."""
+    if v1 is None or v2 is None or len(v1) < 2 or len(v2) < 2:
+        return False
+    min_len = min(len(v1), len(v2))
+    v1, v2 = v1[-min_len:], v2[-min_len:]
+    return bool(v1[-2] > v2[-2] and v1[-1] <= v2[-1])
+
+
+def vec_diverging(v1: np.ndarray, v2: np.ndarray) -> bool:
+    """True if gap between v1 and v2 is widening."""
+    if v1 is None or v2 is None or len(v1) < 2 or len(v2) < 2:
+        return False
+    min_len = min(len(v1), len(v2))
+    v1, v2 = v1[-min_len:], v2[-min_len:]
+    gap_start = abs(v1[0] - v2[0])
+    gap_end = abs(v1[-1] - v2[-1])
+    return bool(gap_end > gap_start)
+
+
+def vec_converging(v1: np.ndarray, v2: np.ndarray) -> bool:
+    """True if gap between v1 and v2 is narrowing."""
+    if v1 is None or v2 is None or len(v1) < 2 or len(v2) < 2:
+        return False
+    min_len = min(len(v1), len(v2))
+    v1, v2 = v1[-min_len:], v2[-min_len:]
+    gap_start = abs(v1[0] - v2[0])
+    gap_end = abs(v1[-1] - v2[-1])
+    return bool(gap_end < gap_start)
+
+
+# ==========================================================================
+# VGP: Vector Comparison (VecType, FloatType -> VecType)
+# ==========================================================================
+
+def vec_gt(vec: np.ndarray, threshold: float) -> np.ndarray:
+    """Element-wise greater than comparison. Returns boolean array as float."""
+    if vec is None:
+        return np.zeros(1)
+    return (vec > threshold).astype(float)
+
+
+def vec_lt(vec: np.ndarray, threshold: float) -> np.ndarray:
+    """Element-wise less than comparison. Returns boolean array as float."""
+    if vec is None:
+        return np.zeros(1)
+    return (vec < threshold).astype(float)
+
+
+# ==========================================================================
+# VGP: create_vgp_primitive_set()
+# ==========================================================================
+
+def create_vgp_primitive_set(config: PrimitiveConfig = None) -> gp.PrimitiveSetTyped:
+    """
+    Create the VGP-specific primitive set for boolean expressions.
+
+    VGP primitives express temporal patterns that cannot be captured
+    by scalar comparisons, solving the degeneracy problem.
+
+    Output type is BoolType. Trees must ultimately return boolean.
+    """
+    config = config or PrimitiveConfig()
+
+    # VGP lookbacks (number of historical values in vectors)
+    vgp_lookbacks = getattr(config, 'vgp_lookbacks', [3, 5, 10])
+
+    # Boolean output for entry/exit conditions
+    pset = gp.PrimitiveSetTyped("VGP_BOOL", [], BoolType)
+
+    # ==========================================================================
+    # LOGICAL FUNCTIONS (BoolType, BoolType) -> BoolType
+    # ==========================================================================
+    pset.addPrimitive(operator.and_, [BoolType, BoolType], BoolType, name='and_')
+    pset.addPrimitive(operator.or_, [BoolType, BoolType], BoolType, name='or_')
+    pset.addPrimitive(operator.not_, [BoolType], BoolType, name='not_')
+
+    # ==========================================================================
+    # VGP AGGREGATORS (VecType -> BoolType) - Collapse vectors to booleans
+    # ==========================================================================
+    pset.addPrimitive(vec_all, [VecType], BoolType, name='vec_all')
+    pset.addPrimitive(vec_any, [VecType], BoolType, name='vec_any')
+    pset.addPrimitive(vec_majority, [VecType], BoolType, name='vec_majority')
+
+    # ==========================================================================
+    # VGP TREND DETECTORS (VecType -> BoolType)
+    # ==========================================================================
+    pset.addPrimitive(vec_rising, [VecType], BoolType, name='vec_rising')
+    pset.addPrimitive(vec_falling, [VecType], BoolType, name='vec_falling')
+    pset.addPrimitive(vec_momentum_positive, [VecType], BoolType, name='vec_mom_pos')
+    pset.addPrimitive(vec_accelerating, [VecType], BoolType, name='vec_accel')
+
+    # ==========================================================================
+    # VGP CROSS DETECTORS (VecType, VecType -> BoolType)
+    # ==========================================================================
+    pset.addPrimitive(vec_cross_above, [VecType, VecType], BoolType, name='vec_cross_above')
+    pset.addPrimitive(vec_cross_below, [VecType, VecType], BoolType, name='vec_cross_below')
+    pset.addPrimitive(vec_diverging, [VecType, VecType], BoolType, name='vec_diverging')
+    pset.addPrimitive(vec_converging, [VecType, VecType], BoolType, name='vec_converging')
+
+    # ==========================================================================
+    # VGP VECTOR COMPARISON (VecType, FloatType -> VecType)
+    # ==========================================================================
+    pset.addPrimitive(vec_gt, [VecType, FloatType], VecType, name='vec_gt')
+    pset.addPrimitive(vec_lt, [VecType, FloatType], VecType, name='vec_lt')
+
+    # ==========================================================================
+    # VGP VECTOR INDICATORS (registered as terminals via wrapper classes)
+    # ==========================================================================
+    # DEAP needs terminals for tree generation. We create wrapper classes that
+    # call the indicator functions when evaluated. This is the standard DEAP
+    # pattern for dynamic terminals.
+
+    # Price vectors
+    for lookback in vgp_lookbacks:
+        # Create terminal by adding the function as a primitive with 0 args
+        # DEAP treats 0-arity primitives as potential terminals for tree growth
+        pset.addPrimitive(_make_vec_close(lookback), [], VecType, name=f'vec_close_{lookback}')
+        pset.addPrimitive(_make_vec_volume(lookback), [], VecType, name=f'vec_vol_{lookback}')
+
+        # Returns vectors
+        for period in [1, 5]:
+            pset.addPrimitive(
+                _make_vec_returns(period, lookback), [], VecType,
+                name=f'vec_ret_{period}d_{lookback}'
+            )
+
+    # SMA vectors
+    for period in config.sma_periods[:3]:  # Limit to avoid explosion
+        for lookback in vgp_lookbacks:
+            pset.addPrimitive(
+                _make_vec_sma(period, lookback), [], VecType,
+                name=f'vec_sma_{period}_{lookback}'
+            )
+
+    # EMA vectors
+    for period in config.ema_periods[:2]:  # Limit to avoid explosion
+        for lookback in vgp_lookbacks:
+            pset.addPrimitive(
+                _make_vec_ema(period, lookback), [], VecType,
+                name=f'vec_ema_{period}_{lookback}'
+            )
+
+    # RSI vectors
+    for lookback in vgp_lookbacks:
+        pset.addPrimitive(
+            _make_vec_rsi(config.rsi_period, lookback), [], VecType,
+            name=f'vec_rsi_{lookback}'
+        )
+
+    # ==========================================================================
+    # VGP VECTOR TERMINALS (for DEAP tree generation)
+    # ==========================================================================
+    # DEAP's tree generation algorithm needs actual terminals for each type.
+    # We add the vector indicators as terminals using a class wrapper.
+
+    class VecTerminal:
+        """Wrapper to make vector indicator functions usable as DEAP terminals."""
+        def __init__(self, func, name, size=5):
+            self.func = func
+            self.name = name
+            self.__name__ = name
+            self._size = size
+
+        def __call__(self):
+            return self.func()
+
+        def __repr__(self):
+            return self.name
+
+        def __len__(self):
+            return self._size
+
+    # Register vector indicators as terminals
+    for lookback in vgp_lookbacks:
+        # Close price vectors
+        term = VecTerminal(_make_vec_close(lookback), f'vec_close_{lookback}')
+        pset.addTerminal(term, VecType, name=f'vec_close_{lookback}_t')
+
+        # Volume vectors
+        term = VecTerminal(_make_vec_volume(lookback), f'vec_vol_{lookback}')
+        pset.addTerminal(term, VecType, name=f'vec_vol_{lookback}_t')
+
+        # RSI vectors
+        term = VecTerminal(_make_vec_rsi(config.rsi_period, lookback), f'vec_rsi_{lookback}')
+        pset.addTerminal(term, VecType, name=f'vec_rsi_{lookback}_t')
+
+    # Add SMA vector terminals
+    for period in config.sma_periods[:2]:  # Just first 2 to limit
+        for lookback in vgp_lookbacks[:2]:  # Just first 2 lookbacks
+            term = VecTerminal(_make_vec_sma(period, lookback), f'vec_sma_{period}_{lookback}')
+            pset.addTerminal(term, VecType, name=f'vec_sma_{period}_{lookback}_t')
+
+    # Add EMA vector terminals
+    for period in config.ema_periods[:2]:
+        for lookback in vgp_lookbacks[:2]:
+            term = VecTerminal(_make_vec_ema(period, lookback), f'vec_ema_{period}_{lookback}')
+            pset.addTerminal(term, VecType, name=f'vec_ema_{period}_{lookback}_t')
+
+    # ==========================================================================
+    # FLOAT PRIMITIVES AND TERMINALS (for vec_gt, vec_lt thresholds)
+    # ==========================================================================
+
+    # Add arithmetic on floats so DEAP can generate float expressions
+    pset.addPrimitive(operator.add, [FloatType, FloatType], FloatType, name='add')
+    pset.addPrimitive(operator.sub, [FloatType, FloatType], FloatType, name='sub')
+    pset.addPrimitive(operator.mul, [FloatType, FloatType], FloatType, name='mul')
+
+    # RSI thresholds
+    for val in [30.0, 40.0, 50.0, 60.0, 70.0]:
+        pset.addTerminal(val, FloatType, name=f'rsi_{int(val)}')
+
+    # Volume thresholds (relative to SMA)
+    for val in [0.5, 1.0, 1.5, 2.0]:
+        name = f'vol_{str(val).replace(".", "p")}'
+        pset.addTerminal(val, FloatType, name=name)
+
+    # Return thresholds (percentage)
+    for val in [-0.02, -0.01, 0.0, 0.01, 0.02]:
+        name = f'ret_{str(val).replace("-", "n").replace(".", "p")}'
+        pset.addTerminal(val, FloatType, name=name)
+
+    # ==========================================================================
+    # BOOLEAN TERMINALS (fallback)
+    # ==========================================================================
+    pset.addTerminal(True, BoolType, name='true')
+    pset.addTerminal(False, BoolType, name='false')
+
+    return pset
 
 
 def create_primitive_set(config: PrimitiveConfig = None) -> gp.PrimitiveSetTyped:

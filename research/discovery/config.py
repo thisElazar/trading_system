@@ -139,6 +139,10 @@ class PrimitiveConfig:
     medium_const_range: tuple = (0.05, 0.20)   # 5% - 20%
     int_const_range: tuple = (5, 50)           # Integer periods
 
+    # VGP (Vectorial GP) settings
+    vgp_lookbacks: List[int] = field(default_factory=lambda: [3, 5, 10])
+    vgp_enabled: bool = True  # Use VGP for entry/exit conditions
+
 
 # Default configurations
 DEFAULT_CONFIG = EvolutionConfig()

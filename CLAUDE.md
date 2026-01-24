@@ -60,6 +60,32 @@ Automated trading system on Raspberry Pi 5. Paper trading via Alpaca.
 | "Could not get open positions" | Wrong method call | Use `execution_tracker.db.get_open_positions()` |
 | System reboot overnight | Memory pressure during research | LRU cache limits added, monitor with `free -h` |
 
+## VGP Migration (Jan 23)
+
+**Problem**: 68% of GP-discovered strategies exploited scalar edge cases like `const_1 > open()`.
+
+**Solution**: Replaced scalar GP with Vectorial GP (VGP) primitives that express temporal patterns.
+
+**Key Changes**:
+- `gp_core.py`: Added `VecType`, ~15 vector primitives, `create_vgp_primitive_set()`
+- `strategy_genome.py`: `use_vgp` flag (default True), `genome_version: 2` in serialization
+- `config.py`: `vgp_lookbacks: [3, 5, 10]`, `vgp_enabled: True`
+- `evolution_engine.py`: VGP validation (requires vector primitives in entry tree)
+- `backtester_fast.py`: Added `trades`, `equity_curve` for compatibility
+
+**Database**:
+- Archived: `*_v1_scalar` tables (184 strategies preserved)
+- Fresh v2 tables with `genome_version` field
+
+**Example VGP Trees**:
+```python
+vec_cross_above(vec_ema_12_5, vec_sma_20_5)  # MA crossover
+vec_rising(vec_rsi_5)                         # RSI trend
+vec_converging(vec_vol_5(), vec_ret_1d_5())  # Volume/returns pattern
+```
+
+**Rollback**: `python research/discovery/vgp_migration.py --rollback`
+
 ## Recent Fixes (Jan 22)
 
 - **Position exits**: Now use per-position `take_profit`/`stop_loss` prices from DB (not global 10% threshold)
