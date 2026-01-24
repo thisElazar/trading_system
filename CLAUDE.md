@@ -86,6 +86,35 @@ vec_converging(vec_vol_5(), vec_ret_1d_5())  # Volume/returns pattern
 
 **Rollback**: `python research/discovery/vgp_migration.py --rollback`
 
+## GP Research Tuning (Jan 24)
+
+**Problem**: GP batch evaluations timing out (100% failure rate overnight). Individual backtests taking 2-10+ minutes on Pi with 194 symbols x 3 years. Degenerate strategies logging 100+ signal limit warnings per backtest.
+
+**Root Causes**:
+1. Backtests too slow for 10-minute batch timeout
+2. Degenerate genomes hitting signal limit on every bar but not aborting early
+3. Too much data scope for Pi's compute capacity
+
+**Fixes Applied**:
+
+1. **Early abort for degenerate strategies** (`strategy_compiler.py`):
+   - Added `DegenerateStrategyError` exception
+   - Tracks consecutive signal limit hits (threshold: 3)
+   - Aborts backtest early with Sharpe = -10.0 penalty
+   - Only logs once per streak (not 100+ times)
+
+2. **Reduced data scope** (`config.py` pi_safe profile):
+   - `max_symbols`: 200 → 100 (faster backtests)
+   - `max_years`: 3 → 2 (less historical data)
+
+3. **Increased batch timeout** (`parallel_pool.py`):
+   - `timeout`: 600s → 1800s (30 minutes vs 10 minutes)
+
+**Expected Impact**:
+- Backtests ~4x faster (half symbols, 2/3 years)
+- Degenerate strategies abort in ~300ms instead of minutes
+- More strategies complete before timeout
+
 ## Recent Fixes (Jan 22)
 
 - **Position exits**: Now use per-position `take_profit`/`stop_loss` prices from DB (not global 10% threshold)

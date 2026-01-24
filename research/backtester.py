@@ -69,6 +69,14 @@ from config import VALIDATION, TRANSACTION_COSTS_BPS, get_transaction_cost
 from strategies.base import BaseStrategy, Signal, SignalType
 from utils.timezone import normalize_dataframe, normalize_timestamp, normalize_index
 
+# Import DegenerateStrategyError for early abort of degenerate GP strategies
+try:
+    from research.discovery.strategy_compiler import DegenerateStrategyError
+except ImportError:
+    # Define a placeholder if discovery module not available
+    class DegenerateStrategyError(Exception):
+        pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -488,8 +496,23 @@ class Backtester:
             
             # Generate new signals
             current_positions = list(self._positions.keys())
-            signals = strategy.generate_signals(current_data, current_positions, vix_regime)
-            
+            try:
+                signals = strategy.generate_signals(current_data, current_positions, vix_regime)
+            except DegenerateStrategyError as e:
+                # Early abort for degenerate GP strategies - return minimal result
+                logger.warning(f"Early abort: {e}")
+                result = BacktestResult(
+                    run_id=run_id,
+                    strategy=strategy.name,
+                    start_date=start_date.strftime('%Y-%m-%d') if hasattr(start_date, 'strftime') else str(start_date),
+                    end_date=current_date.strftime('%Y-%m-%d') if hasattr(current_date, 'strftime') else str(current_date)
+                )
+                result.total_return = 0.0
+                result.sharpe_ratio = -10.0  # Heavily penalize degenerate strategies
+                result.total_trades = 0
+                result.metadata = {'aborted': True, 'reason': 'degenerate_strategy'}
+                return result
+
             # Process signals
             for signal in signals:
                 if signal.signal_type == SignalType.CLOSE:

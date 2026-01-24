@@ -646,9 +646,10 @@ IS_MEMORY_CONSTRAINED = TOTAL_RAM_GB < 8.0
 PERFORMANCE_PROFILES = {
     'pi_safe': {
         # Memory management (optimized post-watchdog fix)
-        # Increased from 100 to 200 for better generalization (batched eval handles it)
-        'max_symbols': 200,
-        'max_years': 3,
+        # Reduced from 200 to 100 symbols, 3 to 2 years (Jan 24, 2026)
+        # Reason: GP backtests timing out on Pi - need faster eval cycles
+        'max_symbols': 100,
+        'max_years': 2,
         'walk_forward': True,  # Validated stable on Pi
         
         # Parallelism (2 workers - prevents OOM on 4GB Pi)

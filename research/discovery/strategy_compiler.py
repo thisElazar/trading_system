@@ -24,6 +24,16 @@ from .gp_core import set_eval_data, clear_eval_data
 logger = logging.getLogger(__name__)
 
 
+class DegenerateStrategyError(Exception):
+    """
+    Raised when a strategy is detected as degenerate during backtesting.
+
+    This allows early abort of backtests for strategies that consistently
+    trigger on too many symbols (likely broken/trivial GP trees).
+    """
+    pass
+
+
 class EvolvedStrategy(BaseStrategy):
     """
     Strategy generated from a GP genome.
@@ -52,6 +62,10 @@ class EvolvedStrategy(BaseStrategy):
         self._target_func = None
 
         self._compile_trees()
+
+        # Track consecutive signal limit hits for early abort
+        self._consecutive_signal_limit_hits = 0
+        self._signal_limit_abort_threshold = 3  # Abort after 3 consecutive hits
 
     def _compile_trees(self):
         """
@@ -86,6 +100,7 @@ class EvolvedStrategy(BaseStrategy):
         signals = []
         current_positions = current_positions or []
         entry_count = 0  # Track how many symbols triggered entry
+        hit_signal_limit = False  # Track if we hit limit this bar
 
         for symbol, df in data.items():
             # Need enough history for indicators
@@ -94,10 +109,26 @@ class EvolvedStrategy(BaseStrategy):
 
             # Safety: abort if we've generated too many signals (degenerate strategy)
             if len(signals) >= self.MAX_SIGNALS_PER_EVAL:
-                logger.warning(
-                    f"Strategy {self.genome.genome_id} hit signal limit ({self.MAX_SIGNALS_PER_EVAL}) - "
-                    f"likely degenerate genome. Aborting signal generation."
-                )
+                hit_signal_limit = True
+                self._consecutive_signal_limit_hits += 1
+
+                # Only log on first hit of a streak to reduce log spam
+                if self._consecutive_signal_limit_hits == 1:
+                    logger.warning(
+                        f"Strategy {self.genome.genome_id} hit signal limit ({self.MAX_SIGNALS_PER_EVAL}) - "
+                        f"likely degenerate genome. Aborting signal generation."
+                    )
+
+                # Check if we should abort the entire backtest
+                if self._consecutive_signal_limit_hits >= self._signal_limit_abort_threshold:
+                    logger.warning(
+                        f"Strategy {self.genome.genome_id} hit signal limit {self._consecutive_signal_limit_hits} "
+                        f"consecutive times - aborting backtest early (degenerate genome)."
+                    )
+                    raise DegenerateStrategyError(
+                        f"Strategy {self.genome.genome_id} is degenerate: "
+                        f"hit signal limit {self._consecutive_signal_limit_hits} consecutive bars"
+                    )
                 break
 
             try:
@@ -168,6 +199,10 @@ class EvolvedStrategy(BaseStrategy):
             except Exception as e:
                 logger.debug(f"Signal generation failed for {symbol}: {e}")
                 continue
+
+        # Reset consecutive hit counter if we didn't hit the limit this bar
+        if not hit_signal_limit:
+            self._consecutive_signal_limit_hits = 0
 
         return signals
 

@@ -324,7 +324,7 @@ class PersistentWorkerPool:
         self,
         genome_data_list: List[Dict],
         config_dict: Dict[str, Any],
-        timeout: int = 600
+        timeout: int = 1800
     ) -> List[Dict[str, Any]]:
         """
         Evaluate a batch of genomes in parallel.
@@ -332,7 +332,7 @@ class PersistentWorkerPool:
         Args:
             genome_data_list: List of serialized genome dicts
             config_dict: Evolution config as dict
-            timeout: Timeout in seconds for batch evaluation (default 5 minutes)
+            timeout: Timeout in seconds for batch evaluation (default 30 minutes)
 
         Returns:
             List of result dicts
