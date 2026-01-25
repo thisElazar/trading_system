@@ -220,14 +220,21 @@ class GeneticOptimizer:
 
             # Pass initializer to ensure workers ignore SIGTERM (prevents zombie workers)
             with ctx.Pool(processes=self.config.n_workers, initializer=_init_parallel_worker) as pool:
-                # Map genes to fitness values
+                # Map genes to fitness values with timeout to prevent deadlock
                 genes_list = [ind.genes for _, ind in to_evaluate]
-                results = pool.map(evaluate_genes_parallel, genes_list)
-                
+                # Use map_async with timeout (30 min) instead of blocking map()
+                async_result = pool.map_async(evaluate_genes_parallel, genes_list)
+                try:
+                    results = async_result.get(timeout=1800)  # 30 min timeout
+                except TimeoutError:
+                    logger.error("Parallel evaluation timed out after 30 minutes")
+                    pool.terminate()
+                    raise
+
                 # Apply results
                 for (idx, ind), fitness in zip(to_evaluate, results):
                     individuals[idx].fitness = fitness if fitness is not None else float('-inf')
-                
+
                 logger.info(f"Parallel evaluation completed: {len(results)} individuals")
 
         except Exception as e:

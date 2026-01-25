@@ -42,6 +42,11 @@ _worker_factory = None
 _worker_compiler = None
 _worker_backtester = None
 
+# Pool singleton tracking - detects accidental concurrent pools
+# Only one PersistentWorkerPool should be active per process
+_active_pool_instance = None  # type: Optional['PersistentWorkerPool']
+_active_pool_pid = None  # type: Optional[int]
+
 
 def _pool_warmup_task(worker_idx: int) -> bool:
     """
@@ -212,7 +217,17 @@ class PersistentWorkerPool:
     - Workers initialized once with shared memory access
     - No data copying between main process and workers
     - Automatic worker restart on failure
-    - Graceful shutdown
+    - Graceful shutdown with 30s timeout
+
+    IMPORTANT: Only one PersistentWorkerPool should be active at a time.
+    Workers share module-level state (_worker_initialized, _worker_data, etc.)
+    which would be corrupted if multiple pools ran simultaneously.
+
+    Lifecycle:
+    - Workers ignore SIGTERM/SIGINT (main process handles shutdown)
+    - shutdown() waits up to 30s for graceful exit, then force-terminates
+    - Context manager (__enter__/__exit__) for automatic cleanup
+    - __del__ ensures cleanup even without explicit shutdown()
     """
 
     def __init__(
@@ -242,9 +257,25 @@ class PersistentWorkerPool:
                           heavy libraries (numpy, pandas, sklearn) simultaneously.
             max_retries: Number of retry attempts if pool creation fails (default 3).
         """
+        global _active_pool_instance, _active_pool_pid
+
         if self._started:
             logger.warning("Pool already started")
             return
+
+        # CRITICAL: Check for clashing pools - only one should be active at a time
+        # Multiple pools would corrupt shared module-level worker state
+        if _active_pool_instance is not None and _active_pool_instance._started:
+            if _active_pool_pid == os.getpid():
+                logger.error(
+                    "CRITICAL: Another PersistentWorkerPool is already active! "
+                    "This will corrupt shared worker state. Shutdown the existing pool first. "
+                    f"Active pool: {_active_pool_instance}, This pool: {self}"
+                )
+                raise RuntimeError(
+                    "Only one PersistentWorkerPool can be active at a time. "
+                    "Call shutdown() on the existing pool before starting a new one."
+                )
 
         logger.info(f"Starting persistent worker pool with {self.n_workers} workers (staggered {stagger_delay}s)...")
 
@@ -318,6 +349,9 @@ class PersistentWorkerPool:
             raise RuntimeError(f"Failed to warm up workers: {e}") from e
 
         self._started = True
+        # Register as the active pool to detect clashing pools
+        _active_pool_instance = self
+        _active_pool_pid = os.getpid()
         logger.info("Worker pool started and initialized (all workers warmed up)")
 
     def evaluate_batch(
@@ -404,12 +438,13 @@ class PersistentWorkerPool:
             callback=callback
         )
 
-    def shutdown(self, wait: bool = True):
+    def shutdown(self, wait: bool = True, timeout: float = 30.0):
         """
         Shutdown the worker pool.
 
         Args:
-            wait: If True, wait for workers to finish current tasks
+            wait: If True, wait for workers to finish current tasks (with timeout)
+            timeout: Maximum seconds to wait for graceful shutdown before terminating
         """
         if not self._started:
             return
@@ -418,12 +453,28 @@ class PersistentWorkerPool:
 
         if wait:
             self._pool.close()
+            # Wait for workers with timeout to avoid deadlock
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                # Check if all workers have exited
+                if not any(w.is_alive() for w in self._pool._pool):
+                    break
+                time.sleep(0.1)
+            else:
+                logger.warning(f"Workers didn't terminate within {timeout}s, force terminating")
+                self._pool.terminate()
             self._pool.join()
         else:
             self._pool.terminate()
+            self._pool.join()
 
         self._pool = None
         self._started = False
+        # Clear active pool tracking
+        global _active_pool_instance, _active_pool_pid
+        if _active_pool_instance is self:
+            _active_pool_instance = None
+            _active_pool_pid = None
         logger.info("Worker pool shut down")
 
     def is_running(self) -> bool:

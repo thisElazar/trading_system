@@ -50,6 +50,12 @@ def _warmup_worker(worker_id: int) -> bool:
     return True
 
 
+# Pool singleton tracking - detects accidental concurrent pools
+# Only one PersistentGAOptimizer pool should be active per process
+_pga_active_pool_instance = None  # type: Optional['PersistentGAOptimizer']
+_pga_active_pool_pid = None  # type: Optional[int]
+
+
 # ============================================================================
 # FITNESS CONSTRAINTS
 # ============================================================================
@@ -240,6 +246,14 @@ class PersistentGAOptimizer:
     - Diversity injection: Replace low-fitness individuals with fresh random ones
     - Adaptive mutation: Increase mutation rate when population stagnates
     - Soft rejection: Poor individuals get low (not zero) fitness
+
+    Worker Lifecycle:
+    - Uses multiprocessing.Pool with fork context
+    - Workers ignore SIGTERM/SIGINT (main process handles shutdown)
+    - shutdown_pool() waits 30s for graceful exit, then force-terminates
+    - Context manager (__enter__/__exit__) for automatic cleanup
+
+    IMPORTANT: Only one PersistentGAOptimizer pool should be active at a time.
     """
 
     # Diversity injection settings (fitness-based - for failing populations)
@@ -346,6 +360,9 @@ class PersistentGAOptimizer:
         Returns:
             True if pool started successfully, False otherwise
         """
+        global _pga_active_pool_instance, _pga_active_pool_pid
+        import os
+
         if self._pool_initialized:
             logger.debug("Pool already initialized")
             return True
@@ -353,6 +370,19 @@ class PersistentGAOptimizer:
         if not self.config.parallel:
             logger.debug("Parallel mode disabled, skipping pool init")
             return True
+
+        # CRITICAL: Check for clashing pools - only one should be active at a time
+        if _pga_active_pool_instance is not None and _pga_active_pool_instance._pool_initialized:
+            if _pga_active_pool_pid == os.getpid():
+                logger.error(
+                    "CRITICAL: Another PersistentGAOptimizer pool is already active! "
+                    "This will corrupt shared worker state. Shutdown the existing pool first. "
+                    f"Active: {_pga_active_pool_instance.strategy_name}, This: {self.strategy_name}"
+                )
+                raise RuntimeError(
+                    "Only one PersistentGAOptimizer pool can be active at a time. "
+                    "Call shutdown_pool() on the existing optimizer before starting a new one."
+                )
 
         try:
             logger.info(f"Starting persistent pool with {self._n_workers} workers...")
@@ -382,6 +412,9 @@ class PersistentGAOptimizer:
                     time.sleep(stagger_delay)
 
             self._pool_initialized = True
+            # Register as the active pool to detect clashing pools
+            _pga_active_pool_instance = self
+            _pga_active_pool_pid = os.getpid()
             logger.info("Persistent pool started successfully")
             return True
 
@@ -391,12 +424,13 @@ class PersistentGAOptimizer:
             self._pool_initialized = False
             return False
 
-    def shutdown_pool(self, wait: bool = True) -> None:
+    def shutdown_pool(self, wait: bool = True, timeout: float = 30.0) -> None:
         """
         Shutdown the persistent worker pool.
 
         Args:
-            wait: If True, wait for workers to finish. If False, terminate immediately.
+            wait: If True, wait for workers to finish (with timeout). If False, terminate immediately.
+            timeout: Maximum seconds to wait for graceful shutdown
         """
         if not self._pool_initialized or self._pool is None:
             return
@@ -406,14 +440,29 @@ class PersistentGAOptimizer:
         try:
             if wait:
                 self._pool.close()
+                # Wait for workers with timeout to avoid deadlock
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    if not any(w.is_alive() for w in self._pool._pool):
+                        break
+                    time.sleep(0.1)
+                else:
+                    logger.warning(f"Workers didn't terminate within {timeout}s, force terminating")
+                    self._pool.terminate()
                 self._pool.join()
             else:
                 self._pool.terminate()
+                self._pool.join()
         except Exception as e:
             logger.warning(f"Error shutting down pool: {e}")
         finally:
             self._pool = None
             self._pool_initialized = False
+            # Clear active pool tracking
+            global _pga_active_pool_instance, _pga_active_pool_pid
+            if _pga_active_pool_instance is self:
+                _pga_active_pool_instance = None
+                _pga_active_pool_pid = None
             logger.info("Pool shutdown complete")
 
     def __enter__(self):

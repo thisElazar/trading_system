@@ -11,6 +11,7 @@ Provides efficient parallelism for:
 
 import logging
 import os
+import time
 from multiprocessing import Pool
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, List, Any, Optional, Tuple, Callable
@@ -25,6 +26,11 @@ logger = logging.getLogger(__name__)
 _ga_worker_initialized = False
 _ga_worker_data: Dict[str, pd.DataFrame] = {}
 _ga_worker_vix: Optional[pd.DataFrame] = None
+
+# Pool singleton tracking - detects accidental concurrent pools
+# Only one GAWorkerPool should be active per process
+_ga_active_pool_instance = None  # type: Optional['GAWorkerPool']
+_ga_active_pool_pid = None  # type: Optional[int]
 
 
 def _ga_warmup_task(worker_idx: int) -> bool:
@@ -41,11 +47,20 @@ def _ga_pool_initializer(shared_metadata: Dict[str, Any]):
     Initialize GA worker process with shared memory access.
 
     Called once when worker starts.
+
+    Note: Only one GAWorkerPool should be active at a time due to
+    module-level shared state (_ga_worker_data, _ga_worker_vix).
     """
     global _ga_worker_initialized, _ga_worker_data, _ga_worker_vix
 
     if _ga_worker_initialized:
         return
+
+    # Ignore shutdown signals in workers to prevent zombie processes
+    # Main process handles graceful shutdown via pool.terminate()
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     try:
         from research.discovery.shared_data import SharedDataReader
@@ -288,6 +303,15 @@ class GAWorkerPool:
 
     Manages a pool of workers with shared memory access
     for efficient parallel fitness evaluation.
+
+    IMPORTANT: Only one GAWorkerPool should be active at a time.
+    Workers share module-level state (_ga_worker_data, _ga_worker_vix)
+    which would be corrupted if multiple pools ran simultaneously.
+
+    Lifecycle:
+    - Workers ignore SIGTERM/SIGINT (main process handles shutdown)
+    - shutdown() uses 30s timeout then force-terminates
+    - Context manager (__enter__/__exit__) for automatic cleanup
     """
 
     def __init__(
@@ -310,9 +334,24 @@ class GAWorkerPool:
                           heavy libraries (numpy, pandas, sklearn) simultaneously.
         """
         import time
+        global _ga_active_pool_instance, _ga_active_pool_pid
 
         if self._started:
             return
+
+        # CRITICAL: Check for clashing pools - only one should be active at a time
+        # Multiple pools would corrupt shared module-level worker state
+        if _ga_active_pool_instance is not None and _ga_active_pool_instance._started:
+            if _ga_active_pool_pid == os.getpid():
+                logger.error(
+                    "CRITICAL: Another GAWorkerPool is already active! "
+                    "This will corrupt shared worker state. Shutdown the existing pool first. "
+                    f"Active pool: {_ga_active_pool_instance}, This pool: {self}"
+                )
+                raise RuntimeError(
+                    "Only one GAWorkerPool can be active at a time. "
+                    "Call shutdown() on the existing pool before starting a new one."
+                )
 
         logger.info(f"Starting GA worker pool with {self.n_workers} workers (staggered {stagger_delay}s)...")
 
@@ -338,6 +377,9 @@ class GAWorkerPool:
                 time.sleep(stagger_delay)
 
         self._started = True
+        # Register as the active pool to detect clashing pools
+        _ga_active_pool_instance = self
+        _ga_active_pool_pid = os.getpid()
         logger.info("GA worker pool started (all workers warmed up)")
 
     def evaluate_fitness_batch(
@@ -410,19 +452,34 @@ class GAWorkerPool:
             logger.error(f"Batch period testing failed: {e}")
             return [{'success': False, 'error': str(e)} for _ in periods]
 
-    def shutdown(self, wait: bool = True):
-        """Shutdown the pool."""
+    def shutdown(self, wait: bool = True, timeout: float = 30.0):
+        """Shutdown the pool with timeout to avoid deadlock."""
         if not self._started:
             return
 
         if wait:
             self._pool.close()
+            # Wait for workers with timeout
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if not any(w.is_alive() for w in self._pool._pool):
+                    break
+                time.sleep(0.1)
+            else:
+                logger.warning(f"GA workers didn't terminate within {timeout}s, force terminating")
+                self._pool.terminate()
             self._pool.join()
         else:
             self._pool.terminate()
+            self._pool.join()
 
         self._pool = None
         self._started = False
+        # Clear active pool tracking
+        global _ga_active_pool_instance, _ga_active_pool_pid
+        if _ga_active_pool_instance is self:
+            _ga_active_pool_instance = None
+            _ga_active_pool_pid = None
         logger.info("GA worker pool shut down")
 
     def is_running(self) -> bool:
