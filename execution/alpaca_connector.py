@@ -8,6 +8,11 @@ Features:
 - Position sync from broker
 - Account info and buying power
 - Order status tracking
+- Timeout protection on all API calls
+
+Safety features:
+- All external API calls wrapped with timeouts
+- Configurable timeout values via utils.timeout
 """
 
 import logging
@@ -18,6 +23,9 @@ from enum import Enum
 from pathlib import Path
 
 import pandas as pd
+
+# Import timeout utilities
+from utils.timeout import timeout_wrapper, TIMEOUTS
 
 # Alpaca imports
 try:
@@ -141,7 +149,11 @@ class AlpacaConnector:
     def get_account(self) -> Optional[AccountInfo]:
         """Get account information."""
         try:
-            account = self.trading_client.get_account()
+            account = timeout_wrapper(
+                self.trading_client.get_account,
+                TIMEOUTS.API_CALL,
+                "get_account"
+            )
 
             return AccountInfo(
                 equity=float(account.equity),
@@ -152,6 +164,9 @@ class AlpacaConnector:
                 pattern_day_trader=account.pattern_day_trader,
                 trading_blocked=account.trading_blocked
             )
+        except TimeoutError:
+            logger.error("get_account timed out")
+            return None
         except Exception as e:
             logger.error(f"Failed to get account info: {e}")
             return None
@@ -159,7 +174,14 @@ class AlpacaConnector:
     def get_positions(self) -> List[BrokerPosition]:
         """Get all open positions from broker."""
         try:
-            positions = self.trading_client.get_all_positions()
+            positions = timeout_wrapper(
+                self.trading_client.get_all_positions,
+                TIMEOUTS.API_CALL,
+                "get_positions"
+            )
+        except TimeoutError:
+            logger.error("get_positions timed out")
+            return []
         except Exception as e:
             logger.error(f"Failed to get positions: {e}")
             return []
@@ -186,7 +208,11 @@ class AlpacaConnector:
     def get_position(self, symbol: str) -> Optional[BrokerPosition]:
         """Get position for a specific symbol."""
         try:
-            pos = self.trading_client.get_open_position(symbol)
+            pos = timeout_wrapper(
+                lambda: self.trading_client.get_open_position(symbol),
+                TIMEOUTS.API_CALL,
+                f"get_position({symbol})"
+            )
             return BrokerPosition(
                 symbol=pos.symbol,
                 qty=float(pos.qty),
@@ -197,6 +223,9 @@ class AlpacaConnector:
                 unrealized_pnl_pct=float(pos.unrealized_plpc) * 100,
                 current_price=float(pos.current_price)
             )
+        except TimeoutError:
+            logger.debug(f"get_position({symbol}) timed out")
+            return None
         except Exception as e:
             logger.debug(f"Failed to get position for {symbol}: {e}")
             return None
@@ -239,7 +268,11 @@ class AlpacaConnector:
                 time_in_force=tif
             )
 
-            order = self.trading_client.submit_order(order_data)
+            order = timeout_wrapper(
+                lambda: self.trading_client.submit_order(order_data),
+                TIMEOUTS.ORDER_SUBMIT,
+                f"submit_market_order({symbol})"
+            )
             order_id = str(order.id)
 
             logger.info(f"✓ Market order submitted: {side.upper()} {qty} {symbol} (order_id={order_id})")
@@ -254,11 +287,12 @@ class AlpacaConnector:
             filled_qty = float(order.filled_qty) if order.filled_qty else 0
             filled_price = float(order.filled_avg_price) if order.filled_avg_price else None
 
-            # Log partial fill warning
+            # Log partial fill as ERROR for manual review
             if filled_qty > 0 and filled_qty < qty:
-                logger.warning(
-                    f"PARTIAL FILL: {symbol} requested {qty} shares, only {int(filled_qty)} filled "
-                    f"({filled_qty/qty*100:.1f}%)"
+                logger.error(
+                    f"PARTIAL FILL - NEEDS REVIEW: {symbol} requested {qty} shares, "
+                    f"only {int(filled_qty)} filled ({filled_qty/qty*100:.1f}%). "
+                    f"Order ID: {order_id}"
                 )
             elif filled_qty == 0:
                 logger.error(f"ORDER NOT FILLED: {symbol} {qty} shares - status={order.status.value}")
@@ -307,7 +341,11 @@ class AlpacaConnector:
 
         while time.time() - start_time < timeout_seconds:
             try:
-                order = self.trading_client.get_order_by_id(order_id)
+                order = timeout_wrapper(
+                    lambda: self.trading_client.get_order_by_id(order_id),
+                    TIMEOUTS.API_CALL,
+                    f"get_order_by_id({order_id})"
+                )
                 status = order.status.value.lower()
 
                 if status in terminal_statuses:
@@ -323,13 +361,20 @@ class AlpacaConnector:
 
                 time.sleep(poll_interval)
 
+            except TimeoutError:
+                logger.warning(f"Timeout checking order {order_id}, retrying...")
+                time.sleep(poll_interval)
             except Exception as e:
                 logger.warning(f"Error checking order {order_id}: {e}")
                 time.sleep(poll_interval)
 
         # Timeout - return last known state
         try:
-            return self.trading_client.get_order_by_id(order_id)
+            return timeout_wrapper(
+                lambda: self.trading_client.get_order_by_id(order_id),
+                TIMEOUTS.API_CALL,
+                f"get_order_by_id_final({order_id})"
+            )
         except Exception:
             return None
     
@@ -353,9 +398,13 @@ class AlpacaConnector:
                 limit_price=limit_price,
                 time_in_force=tif
             )
-            
-            order = self.trading_client.submit_order(order_data)
-            
+
+            order = timeout_wrapper(
+                lambda: self.trading_client.submit_order(order_data),
+                TIMEOUTS.ORDER_SUBMIT,
+                f"submit_limit_order({symbol})"
+            )
+
             logger.info(f"✓ Limit order submitted: {side.upper()} {qty} {symbol} @ ${limit_price:.2f}")
             
             return BrokerOrder(
@@ -408,14 +457,18 @@ class AlpacaConnector:
                 take_profit=TakeProfitRequest(limit_price=take_profit),
                 stop_loss=StopLossRequest(stop_price=stop_loss)
             )
-            
-            order = self.trading_client.submit_order(order_data)
-            
+
+            order = timeout_wrapper(
+                lambda: self.trading_client.submit_order(order_data),
+                TIMEOUTS.ORDER_SUBMIT,
+                f"submit_bracket_order({symbol})"
+            )
+
             logger.info(
                 f"✓ Bracket order: {side.upper()} {qty} {symbol} | "
                 f"TP: ${take_profit:.2f} | SL: ${stop_loss:.2f}"
             )
-            
+
             return str(order.id)
             
         except Exception as e:
@@ -425,9 +478,16 @@ class AlpacaConnector:
     def close_position(self, symbol: str) -> bool:
         """Close entire position for a symbol."""
         try:
-            self.trading_client.close_position(symbol)
+            timeout_wrapper(
+                lambda: self.trading_client.close_position(symbol),
+                TIMEOUTS.ORDER_SUBMIT,
+                f"close_position({symbol})"
+            )
             logger.info(f"✓ Closed position: {symbol}")
             return True
+        except TimeoutError:
+            logger.error(f"close_position({symbol}) timed out")
+            return False
         except Exception as e:
             logger.error(f"Failed to close {symbol}: {e}")
             return False
@@ -435,9 +495,16 @@ class AlpacaConnector:
     def close_all_positions(self) -> bool:
         """Close all positions (emergency)."""
         try:
-            self.trading_client.close_all_positions(cancel_orders=True)
+            timeout_wrapper(
+                lambda: self.trading_client.close_all_positions(cancel_orders=True),
+                TIMEOUTS.ORDER_SUBMIT,
+                "close_all_positions"
+            )
             logger.warning("⚠ Closed ALL positions")
             return True
+        except TimeoutError:
+            logger.error("close_all_positions timed out")
+            return False
         except Exception as e:
             logger.error(f"Failed to close all positions: {e}")
             return False
@@ -445,9 +512,16 @@ class AlpacaConnector:
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a pending order."""
         try:
-            self.trading_client.cancel_order_by_id(order_id)
+            timeout_wrapper(
+                lambda: self.trading_client.cancel_order_by_id(order_id),
+                TIMEOUTS.API_CALL,
+                f"cancel_order({order_id})"
+            )
             logger.info(f"✓ Cancelled order: {order_id}")
             return True
+        except TimeoutError:
+            logger.error(f"cancel_order({order_id}) timed out")
+            return False
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
@@ -455,7 +529,11 @@ class AlpacaConnector:
     def get_order(self, order_id: str) -> Optional[BrokerOrder]:
         """Get order status."""
         try:
-            order = self.trading_client.get_order_by_id(order_id)
+            order = timeout_wrapper(
+                lambda: self.trading_client.get_order_by_id(order_id),
+                TIMEOUTS.API_CALL,
+                f"get_order({order_id})"
+            )
             return BrokerOrder(
                 id=str(order.id),
                 symbol=order.symbol,
@@ -468,6 +546,9 @@ class AlpacaConnector:
                 submitted_at=order.submitted_at,
                 filled_at=order.filled_at
             )
+        except TimeoutError:
+            logger.error(f"get_order({order_id}) timed out")
+            return None
         except Exception as e:
             logger.error(f"Failed to get order {order_id}: {e}")
             return None
@@ -476,8 +557,12 @@ class AlpacaConnector:
         """Get all open orders."""
         try:
             request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-            orders = self.trading_client.get_orders(request)
-            
+            orders = timeout_wrapper(
+                lambda: self.trading_client.get_orders(request),
+                TIMEOUTS.API_CALL,
+                "get_open_orders"
+            )
+
             return [
                 BrokerOrder(
                     id=str(o.id),
@@ -493,6 +578,9 @@ class AlpacaConnector:
                 )
                 for o in orders
             ]
+        except TimeoutError:
+            logger.error("get_open_orders timed out")
+            return []
         except Exception as e:
             logger.error(f"Failed to get open orders: {e}")
             return []
@@ -505,12 +593,19 @@ class AlpacaConnector:
         """Get latest trade price for a symbol."""
         try:
             request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-            quotes = self.data_client.get_stock_latest_quote(request)
-            
+            quotes = timeout_wrapper(
+                lambda: self.data_client.get_stock_latest_quote(request),
+                TIMEOUTS.API_CALL,
+                f"get_latest_price({symbol})"
+            )
+
             if symbol in quotes:
                 quote = quotes[symbol]
                 # Use midpoint of bid/ask
                 return (float(quote.bid_price) + float(quote.ask_price)) / 2
+            return None
+        except TimeoutError:
+            logger.debug(f"get_latest_price({symbol}) timed out")
             return None
         except Exception as e:
             logger.debug(f"Failed to get quote for {symbol}: {e}")
@@ -520,37 +615,51 @@ class AlpacaConnector:
         """Get latest prices for multiple symbols."""
         try:
             request = StockLatestQuoteRequest(symbol_or_symbols=symbols)
-            quotes = self.data_client.get_stock_latest_quote(request)
-            
+            quotes = timeout_wrapper(
+                lambda: self.data_client.get_stock_latest_quote(request),
+                TIMEOUTS.DATA_FETCH,
+                "get_latest_prices"
+            )
+
             result = {}
             for symbol, quote in quotes.items():
                 result[symbol] = (float(quote.bid_price) + float(quote.ask_price)) / 2
             return result
+        except TimeoutError:
+            logger.error("get_latest_prices timed out")
+            return {}
         except Exception as e:
             logger.error(f"Failed to get quotes: {e}")
             return {}
     
     def get_bars(
-        self, 
-        symbol: str, 
+        self,
+        symbol: str,
         days: int = 60,
         timeframe: str = 'day'
     ) -> pd.DataFrame:
         """Get historical bars."""
         try:
             tf = TimeFrame.Day if timeframe == 'day' else TimeFrame.Hour
-            
+
             request = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=tf,
                 start=datetime.now() - timedelta(days=days),
                 end=datetime.now()
             )
-            bars = self.data_client.get_stock_bars(request)
-            
+            bars = timeout_wrapper(
+                lambda: self.data_client.get_stock_bars(request),
+                TIMEOUTS.DATA_FETCH,
+                f"get_bars({symbol})"
+            )
+
             df = bars.df.reset_index()
             return df
-            
+
+        except TimeoutError:
+            logger.error(f"get_bars({symbol}) timed out")
+            return pd.DataFrame()
         except Exception as e:
             logger.error(f"Failed to get bars for {symbol}: {e}")
             return pd.DataFrame()

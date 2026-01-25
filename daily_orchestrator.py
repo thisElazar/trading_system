@@ -24,8 +24,9 @@ import threading
 import time
 from datetime import datetime, timedelta, date
 from enum import Enum
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Dict, Any, List, Callable, Deque
 from pathlib import Path
 import gc
 import json
@@ -228,14 +229,20 @@ class PhaseConfig:
     tasks: List[str] = field(default_factory=list)
 
 
+# Maximum items to track in bounded collections (prevents unbounded memory growth)
+MAX_ERRORS_TRACKED = 500
+MAX_TASKS_TRACKED = 500
+
+
 @dataclass
 class OrchestratorState:
     """Current state of the orchestrator."""
     current_phase: MarketPhase = MarketPhase.EVENING
     phase_started_at: Optional[datetime] = None
     last_task_run: Dict[str, datetime] = field(default_factory=dict)
-    errors_today: List[Dict[str, Any]] = field(default_factory=list)
-    tasks_completed_today: List[str] = field(default_factory=list)
+    # Use bounded deques to prevent unbounded memory growth
+    errors_today: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=MAX_ERRORS_TRACKED))
+    tasks_completed_today: Deque[str] = field(default_factory=lambda: deque(maxlen=MAX_TASKS_TRACKED))
     daily_stats: Dict[str, Any] = field(default_factory=dict)
     is_running: bool = False
     scheduler_thread: Optional[threading.Thread] = None
@@ -245,7 +252,7 @@ class OrchestratorState:
 
     # Weekend phase state
     weekend_sub_phase: Optional[WeekendSubPhase] = None
-    weekend_tasks_completed: List[str] = field(default_factory=list)
+    weekend_tasks_completed: Deque[str] = field(default_factory=lambda: deque(maxlen=MAX_TASKS_TRACKED))
     weekend_started_at: Optional[datetime] = None
     weekend_config: Dict[str, Any] = field(default_factory=dict)  # Runtime config from dashboard
     weekend_research_progress: Dict[str, Any] = field(default_factory=dict)  # Generation, strategy, etc.
@@ -5301,8 +5308,8 @@ class DailyOrchestrator:
 
                     # Reset daily stats at start of pre-market
                     if current_phase == MarketPhase.PRE_MARKET:
-                        self.state.tasks_completed_today = []
-                        self.state.errors_today = []
+                        self.state.tasks_completed_today.clear()
+                        self.state.errors_today.clear()
                         self.state.daily_stats = {}
                         self.state.phase_tasks_completed = {}  # Reset per-phase tracking
 

@@ -290,6 +290,12 @@ class SignalDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_signals_strategy ON signals(strategy_name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol)")
+            # UNIQUE constraint prevents duplicate open positions for the same symbol
+            # This is the database-level enforcement of atomic position opening
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_open_symbol
+                ON positions(symbol) WHERE status = 'open'
+            """)
 
             conn.commit()
             conn.close()
@@ -604,6 +610,23 @@ class SignalDatabase:
             logger.info(f"Position opened: {position.direction} {position.quantity} {position.symbol} "
                        f"@ {position.entry_price} (stop={position.stop_loss}, target={position.take_profit}) [pos_id={pos_id}]")
             return pos_id
+        except sqlite3.IntegrityError as e:
+            # UNIQUE constraint violation - position was opened by concurrent request
+            # This is expected under race conditions and handled gracefully
+            logger.warning(
+                f"Position creation race detected for {position.symbol}: "
+                f"another position was opened concurrently. Fetching existing."
+            )
+            if conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id FROM positions
+                    WHERE symbol = ? AND status = 'open'
+                """, (position.symbol,))
+                existing = cursor.fetchone()
+                if existing:
+                    return existing[0]
+            raise  # Re-raise if we can't find the existing position
         except sqlite3.Error as e:
             logger.error(f"Failed to open position: {position.direction} {position.symbol} @ {position.entry_price} - {e}")
             raise
@@ -663,6 +686,7 @@ class SignalDatabase:
                 logger.warning(f"Position not found for price update: position_id={position_id}")
         except sqlite3.Error as e:
             logger.error(f"Failed to update position price: position_id={position_id}, price={current_price} - {e}")
+            raise  # Propagate DB errors so caller can handle
         finally:
             if conn:
                 conn.close()

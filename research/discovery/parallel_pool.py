@@ -70,13 +70,28 @@ def _pool_warmup_task(worker_idx: int) -> bool:
         return False
 
 
+# Flag to detect worker context - used to warn about DB access in workers
+_is_worker_process = False
+
+
 def _pool_initializer(shared_metadata: Dict[str, Any]):
     """
     Initialize worker process - called once when worker starts.
 
     Sets up shared memory access to market data.
+
+    IMPORTANT: Workers should NOT access the database directly.
+    DB connections are not safe across fork() and can cause deadlocks.
     """
-    global _worker_initialized, _worker_data, _worker_vix
+    global _worker_initialized, _worker_data, _worker_vix, _is_worker_process
+
+    # Mark this as a worker process (for both local flag and db_manager)
+    _is_worker_process = True
+    try:
+        from data.storage.db_manager import mark_as_worker_process
+        mark_as_worker_process()
+    except ImportError:
+        pass  # db_manager not available
 
     # CRITICAL: Workers must ignore signals - only main process handles shutdown
     # This prevents zombie workers when SIGTERM is sent to the process group
@@ -99,6 +114,11 @@ def _pool_initializer(shared_metadata: Dict[str, Any]):
     except Exception as e:
         logger.error(f"Worker initialization failed: {e}")
         raise
+
+
+def is_worker_process() -> bool:
+    """Check if current process is a worker (forked from pool)."""
+    return _is_worker_process
 
 
 def _get_genome_id_from_data(genome_data) -> str:

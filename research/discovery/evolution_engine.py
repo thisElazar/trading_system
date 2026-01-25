@@ -19,6 +19,7 @@ import gc
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from utils.timezone import is_research_allowed
+from utils.cache import LRUCache
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -230,8 +231,17 @@ class EvolutionEngine:
 
         # Population
         self.population: List[StrategyGenome] = []
-        self.fitness_cache: Dict[str, FitnessVector] = {}
-        self.behavior_cache: Dict[str, BehaviorVector] = {}
+        # Use LRU caches with explicit limits to prevent unbounded memory growth
+        self.fitness_cache: LRUCache[str, FitnessVector] = LRUCache(
+            maxsize=MAX_CACHE_SIZE,
+            track_stats=True,
+            name="fitness_cache"
+        )
+        self.behavior_cache: LRUCache[str, BehaviorVector] = LRUCache(
+            maxsize=MAX_CACHE_SIZE,
+            track_stats=True,
+            name="behavior_cache"
+        )
 
         # Pareto front tracking
         self.pareto_front: List[StrategyGenome] = []
@@ -300,18 +310,33 @@ class EvolutionEngine:
             return True, 0
 
     def _prune_caches(self):
-        """Prune caches to keep only entries for current population."""
+        """Prune caches to remove entries not in current population.
+
+        Note: LRUCache handles size limits automatically via eviction.
+        This method removes entries for genomes that have been eliminated
+        from the population to free memory earlier.
+        """
         current_ids = {g.genome_id for g in self.population}
 
-        if len(self.fitness_cache) > MAX_CACHE_SIZE:
-            self.fitness_cache = {
-                gid: f for gid, f in self.fitness_cache.items()
-                if gid in current_ids
-            }
-            self.behavior_cache = {
-                gid: b for gid, b in self.behavior_cache.items()
-                if gid in current_ids
-            }
+        # Remove entries not in current population
+        # (LRUCache handles size limits, but we can proactively remove dead entries)
+        fitness_to_remove = [gid for gid in self.fitness_cache.keys() if gid not in current_ids]
+        behavior_to_remove = [gid for gid in self.behavior_cache.keys() if gid not in current_ids]
+
+        for gid in fitness_to_remove:
+            self.fitness_cache.pop(gid, None)
+        for gid in behavior_to_remove:
+            self.behavior_cache.pop(gid, None)
+
+        # Log cache stats periodically
+        if self.current_generation % 10 == 0:
+            fitness_stats = self.fitness_cache.stats
+            if fitness_stats:
+                logger.debug(
+                    f"Cache stats: fitness={len(self.fitness_cache)}/{MAX_CACHE_SIZE} "
+                    f"(hit_rate={fitness_stats.hit_rate:.1%}), "
+                    f"behavior={len(self.behavior_cache)}/{MAX_CACHE_SIZE}"
+                )
 
     def _cleanup_generation(self):
         """Perform memory cleanup after a generation."""

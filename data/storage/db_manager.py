@@ -12,6 +12,11 @@ Thread Safety:
 - Uses per-thread connections via threading.local()
 - Each thread gets its own SQLite connection (safe for concurrent access)
 - Connections are created lazily and cached per-thread
+
+Multiprocessing Safety:
+- Connections should be closed before fork() to prevent deadlocks
+- Call close_thread_connections() before spawning worker pools
+- Worker processes should NOT access DB directly
 """
 
 import sqlite3
@@ -21,6 +26,23 @@ from typing import Optional, List, Dict, Any, Tuple
 import json
 import logging
 import threading
+import os
+
+# Flag to detect if in worker process (set by parallel pool initializer)
+_in_worker_process = False
+_main_process_pid = os.getpid()
+
+
+def mark_as_worker_process():
+    """Mark current process as a worker. Called from pool initializer."""
+    global _in_worker_process
+    _in_worker_process = True
+
+
+def is_in_worker_process() -> bool:
+    """Check if current process is a worker (forked from main)."""
+    # Either explicitly marked or PID changed from main process
+    return _in_worker_process or os.getpid() != _main_process_pid
 
 # Import from parent
 import sys
@@ -79,9 +101,17 @@ class DatabaseManager:
 
     def _get_connection(self, db_name: str) -> sqlite3.Connection:
         """Get or create a connection to a database for the current thread."""
+        # Warn if accessed from worker process (can cause deadlocks)
+        if is_in_worker_process():
+            logger.warning(
+                f"DB access from worker process detected (db={db_name}, pid={os.getpid()}). "
+                f"Workers should not access DB directly - this can cause deadlocks."
+            )
+
         connections = self._get_thread_connections()
 
         if db_name not in connections:
+            conn = None
             try:
                 db_path = DATABASES[db_name]
                 db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,10 +122,20 @@ class DatabaseManager:
                 conn.row_factory = sqlite3.Row
 
                 # Enable WAL mode for better concurrent read performance
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                # Set busy timeout to 30s (prevents indefinite hangs on lock contention)
-                conn.execute("PRAGMA busy_timeout=30000")
+                # Wrap PRAGMA setup in try/except to ensure cleanup on failure
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    # Set busy timeout to 30s (prevents indefinite hangs on lock contention)
+                    conn.execute("PRAGMA busy_timeout=30000")
+                except sqlite3.Error as pragma_error:
+                    # Close connection on PRAGMA setup failure before re-raising
+                    logger.error(f"PRAGMA setup failed for {db_name}, closing connection: {pragma_error}")
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise
 
                 connections[db_name] = conn
 
@@ -103,6 +143,12 @@ class DatabaseManager:
                 logger.debug(f"Database connection established: {db_name} ({db_path}) [thread={thread_id}]")
             except sqlite3.Error as e:
                 logger.error(f"Failed to connect to database {db_name}: {e}")
+                # Ensure cleanup if connection was partially created
+                if conn is not None and db_name not in connections:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
                 raise
             except KeyError:
                 logger.error(f"Unknown database name: {db_name}")

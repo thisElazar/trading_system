@@ -27,7 +27,13 @@ import json
 import os
 import threading
 
+from data.storage.db_manager import get_db
+from utils.persistent_state import PersistentCounter, PersistentDict, PersistentSet
+
 logger = logging.getLogger(__name__)
+
+# Maximum age for pending approvals before cleanup (1 hour)
+MAX_PENDING_AGE_SECONDS = 3600
 
 
 # =============================================================================
@@ -267,19 +273,35 @@ class ExecutionManager:
 
         # Thread safety for position operations (prevents TOCTOU race conditions)
         self._position_lock = threading.Lock()
-        self._pending_symbols: Set[str] = set()  # Symbols with orders in flight
-        self._held_symbols_cache: Set[str] = set()  # Cached held symbols
+
+        # Database manager for persistent state
+        self._db = get_db()
+
+        # Persistent symbols with orders in flight (survives restarts)
+        self._pending_symbols = PersistentSet(
+            self._db, "pending_order_symbols", db_name="trades"
+        )
+
+        self._held_symbols_cache: Set[str] = set()  # Cached held symbols (from broker)
         self._held_symbols_cache_time: datetime = datetime.min
 
-        # Pending approval tracking (fixes batch processing race condition)
+        # Persistent approval tracking (survives restarts)
         # These counters track signals that have been APPROVED but not yet persisted
         # to the database. This prevents multiple signals in a batch from all passing
         # the position limit check before any positions are actually created.
-        self._pending_approval_count: int = 0  # Global pending approvals
-        self._pending_approval_by_strategy: Dict[str, int] = {}  # Per-strategy pending
+        self._pending_approval_count = PersistentCounter(
+            self._db, "execution", "pending_approvals", db_name="trades"
+        )
+        self._pending_approval_by_strategy = PersistentDict[int](
+            self._db, "execution", "pending_by_strategy", db_name="trades",
+            default_factory=lambda: 0
+        )
 
         # Initialize database
         self._init_decision_logging()
+
+        # Clean up stale persistent state from crashes/restarts
+        self._cleanup_stale_state()
 
         logger.info("ExecutionManager initialized")
 
@@ -316,6 +338,77 @@ class ExecutionManager:
             self.broker = broker
 
         logger.info("ExecutionManager dependencies injected")
+
+        # Sync broker positions after dependencies are injected
+        if broker:
+            self._sync_broker_positions()
+
+    def _cleanup_stale_state(self):
+        """
+        Clean up stale persistent state on startup.
+
+        This handles recovery from crashes where pending state was not properly
+        cleared. Aggressively clears anything older than 1 hour.
+        """
+        try:
+            # Clear stale pending symbols
+            stale_count = self._pending_symbols.clear_stale(MAX_PENDING_AGE_SECONDS)
+            if stale_count > 0:
+                logger.info(f"Cleaned up {stale_count} stale pending symbols")
+
+            # Reset pending approval counters if they seem stale
+            # (we can't know their age, but we reset on startup to be safe)
+            current_count = self._pending_approval_count.value
+            if current_count > 0:
+                logger.warning(
+                    f"Found {current_count} pending approvals from previous run, resetting"
+                )
+                self._pending_approval_count.reset()
+                self._pending_approval_by_strategy.clear()
+
+        except Exception as e:
+            logger.error(f"Error cleaning up stale state: {e}")
+
+    def _sync_broker_positions(self):
+        """
+        Sync broker positions to DB on startup.
+
+        Compares broker positions to database and logs any discrepancies.
+        This helps detect orphaned positions or sync issues.
+        """
+        if not self.broker:
+            return
+
+        try:
+            broker_positions = self.broker.get_positions()
+            broker_symbols = {pos.symbol for pos in broker_positions}
+
+            # Update held symbols cache
+            self._held_symbols_cache = broker_symbols
+            self._held_symbols_cache_time = datetime.now()
+
+            logger.info(f"Synced {len(broker_symbols)} positions from broker")
+
+            # If we have an execution tracker, compare to DB
+            if self.execution_tracker:
+                try:
+                    db_positions = self.execution_tracker.db.get_open_positions()
+                    db_symbols = {pos['symbol'] for pos in db_positions}
+
+                    # Find discrepancies
+                    broker_only = broker_symbols - db_symbols
+                    db_only = db_symbols - broker_symbols
+
+                    if broker_only:
+                        logger.warning(f"Positions in broker but not DB: {broker_only}")
+                    if db_only:
+                        logger.warning(f"Positions in DB but not broker: {db_only}")
+
+                except Exception as e:
+                    logger.warning(f"Could not compare DB positions: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to sync broker positions: {e}")
 
     # =========================================================================
     # Main Entry Point
@@ -490,9 +583,9 @@ class ExecutionManager:
                 logger.debug(f"Found {symbol} in pending orders")
                 return True
 
-            # 2. Check/refresh held symbols cache
+            # 2. Check/refresh held symbols cache (reduced from 5s to 1s for critical paths)
             cache_age = (datetime.now() - self._held_symbols_cache_time).total_seconds()
-            if cache_age > 5.0:  # Refresh cache every 5 seconds
+            if cache_age > 1.0:  # Refresh cache every 1 second
                 self._refresh_held_symbols_cache()
 
             if symbol in self._held_symbols_cache:
@@ -580,12 +673,11 @@ class ExecutionManager:
         Must be decremented when the position is persisted or signal fails.
         """
         with self._position_lock:
-            self._pending_approval_count += 1
-            self._pending_approval_by_strategy[strategy_name] = (
-                self._pending_approval_by_strategy.get(strategy_name, 0) + 1
-            )
+            new_count = self._pending_approval_count.increment()
+            current = self._pending_approval_by_strategy.get(strategy_name, 0)
+            self._pending_approval_by_strategy[strategy_name] = current + 1
             logger.debug(
-                f"Pending approval incremented: global={self._pending_approval_count}, "
+                f"Pending approval incremented: global={new_count}, "
                 f"{strategy_name}={self._pending_approval_by_strategy[strategy_name]}"
             )
 
@@ -599,12 +691,12 @@ class ExecutionManager:
         3. Signal is abandoned for any reason
         """
         with self._position_lock:
-            self._pending_approval_count = max(0, self._pending_approval_count - 1)
+            new_count = self._pending_approval_count.decrement()
             current = self._pending_approval_by_strategy.get(strategy_name, 0)
             if current > 0:
                 self._pending_approval_by_strategy[strategy_name] = current - 1
             logger.debug(
-                f"Pending approval decremented: global={self._pending_approval_count}, "
+                f"Pending approval decremented: global={new_count}, "
                 f"{strategy_name}={self._pending_approval_by_strategy.get(strategy_name, 0)}"
             )
 
@@ -615,8 +707,8 @@ class ExecutionManager:
         Call this at the start of each trading day or after position sync.
         """
         with self._position_lock:
-            old_count = self._pending_approval_count
-            self._pending_approval_count = 0
+            old_count = self._pending_approval_count.value
+            self._pending_approval_count.reset()
             self._pending_approval_by_strategy.clear()
             if old_count > 0:
                 logger.info(f"Reset pending approvals: cleared {old_count} pending")
@@ -698,7 +790,7 @@ class ExecutionManager:
         # Include pending approvals in the count (fixes batch processing race condition)
         # These are signals that have been approved but not yet persisted to the database
         with self._position_lock:
-            pending_global = self._pending_approval_count
+            pending_global = self._pending_approval_count.value
             pending_strategy = self._pending_approval_by_strategy.get(strategy_name, 0)
 
         effective_global_count = len(current_positions) + pending_global

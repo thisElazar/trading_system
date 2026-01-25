@@ -204,8 +204,12 @@ def evaluate_genes_parallel(genes: dict) -> float:
                 return 0.0
             
             return float(base_fitness * constraint_mult)
-    
+
     except Exception as e:
+        # Log the error for debugging, but return 0.0 to not crash worker
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Fitness evaluation failed: {e}")
         return 0.0
 
 def setup_parallel_fitness_context(strategy_name: str, backtester, data: dict,
@@ -1907,8 +1911,8 @@ class NightlyResearchEngine:
             if self._leds:
                 try:
                     self._leds.set_color('research', 'red')
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to set LED color: {e}")
             return {'success': False, 'error': 'Data load failed'}
 
         # Track results
@@ -2515,7 +2519,8 @@ def main():
             import json as json_mod
             try:
                 resume_strategies = json_mod.loads(strategies_str)
-            except:
+            except (json_mod.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Failed to parse strategies from run {args.resume}: {e}")
                 resume_strategies = []
         else:
             resume_strategies = [s.strip() for s in strategies_str.split(',') if s.strip()]

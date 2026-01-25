@@ -34,6 +34,7 @@ Usage:
 
 import logging
 import sqlite3
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -921,6 +922,10 @@ class CircuitBreakerManager:
         self.broker = None
         self.alert_manager = None
 
+        # Thread safety for state checks and modifications
+        # Ensures atomicity during signal evaluation
+        self._state_lock = threading.Lock()
+
         # Load persisted state
         self._load_persisted_state()
 
@@ -947,68 +952,92 @@ class CircuitBreakerManager:
         self.kill_switch.alert_manager = alert_manager
 
     def check_all(self, context: Dict) -> List[BreakerState]:
-        """Check all circuit breakers and file triggers. Returns triggered states."""
-        triggered = []
+        """
+        Check all circuit breakers and file triggers. Returns triggered states.
 
-        # First check file-based kill switches
-        file_triggers = self.kill_switch.check_file_triggers()
-        for trigger_type, target in file_triggers:
-            if trigger_type == KillSwitchType.HALT:
-                self.kill_switch.execute_halt()
-            elif trigger_type == KillSwitchType.CLOSE_ALL:
-                self.kill_switch.execute_close_all()
-            elif trigger_type == KillSwitchType.GRACEFUL:
-                self.kill_switch.execute_graceful()
-            elif trigger_type == KillSwitchType.STRATEGY:
-                self.kill_switch.disable_strategy(target)
+        Thread-safe: Uses lock to ensure atomic state checks during signal evaluation.
+        """
+        with self._state_lock:
+            triggered = []
 
-        # Then check automatic circuit breakers
-        for name, breaker in self.breakers.items():
-            try:
-                state = breaker.check(context)
-                if state.is_triggered:
-                    triggered.append(state)
-            except Exception as e:
-                logger.error(f"Error checking breaker {name}: {e}")
+            # First check file-based kill switches
+            file_triggers = self.kill_switch.check_file_triggers()
+            for trigger_type, target in file_triggers:
+                if trigger_type == KillSwitchType.HALT:
+                    self.kill_switch.execute_halt()
+                elif trigger_type == KillSwitchType.CLOSE_ALL:
+                    self.kill_switch.execute_close_all()
+                elif trigger_type == KillSwitchType.GRACEFUL:
+                    self.kill_switch.execute_graceful()
+                elif trigger_type == KillSwitchType.STRATEGY:
+                    self.kill_switch.disable_strategy(target)
 
-        return triggered
+            # Then check automatic circuit breakers
+            for name, breaker in self.breakers.items():
+                try:
+                    state = breaker.check(context)
+                    if state.is_triggered:
+                        triggered.append(state)
+                except Exception as e:
+                    logger.error(f"Error checking breaker {name}: {e}")
+
+            return triggered
 
     def can_trade(self) -> bool:
-        """Check if trading is allowed (no halt-type breakers active)."""
-        # Check kill switches first (fast path)
-        if self.kill_switch.is_halt_active():
-            return False
-        if self.kill_switch.is_graceful_active():
-            return False
+        """
+        Check if trading is allowed (no halt-type breakers active).
 
-        # Check database for active halt breakers
-        now = datetime.now()
-        active_halts = self.db.get_active_breakers(action='halt')
-
-        for state in active_halts:
-            if state.expires_at is None or now < state.expires_at:
+        Thread-safe: Uses lock for consistent state checks.
+        """
+        with self._state_lock:
+            # Check kill switches first (fast path)
+            if self.kill_switch.is_halt_active():
+                return False
+            if self.kill_switch.is_graceful_active():
                 return False
 
-        return True
+            # Check database for active halt breakers
+            now = datetime.now()
+            active_halts = self.db.get_active_breakers(action='halt')
+
+            for state in active_halts:
+                if state.expires_at is None or now < state.expires_at:
+                    return False
+
+            return True
 
     def can_run_strategy(self, strategy_name: str) -> bool:
-        """Check if a specific strategy can run."""
-        if not self.can_trade():
-            return False
+        """
+        Check if a specific strategy can run.
 
-        # Check strategy-specific kill switch
-        if self.kill_switch.is_strategy_disabled(strategy_name):
-            return False
-
-        # Check strategy-specific breakers
-        now = datetime.now()
-        active_pauses = self.db.get_active_breakers(action='pause_strategy', target=strategy_name)
-
-        for state in active_pauses:
-            if state.expires_at is None or now < state.expires_at:
+        Thread-safe: Uses lock for consistent state checks.
+        """
+        with self._state_lock:
+            # Check kill switches first (fast path)
+            if self.kill_switch.is_halt_active():
+                return False
+            if self.kill_switch.is_graceful_active():
                 return False
 
-        return True
+            # Check database for active halt breakers
+            now = datetime.now()
+            active_halts = self.db.get_active_breakers(action='halt')
+            for state in active_halts:
+                if state.expires_at is None or now < state.expires_at:
+                    return False
+
+            # Check strategy-specific kill switch
+            if self.kill_switch.is_strategy_disabled(strategy_name):
+                return False
+
+            # Check strategy-specific breakers
+            active_pauses = self.db.get_active_breakers(action='pause_strategy', target=strategy_name)
+
+            for state in active_pauses:
+                if state.expires_at is None or now < state.expires_at:
+                    return False
+
+            return True
 
     def get_position_multiplier(self) -> float:
         """Get position size multiplier (1.0 = normal, 0.5 = reduced due to drawdown)."""
