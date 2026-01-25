@@ -86,7 +86,7 @@ vec_converging(vec_vol_5(), vec_ret_1d_5())  # Volume/returns pattern
 
 **Rollback**: `python research/discovery/vgp_migration.py --rollback`
 
-## GP Research Tuning (Jan 24)
+## GP Research Tuning (Jan 24-25)
 
 **Problem**: GP batch evaluations timing out (100% failure rate overnight). Individual backtests taking 2-10+ minutes on Pi with 194 symbols x 3 years. Degenerate strategies logging 100+ signal limit warnings per backtest.
 
@@ -94,6 +94,7 @@ vec_converging(vec_vol_5(), vec_ret_1d_5())  # Volume/returns pattern
 1. Backtests too slow for 10-minute batch timeout
 2. Degenerate genomes hitting signal limit on every bar but not aborting early
 3. Too much data scope for Pi's compute capacity
+4. VGP primitives recomputing rolling indicators on EVERY call (O(n²) complexity)
 
 **Fixes Applied**:
 
@@ -110,10 +111,17 @@ vec_converging(vec_vol_5(), vec_ret_1d_5())  # Volume/returns pattern
 3. **Increased batch timeout** (`parallel_pool.py`):
    - `timeout`: 600s → 1800s (30 minutes vs 10 minutes)
 
+4. **VGP indicator caching** (`gp_core.py`, Jan 25):
+   - Added `_get_or_compute_indicator()` helper
+   - Caches rolling computations (SMA, EMA, RSI, returns, volume) in DataFrame columns
+   - 40x speedup: 0.12ms/iteration (cached) vs 4.79ms (uncached)
+   - With 500 bars × 96 symbols = 48,000 tree evals per backtest, this is critical
+
 **Expected Impact**:
 - Backtests ~4x faster (half symbols, 2/3 years)
+- VGP backtests ~40x faster (cached indicators)
 - Degenerate strategies abort in ~300ms instead of minutes
-- More strategies complete before timeout
+- Batch timeouts should drop from 100% to near-zero
 
 ## Worker Lifecycle Fixes (Jan 25)
 
