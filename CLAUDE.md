@@ -115,6 +115,32 @@ vec_converging(vec_vol_5(), vec_ret_1d_5())  # Volume/returns pattern
 - Degenerate strategies abort in ~300ms instead of minutes
 - More strategies complete before timeout
 
+## Worker Lifecycle Fixes (Jan 25)
+
+**Problem**: Research processes hanging indefinitely during shutdown. Workers blocked on `pipe_read`/`futex_wait_queue` while main process waited on `pool.join()` - classic multiprocessing deadlock.
+
+**Root Cause**: `pool.close()` + `pool.join()` without timeout. Workers waiting for tasks that never come, main process waiting for workers that never exit.
+
+**Fixes Applied**:
+
+1. **30-second timeout on all pool shutdowns**:
+   - `parallel_pool.py`, `ga_parallel.py`, `persistent_optimizer.py`
+   - Poll workers for graceful exit, force-terminate if stuck
+
+2. **Timeout on GeneticOptimizer.map()** (`optimizer.py`):
+   - Changed `pool.map()` to `pool.map_async().get(timeout=1800)`
+
+3. **Runtime detection for clashing pools**:
+   - Module-level tracking: `_active_pool_instance`, `_active_pool_pid`
+   - `RuntimeError` if second pool started without shutdown
+   - Prevents silent data corruption from shared state
+
+4. **Signal handling in all worker initializers**:
+   - Workers ignore SIGTERM/SIGINT
+   - Main process handles graceful shutdown
+
+**Architecture Constraint**: Only ONE worker pool of each type can be active at a time. Workers share module-level state via fork().
+
 ## Recent Fixes (Jan 22)
 
 - **Position exits**: Now use per-position `take_profit`/`stop_loss` prices from DB (not global 10% threshold)

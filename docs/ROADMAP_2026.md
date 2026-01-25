@@ -1,9 +1,9 @@
 # TradeBot Enhancement Roadmap 2026
 
 **Based on:** State-of-the-Art Research Review (January 2026)
-**Current State:** 17 days live, 24% win rate, +$3,311 realized P&L
+**Current State:** 22 days live, paper trading via Alpaca
 **Platform:** Raspberry Pi 5 (8GB RAM)
-**Updated:** January 22, 2026
+**Updated:** January 25, 2026
 
 ---
 
@@ -11,7 +11,7 @@
 
 Your system is **architecturally ahead** of much of the published research—you already have MAP-Elites, Novelty Search, NSGA-II multi-objective optimization, and behavioral vectors implemented. The research validates these choices.
 
-However, analysis of the existing 184 scalar GP strategies revealed critical issues that must be addressed before further evolution is meaningful:
+Analysis of the existing 184 scalar GP strategies revealed critical issues:
 
 | Finding | Value | Implication |
 |---------|-------|-------------|
@@ -24,21 +24,33 @@ However, analysis of the existing 184 scalar GP strategies revealed critical iss
 
 ---
 
-## Phase 0: VGP Migration (IMMEDIATE PRIORITY)
+## Phase 0: VGP Migration ✅ COMPLETE (Jan 23-25, 2026)
 
 **Goal:** Replace scalar GP with Vectorial GP before any further evolution
 
-**Rationale:** Analysis of 184 existing strategies shows:
-- 68% exploit degenerate patterns (`const_1 > open()` — only triggers on penny stocks)
-- Only 21 unique entry trees despite months of evolution
-- Exit/position/stop trees are mostly noise (`not_(not_(true))` patterns)
-- Research confirms scalar GP "always among worst performers"
+**Completed Items:**
+- ✅ Archived 184 scalar strategies to `discovered_strategies_v1_scalar`
+- ✅ Implemented VGP primitives (~15 vector operators) in `gp_core.py`
+- ✅ Created `VecType` for type-safe vector operations
+- ✅ Updated `GenomeFactory` with `use_vgp=True` default
+- ✅ Added VGP validation in `evolution_engine.py`
+- ✅ Created migration script `vgp_migration.py` with rollback support
+- ✅ Fixed degenerate strategy early-abort (3 consecutive signal limits → abort)
+- ✅ Reduced data scope for Pi (100 symbols, 2 years)
+- ✅ Fixed worker pool deadlocks (30s shutdown timeout, clashing pool detection)
 
-Continuing to evolve scalar strategies is wasted compute.
+**Key Files Changed:**
+- `research/discovery/gp_core.py` - VGP primitives
+- `research/discovery/strategy_genome.py` - `use_vgp` flag, `genome_version: 2`
+- `research/discovery/evolution_engine.py` - VGP validation
+- `research/discovery/strategy_compiler.py` - Degenerate abort logic
+- `research/discovery/parallel_pool.py` - Deadlock-free shutdown
+- `research/genetic/ga_parallel.py` - Unified lifecycle
+- `research/genetic/persistent_optimizer.py` - Unified lifecycle
 
 ### 0.1 Archive Scalar Population
 
-**Status:** TO DO
+**Status:** ✅ DONE (Jan 23)
 **Effort:** 1 hour
 
 ```bash
@@ -105,7 +117,7 @@ def vec_gt(vec, threshold) -> np.ndarray  # Element-wise >
 
 ### 0.3 Create VGP Primitive Set
 
-**Status:** TO DO
+**Status:** ✅ DONE (Jan 23)
 **Effort:** 2 hours
 **File:** `research/discovery/gp_core.py`
 
@@ -137,7 +149,7 @@ def create_vgp_primitive_set(config: PrimitiveConfig = None) -> gp.PrimitiveSetT
 
 ### 0.4 Update GenomeFactory
 
-**Status:** TO DO
+**Status:** ✅ DONE (Jan 23)
 **Effort:** 1 hour
 **File:** `research/discovery/strategy_genome.py`
 
@@ -153,7 +165,7 @@ class GenomeFactory:
 
 ### 0.5 Reset Evolution State
 
-**Status:** TO DO
+**Status:** ✅ DONE (Jan 23)
 **Effort:** 30 min
 
 ```sql
@@ -169,23 +181,34 @@ CREATE TABLE discovered_strategies_v2_vgp (
 
 ### 0.6 Validate & Test
 
-**Status:** TO DO
+**Status:** ✅ DONE (Jan 23-24)
 **Effort:** 2 hours
 
-- [ ] Generate random VGP trees, verify type safety
-- [ ] Compile and evaluate trees on test data
-- [ ] Run single generation, verify fitness evaluation works
-- [ ] Confirm backtest integration unchanged
+- [x] Generate random VGP trees, verify type safety
+- [x] Compile and evaluate trees on test data
+- [x] Run single generation, verify fitness evaluation works
+- [x] Confirm backtest integration unchanged
+
+### 0.7 Worker Lifecycle Hardening (Added Jan 25)
+
+**Status:** ✅ DONE (Jan 25)
+
+Fixed multiprocessing deadlocks discovered during overnight research:
+- [x] Added 30s timeout to all pool shutdown methods
+- [x] Added runtime detection for clashing pools (raises RuntimeError)
+- [x] Added signal handling to all worker initializers
+- [x] Documented single-pool constraint in class docstrings
 
 ### Phase 0 Success Criteria
 
-- [ ] Scalar strategies archived (not deleted)
-- [ ] VGP primitives implemented with type safety
-- [ ] GenomeFactory defaults to VGP
-- [ ] Single overnight evolution cycle completes successfully
-- [ ] New strategies show temporal patterns (not `const > price`)
+- [x] Scalar strategies archived (not deleted)
+- [x] VGP primitives implemented with type safety
+- [x] GenomeFactory defaults to VGP
+- [x] Single overnight evolution cycle completes successfully
+- [x] New strategies show temporal patterns (not `const > price`)
+- [x] Worker pools don't deadlock on shutdown
 
-**Estimated Total Effort:** 10-12 hours
+**Actual Effort:** ~15 hours across Jan 23-25
 
 ---
 
