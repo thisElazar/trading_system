@@ -344,6 +344,30 @@ def _safe_get_vector(df, col: str, lookback: int, default: float = 0.0) -> np.nd
     return values.astype(float)
 
 
+def _get_or_compute_indicator(df: pd.DataFrame, col_name: str, compute_fn, default_value=0.0):
+    """
+    Get indicator from DataFrame cache or compute and cache it.
+
+    This is critical for VGP performance - indicators should be computed once
+    per symbol, not once per bar (500x speedup for 500-bar backtest).
+    """
+    if df is None:
+        return None
+
+    # Check if already computed and cached in DataFrame
+    if col_name in df.columns:
+        return df[col_name]
+
+    # Compute and cache
+    try:
+        result = compute_fn(df)
+        # Cache in DataFrame (modifies in place for efficiency)
+        df[col_name] = result
+        return result
+    except Exception:
+        return None
+
+
 def _make_vec_close(lookback: int):
     """Factory for vector of last N close prices."""
     def _vec_close() -> np.ndarray:
@@ -353,55 +377,97 @@ def _make_vec_close(lookback: int):
 
 
 def _make_vec_sma(period: int, lookback: int):
-    """Factory for vector of last N SMA values."""
+    """Factory for vector of last N SMA values (cached)."""
+    col_name = f'_vgp_sma_{period}'
+
     def _vec_sma() -> np.ndarray:
         df = get_eval_data()
         if df is None or len(df) < period + lookback:
             return np.full(lookback, 0.0)
-        sma = df['close'].rolling(period).mean()
+
+        # Get or compute cached indicator
+        sma = _get_or_compute_indicator(
+            df, col_name,
+            lambda d: d['close'].rolling(period).mean()
+        )
+        if sma is None:
+            return np.full(lookback, 0.0)
+
         values = sma.tail(lookback).values
         return np.nan_to_num(values, nan=0.0)
+
     _vec_sma.__name__ = f'vec_sma_{period}_{lookback}'
     return _vec_sma
 
 
 def _make_vec_ema(period: int, lookback: int):
-    """Factory for vector of last N EMA values."""
+    """Factory for vector of last N EMA values (cached)."""
+    col_name = f'_vgp_ema_{period}'
+
     def _vec_ema() -> np.ndarray:
         df = get_eval_data()
         if df is None or len(df) < period + lookback:
             return np.full(lookback, 0.0)
-        ema = df['close'].ewm(span=period, adjust=False).mean()
+
+        # Get or compute cached indicator
+        ema = _get_or_compute_indicator(
+            df, col_name,
+            lambda d: d['close'].ewm(span=period, adjust=False).mean()
+        )
+        if ema is None:
+            return np.full(lookback, 0.0)
+
         values = ema.tail(lookback).values
         return np.nan_to_num(values, nan=0.0)
+
     _vec_ema.__name__ = f'vec_ema_{period}_{lookback}'
     return _vec_ema
 
 
 def _make_vec_rsi(period: int, lookback: int):
-    """Factory for vector of last N RSI values."""
+    """Factory for vector of last N RSI values (cached)."""
+    col_name = f'_vgp_rsi_{period}'
+
+    def _compute_rsi(d):
+        delta = d['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss.replace(0, 1e-10)
+        return 100 - (100 / (1 + rs))
+
     def _vec_rsi() -> np.ndarray:
         df = get_eval_data()
         if df is None or len(df) < period + lookback + 1:
             return np.full(lookback, 50.0)
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss.replace(0, 1e-10)
-        rsi = 100 - (100 / (1 + rs))
+
+        # Get or compute cached indicator
+        rsi = _get_or_compute_indicator(df, col_name, _compute_rsi)
+        if rsi is None:
+            return np.full(lookback, 50.0)
+
         values = rsi.tail(lookback).values
         return np.nan_to_num(values, nan=50.0)
+
     _vec_rsi.__name__ = f'vec_rsi_{period}_{lookback}'
     return _vec_rsi
 
 
 def _make_vec_returns(period: int, lookback: int):
-    """Factory for vector of last N period returns."""
+    """Factory for vector of last N period returns (cached)."""
+    col_name = f'_vgp_returns_{period}'
+
     def _vec_returns() -> np.ndarray:
         df = get_eval_data()
         if df is None or len(df) < period + lookback + 1:
             return np.zeros(lookback)
-        returns = df['close'].pct_change(periods=period)
+
+        # Get or compute cached indicator
+        returns = _get_or_compute_indicator(
+            df, col_name,
+            lambda d: d['close'].pct_change(periods=period)
+        )
+        if returns is None:
+            return np.zeros(lookback)
         values = returns.tail(lookback).values
         return np.nan_to_num(values, nan=0.0)
     _vec_returns.__name__ = f'vec_returns_{period}_{lookback}'
@@ -409,15 +475,25 @@ def _make_vec_returns(period: int, lookback: int):
 
 
 def _make_vec_volume(lookback: int):
-    """Factory for vector of last N relative volumes (vs 20-day SMA)."""
+    """Factory for vector of last N relative volumes (vs 20-day SMA, cached)."""
+    col_name = '_vgp_rel_vol_20'
+
     def _vec_volume() -> np.ndarray:
         df = get_eval_data()
         if df is None or len(df) < 20 + lookback:
             return np.ones(lookback)
-        vol_sma = df['volume'].rolling(20).mean()
-        rel_vol = df['volume'] / vol_sma.replace(0, 1)
+
+        # Get or compute cached relative volume
+        rel_vol = _get_or_compute_indicator(
+            df, col_name,
+            lambda d: d['volume'] / d['volume'].rolling(20).mean().replace(0, 1)
+        )
+        if rel_vol is None:
+            return np.ones(lookback)
+
         values = rel_vol.tail(lookback).values
         return np.nan_to_num(values, nan=1.0)
+
     _vec_volume.__name__ = f'vec_volume_{lookback}'
     return _vec_volume
 
