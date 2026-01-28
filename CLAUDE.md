@@ -51,8 +51,11 @@ Automated trading system on Raspberry Pi 5. Paper trading via Alpaca.
 |---------|--------------|-----|
 | No trades executing | Circuit breaker triggered | Check `circuit_breaker_state` table |
 | Orchestrator frozen | Memory pressure or deadlock | `sudo systemctl restart trading-orchestrator` |
+| Orchestrator hangs 4+ hours at night | WiFi power save enabled | Check `iwconfig wlan0 \| grep Power` - should be "off" |
 | Position not exiting at target | Was using global 10% threshold | Fixed: now uses per-position TP/SL from DB |
-| Pre-market refresh hung for hours | Alpaca API call with no timeout | Fixed: 30s timeout + 3 retries on all fetchers |
+| Pre-market refresh hung for hours | Alpaca SDK has NO HTTP timeout | Fixed: inject_session_timeout() wrapper on all Alpaca clients |
+| Orphaned positions (strategy_name='manual') | Position tracking failed after Alpaca order | Check logs for "POSITION TRACKING FAILURE" |
+| Duplicate signals (20x for same symbol) | Strategy in both scheduler and universe_scanner | Remove from universe_scanner if it has fixed universe |
 | LCD showing stale data | Orchestrator not updating | Check service status |
 | Research not running | Wrong phase or disabled | Check ENABLE_* flags in config.py |
 | Watchdog crash loop | Systemd `WatchdogSec` without `sd_notify` | Remove `WatchdogSec` from service file |
@@ -149,11 +152,18 @@ vec_converging(vec_vol_5(), vec_ret_1d_5())  # Volume/returns pattern
 
 **Architecture Constraint**: Only ONE worker pool of each type can be active at a time. Workers share module-level state via fork().
 
-## Recent Fixes (Jan 22)
+## Recent Fixes (Jan 27)
+
+- **WiFi power management**: Was causing 4+ hour hangs during pre-market data refresh. WiFi adapter would sleep during quiet hours, blocking network calls indefinitely. Fixed by disabling power save (`iw wlan0 set power_save off`) and creating systemd service `wifi-powersave-off.service` to persist across reboots.
+- **gap_fill duplicate signals**: gap_fill was generating 20x duplicate signals because it ran both directly at 09:31 ET AND through universe_scanner. Since gap_fill has its own fixed universe (SPY/QQQ) and ignores batch data, it generated signals on every batch. Fixed by removing gap_fill from `universe_scanner.py` - it now only runs via scheduler at 09:31 ET.
+- **Position tracking failures**: Alpaca orders could succeed but DB recording could fail silently (try/finally with no except). This caused "orphaned positions" that showed as `strategy_name='manual'` after restart. Fixed by adding exception logging in `scheduler.py` to capture the actual error.
+- **Hardcoded strategy graduation**: Strategies not in the promotion pipeline (like gap_fill) default to `route='live'` in `execution_manager.py:1033-1035`. This is intentional - hardcoded strategies auto-execute to Alpaca paper account.
+
+## Fixes (Jan 22)
 
 - **Position exits**: Now use per-position `take_profit`/`stop_loss` prices from DB (not global 10% threshold)
 - **Rapid gain scaler**: Disabled (was trimming positions prematurely)
-- **API timeouts**: Alpaca fetchers have 30s request timeout, 60s per-symbol limit, 3 retries with backoff
+- **API timeouts**: Alpaca clients now have HTTP-level timeouts via `utils/timeout.py:inject_session_timeout()`. The SDK has NO default timeout - requests can hang forever. ThreadPoolExecutor timeout (Jan 22 fix) didn't work because Python threads can't be killed. New fix injects (10s connect, 30s read) timeout directly into the requests.Session.
 - **Watchdog thresholds**: 98% memory (was 95%), 80% swap, 15-minute tolerance (was 5)
 
 ## Previous Fixes (Jan 14)
