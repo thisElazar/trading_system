@@ -465,9 +465,11 @@ def create_scanner_with_strategies() -> UniverseScanner:
     scanner = UniverseScanner()
 
     # Import and register each enabled strategy
+    # NOTE: gap_fill is NOT included here - it runs separately at 09:31 ET
+    # via the scheduler (it has its own fixed universe of SPY/QQQ and ignores
+    # batch data, which caused duplicate signals when included here)
     strategy_imports = {
         'mean_reversion': ('strategies.mean_reversion', 'MeanReversionStrategy'),
-        'gap_fill': ('strategies.gap_fill', 'GapFillStrategy'),
         'relative_volume_breakout': ('strategies.relative_volume_breakout', 'RelativeVolumeBreakout'),
         'vix_regime_rotation': ('strategies.vix_regime_rotation', 'VIXRegimeRotationStrategy'),
         'vol_managed_momentum': ('strategies.vol_managed_momentum_v2', 'VolManagedMomentumV2'),

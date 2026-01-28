@@ -407,6 +407,16 @@ class StrategyScheduler:
                     }
                 }
             )
+        except Exception as e:
+            # CRITICAL: Log this error - if we submitted to Alpaca but fail here,
+            # we have an orphaned position at the broker with no DB record
+            logger.error(
+                f"POSITION TRACKING FAILURE: {actual_strategy} {direction} {shares} {symbol} "
+                f"alpaca_order_id={alpaca_order_id} - Error: {e}",
+                exc_info=True
+            )
+            # Re-raise so callers know something went wrong
+            raise
         finally:
             # Decrement pending approval counter now that position is persisted
             # This must happen regardless of success/failure to prevent counter drift
